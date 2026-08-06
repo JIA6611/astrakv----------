@@ -1,0 +1,4 @@
+# All capacity and KV-layout values are explicit experiment inputs.
+model_path: /opt/models/Qwen3-8B
+block_size_tokens: 16
+kv_bytes_per_token: 0

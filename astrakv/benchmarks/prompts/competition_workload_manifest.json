@@ -1,0 +1,27 @@
+{
+  "schema": "astra-workload-suite-v1",
+  "generated": "2026-06-08T17:32:06",
+  "suite_path": "benchmarks\\prompts\\competition_workload_suite.jsonl",
+  "parameters": {
+    "long_context_tokens": 4096,
+    "memory_pressure_tokens": 8192,
+    "repeated_prefix_tokens": 2048
+  },
+  "summary": {
+    "schema": "astra-workload-suite-v1",
+    "case_count": 6,
+    "type_counts": {
+      "long_context_qa": 1,
+      "memory_pressure": 1,
+      "prefix_reuse": 2,
+      "rag_repeated_prefix": 1,
+      "short_chat": 1
+    },
+    "repeat_group_counts": {
+      "prefix_reuse_001": 2,
+      "rag_docs_001": 1
+    },
+    "max_context_length": 8192,
+    "total_expected_output_tokens": 768
+  }
+}

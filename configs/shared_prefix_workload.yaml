@@ -1,0 +1,34 @@
+# Shared-prefix ablation workload configuration
+# Simulates RAG / multi-turn dialogue: fixed 2K system prompt + varying user query
+# This is the most valuable scenario for KV-cache reuse.
+
+workload:
+  name: shared_prefix_ablation
+  description: |
+    Shared-prefix workload for ablation experiments:
+    Group A: pure LMCache CPU, no pressure/scorer/prefetch
+    Group B: + Memory Pressure Controller
+    Group C: + Chunk Scorer
+    Group D: + Selective Prefetch (full system)
+
+  shared_prefix_tokens: 2048   # Simulates long system prompt / RAG context
+  query_tokens: [128, 256, 512]
+  batch_sizes: [1, 2, 4]
+  repeat: 5
+  output_tokens: 64
+
+  model:
+    default: "Qwen/Qwen2.5-7B-Instruct"
+    fallback: "Qwen/Qwen2.5-1.5B-Instruct"
+
+  server:
+    gpu_memory_utilization: 0.60
+    max_model_len: 8192
+
+  metrics:
+    - ttft_ms          # Time to first token
+    - throughput_tps   # Tokens per second
+    - oom_rate         # Out-of-memory rate
+    - cache_hit_rate   # KV-cache hit rate
+    - gpu_mem_peak_mb  # GPU peak memory
+    - cpu_rss_peak_mb  # CPU peak RSS

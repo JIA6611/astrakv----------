@@ -1,0 +1,4 @@
+# LMCache CPU backend with a tighter host-memory cache budget for constrained runs.
+
+local_cpu: true
+max_local_cpu_size: 8.0

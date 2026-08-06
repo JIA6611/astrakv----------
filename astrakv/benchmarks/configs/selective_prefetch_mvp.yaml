@@ -1,0 +1,32 @@
+run_name: selective_prefetch_mvp
+
+benchmark:
+  type: selective_prefetch_mvp
+
+matrix:
+  batch_sizes: [1, 2, 4]
+  context_lengths: [512, 1024, 2048]
+  output_tokens: 32
+  repeat: 1
+
+synthetic_backend:
+  prefill_ms_per_token: 0.018
+  decode_ms_per_token: 0.9
+  batch_overhead_ms: 1.5
+  deterministic_jitter_ratio: 0.04
+
+prefetch_mvp:
+  gpu_capacity_blocks: 4
+  block_size_bytes: 16777216
+  blocks_per_context: 8
+  reuse_stride: 4
+  prefetch_window: 2
+  max_queue_size: 16
+  prefetch_latency_ms: 0.15
+  cpu_miss_latency_ms: 1.2
+  gpu_hit_latency_ms: 0.02
+  prefetch_hit_latency_ms: 0.03
+
+disk_io:
+  scratch_file_mb: 8
+  block_mb: 1

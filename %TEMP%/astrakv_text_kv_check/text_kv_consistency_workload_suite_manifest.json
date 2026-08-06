@@ -1,0 +1,29 @@
+{
+  "schema": "astrakv-text-kv-consistency-workload-suite-v1",
+  "target_context_lengths": [
+    32768,
+    131072
+  ],
+  "target_block_size_tokens": 16,
+  "expected_output_tokens": 64,
+  "batch_size": 1,
+  "model_path": "",
+  "contexts": {
+    "32768": {
+      "label": "ctx32k",
+      "analysis_workload": "%TEMP%\\astrakv_text_kv_check\\ctx32k\\analysis_workload.jsonl",
+      "warmup_workload": "%TEMP%\\astrakv_text_kv_check\\ctx32k\\warmup_workload.jsonl",
+      "pairwise_reference_replay": "%TEMP%\\astrakv_text_kv_check\\ctx32k\\pairwise_reference_replay.jsonl",
+      "manifest": "%TEMP%\\astrakv_text_kv_check\\ctx32k\\text_kv_consistency_workload_manifest.json",
+      "report": "%TEMP%\\astrakv_text_kv_check\\ctx32k\\text_kv_consistency_workload_report.md"
+    },
+    "131072": {
+      "label": "ctx128k",
+      "analysis_workload": "%TEMP%\\astrakv_text_kv_check\\ctx128k\\analysis_workload.jsonl",
+      "warmup_workload": "%TEMP%\\astrakv_text_kv_check\\ctx128k\\warmup_workload.jsonl",
+      "pairwise_reference_replay": "%TEMP%\\astrakv_text_kv_check\\ctx128k\\pairwise_reference_replay.jsonl",
+      "manifest": "%TEMP%\\astrakv_text_kv_check\\ctx128k\\text_kv_consistency_workload_manifest.json",
+      "report": "%TEMP%\\astrakv_text_kv_check\\ctx128k\\text_kv_consistency_workload_report.md"
+    }
+  }
+}

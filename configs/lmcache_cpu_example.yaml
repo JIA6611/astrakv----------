@@ -1,0 +1,6 @@
+# Example-only LMCache CPU backend config.
+# LMCache configuration keys can change across releases. Verify against the
+# installed LMCache documentation before using this file as a launcher input.
+
+local_cpu: true
+max_local_cpu_size: 20.0

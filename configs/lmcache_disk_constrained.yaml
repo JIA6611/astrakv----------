@@ -1,0 +1,6 @@
+# LMCache disk backend with a small CPU cache and bounded local disk store.
+
+local_cpu: true
+max_local_cpu_size: 4.0
+local_disk: results/lmcache_disk_store
+max_local_disk_size: 40.0

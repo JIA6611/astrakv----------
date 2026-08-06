@@ -1,0 +1,2 @@
+backend,request_count,ok_count,error_count,avg_latency_ms,avg_ttft_ms,avg_tpot_ms,p95_latency_ms,p95_ttft_ms,shared_context_count
+vllm,2,0,0,0.0,0.0,0.0,0.0,0.0,1

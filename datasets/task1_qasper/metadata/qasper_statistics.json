@@ -1,0 +1,21 @@
+{
+  "dataset": "longbench",
+  "task": "qasper",
+  "sample_count": 200,
+  "average_context_tokens": 4500.28,
+  "max_context_tokens": 18878,
+  "reuse_group_count": 148,
+  "average_group_size": 1.3513513513513513,
+  "max_group_size": 3,
+  "shared_group_count": 43,
+  "total_chunks": 1504,
+  "average_chunks_per_sample": 7.52,
+  "total_estimated_kv_tokens": 908151,
+  "average_estimated_kv_tokens": 4540.755,
+  "total_estimated_reusable_tokens": 395709,
+  "reusable_token_ratio": 0.4357304016622786,
+  "prefetch_candidate_count": 95,
+  "offload_candidate_count": 173,
+  "random_workload_count": 200,
+  "grouped_workload_count": 200
+}

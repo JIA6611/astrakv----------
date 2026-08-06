@@ -1,0 +1,60 @@
+run_name: real_lmcache_gpu_ssd_qwen3_8b
+require_canonical_workload: true
+workload_jsonl: ""
+
+backend:
+  name: vllm_lmcache_disk
+  base_url: http://127.0.0.1:8000/v1
+  api_key: EMPTY
+  model: /opt/models/Qwen3-8B
+  fallback_model: /opt/models/Qwen2.5-7B-Instruct
+  timeout_seconds: 600
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  dtype: auto
+  gpu_memory_utilization: 0.72
+  max_model_len: 32768
+  tensor_parallel_size: 1
+  trust_remote_code: true
+
+lmcache:
+  enabled: true
+  backend: disk
+  topology: gpu_ssd_only
+  cpu_layer_enabled: false
+  cpu_staging_enabled: true
+  cpu_staging_size_gb: 2.0
+  cpu_staging_note: "Required same-NUMA staging allocator for LMCache LocalDiskBackend; it is not a CPU hot-cache tier."
+  config_file: configs/lmcache_disk_example.yaml
+  local_disk: results/lmcache_gpu_ssd_store
+  kv_transfer_config:
+    kv_connector: LMCacheConnectorV1
+    kv_role: kv_both
+  note: "Verify the installed LMCache/vLLM versions accept LMCacheConnectorV1 before official runs."
+
+matrix:
+  # P0-3 disk-tier baseline matrix. Keep this aligned with the vLLM-only and
+  # LMCache CPU matrices so reports can compare all three backends directly.
+  # Override these values from the CLI for quick smoke tests.
+  batch_sizes: [1, 2, 4]
+  context_lengths: [512, 1024, 2048, 4096, 8192]
+  output_tokens: 64
+  repeat: 5
+
+workload:
+  system_prompt: "You are a concise assistant for systems research experiments."
+  prompt_seed: "AstraKV-W evaluates disk-tier KV offload and restore behavior."
+  prompt_token_scale: 0.75
+  temperature: 0.0
+  top_p: 1.0
+
+metrics:
+  sample_interval_seconds: 0.5
+  disk_device: ""
+  process_name_filters: ["vllm", "lmcache", "python"]
+
+disk_io:
+  scratch_file_mb: 64
+  block_mb: 4

@@ -1,0 +1,21 @@
+schema: astrakv-dataset-pilot-matrix-v1
+sampling:
+  seed: 20260717
+  smoke_request_count: 10
+  pilot_request_count: 50
+  selection_method: published_arrival_order_prefix
+required_dataset_slots:
+  - slot: qasper
+    dataset_id: qasper
+    source_id: task1-qasper-immutable
+    status: observation_pending
+    reason: Tokenizer-backed raw QASPER observation has not been generated yet.
+  - slot: independent_dataset_2
+    dataset_id: null
+    status: unavailable
+    reason: A second semantic-independent dataset has not been named or supplied.
+  - slot: independent_dataset_3
+    dataset_id: null
+    status: unavailable
+    reason: A third semantic-independent dataset has not been named or supplied.
+composed_stress: []

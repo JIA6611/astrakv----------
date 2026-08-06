@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Model checkpoints and data
+checkpoints/
+data/
+models/*
+!models/README.md
+*.deb
+
+# Build outputs
+build/
+dist/
+*.egg-info/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# Large/generated research artifacts
+results/**
+!results/
+!results/README.md
+reports/*
+
+# Local editor files
+.idea/
+.vscode/
+
+# Third-party repositories are intentionally cloned for local analysis.
+# Keep them unmodified unless a later stage explicitly authorizes changes.
+third_party/*

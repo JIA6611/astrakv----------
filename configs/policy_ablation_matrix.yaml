@@ -1,0 +1,59 @@
+run_name: astrakv_policy_ablation
+
+description: >
+  Read-only policy ablation matrix for competition reporting. Replace paths
+  with real result directories after GPU runs complete.
+
+policies:
+  - label: no_prefetch
+    kind: no_prefetch
+    benchmark: results/p0_1_vllm
+    notes: vLLM-only or no-prefetch demand-serving baseline.
+
+  - label: lmcache_cpu_default
+    kind: lmcache_default
+    benchmark: results/p0_2_lmcache_cpu
+    notes: LMCache CPU-tier default behavior without AstraKV-W policy guidance.
+
+  - label: lmcache_disk_default
+    kind: lmcache_default
+    benchmark: results/p0_3_lmcache_disk
+    notes: LMCache disk-tier default behavior without AstraKV-W policy guidance.
+
+  - label: next_n
+    kind: next_n
+    chunk_scores: results/p1_4_next_n
+    notes: Optional next-N policy artifact under the same workload.
+
+  - label: lru_aware
+    kind: lru_aware
+    chunk_scores: results/p1_4_lru_aware
+    notes: Optional LRU-aware policy artifact under the same workload.
+
+  - label: reuse_aware
+    kind: reuse_aware
+    chunk_scores: results/p1_3_chunk_scores
+    notes: ProfileDB reuse-aware scorer output.
+
+  - label: deadline_aware
+    kind: deadline_aware
+    chunk_scores: results/p1_4_deadline_aware
+    notes: Optional deadline-sensitive scorer output.
+
+  - label: astrakv_combined
+    kind: astrakv_combined
+    benchmark: results/p0_8_selective_prefetch
+    prefetch: results/p0_8_selective_prefetch
+    chunk_scores: results/p1_3_chunk_scores
+    notes: AstraKV-W combined policy evidence from benchmark, prefetch, and chunk-score artifacts.
+
+usage:
+  command: >
+    python scripts/analyze_policy_ablation.py
+    --config configs/policy_ablation_matrix.yaml
+    --output-dir results/p1_4_policy_ablation
+
+notes:
+  - This config is intentionally non-invasive; it only points to artifacts.
+  - Empty or missing paths are reported as missing evidence, not treated as zeros.
+  - For official results, ensure all listed directories contain same-workload CSV artifacts.

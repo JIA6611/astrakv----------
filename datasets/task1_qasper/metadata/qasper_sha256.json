@@ -1,0 +1,60 @@
+{
+  "schema": "astra-workload-sha256-v1",
+  "files": {
+    "processed": {
+      "path": "datasets\\processed\\qasper\\samples.jsonl",
+      "sha256": "sha256:98ae4037b8c237c619efc04237dd5a0f2bc4e67808fbde5cda84a6860779e891",
+      "bytes": 5089739
+    },
+    "metadata": {
+      "path": "datasets\\metadata\\qasper\\metadata.jsonl",
+      "sha256": "sha256:84ed8fba75543022c6a72f453464878adee0a71c44df465559c898ebda775238",
+      "bytes": 6464360
+    },
+    "context_blocks": {
+      "path": "datasets\\metadata\\qasper\\context_blocks.jsonl",
+      "sha256": "sha256:7ecda0c1e4e15bffb2f228d0dc30b49640fc8c41e825f4d1dcb77e6c1a7a88e1",
+      "bytes": 5741727
+    },
+    "dependency_graph": {
+      "path": "datasets\\metadata\\qasper\\dependency_graph.jsonl",
+      "sha256": "sha256:644244d509a5b1e69287ef7118acc51bf205abaae6c5dfa0452604c6b8179ba7",
+      "bytes": 611704
+    },
+    "reuse_groups": {
+      "path": "datasets\\metadata\\qasper\\reuse_groups.json",
+      "sha256": "sha256:97edf76a52330303c80e23654a5156a41d6119deaccb8553e470c86d45c79ebd",
+      "bytes": 37536
+    },
+    "manifest": {
+      "path": "datasets\\metadata\\qasper\\manifest.json",
+      "sha256": "sha256:cd56500e3f7dde01f0b1d1a1bda3d4bbfb76c368a2dd23d7afb5c0a46c81aa97",
+      "bytes": 2224
+    },
+    "statistics": {
+      "path": "datasets\\metadata\\qasper\\statistics.json",
+      "sha256": "sha256:3a1c38f9703dc77aebe4248b30fc7a9e03f06b31cf91573811e84d1ecd512ac6",
+      "bytes": 649
+    },
+    "random_workload": {
+      "path": "datasets\\workloads\\qasper\\random.jsonl",
+      "sha256": "sha256:e402bc8f5c3155c18129a78cc063506f26f258b50b71f58015651823ec20890d",
+      "bytes": 5026330
+    },
+    "grouped_workload": {
+      "path": "datasets\\workloads\\qasper\\grouped.jsonl",
+      "sha256": "sha256:6a5f2bae27d9210c974f31ac9ee1766a430a60241eb0d9abd1e25e381b755888",
+      "bytes": 5026530
+    },
+    "validation_json": {
+      "path": "datasets\\reports\\qasper\\validation.json",
+      "sha256": "sha256:c400163c5538fb2bda491e44fd9d469e2da4a1334dd9075f95f0b77659ae1961",
+      "bytes": 380
+    },
+    "validation_report": {
+      "path": "datasets\\reports\\qasper\\validation_report.md",
+      "sha256": "sha256:0d62f650eeb2ccd9918c70286aa200d7d8e8c3c5b2e0d2be32ed1fb904315587",
+      "bytes": 434
+    }
+  }
+}

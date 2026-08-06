@@ -1,0 +1,64 @@
+schema: astra-multi-model-evaluation-matrix-v1
+description: >
+  Recommended P2-7 official evaluation matrix. Each item should be run with
+  scripts/run_real_benchmark.py on a real GPU endpoint, then summarized with
+  scripts/analyze_multi_model_evaluation.py.
+
+models:
+  - model_id: qwen2_5_7b
+    model_family: dense
+    recommended_checkpoint: Qwen/Qwen2.5-7B-Instruct
+    required: true
+    purpose: Dense baseline for KV cache and memory-tier behavior.
+    backends:
+      - vllm
+      - lmcache_cpu
+      - lmcache_disk
+      - astrakv_prefetch
+
+  - model_id: mixtral_small_or_equivalent
+    model_family: moe
+    recommended_checkpoint: Mixtral-compatible MoE checkpoint available on the GPU host
+    required: true
+    purpose: MoE expert activation/loading/prediction validation.
+    backends:
+      - vllm
+      - astrakv_moe_trace
+      - astrakv_moe_prefetch
+
+  - model_id: long_context_dense_or_equivalent
+    model_family: long_context
+    recommended_checkpoint: Any locally available long-context dense model
+    required: false
+    purpose: Stress long-context KV capacity and tiering.
+    backends:
+      - vllm
+      - lmcache_cpu
+      - lmcache_disk
+
+workload_matrix:
+  context_lengths:
+    - 512
+    - 2048
+    - 4096
+    - 8192
+  batch_sizes:
+    - 1
+    - 2
+  output_tokens: 128
+  repeat: 3
+
+required_artifacts:
+  - benchmark_results.csv
+  - benchmark_report.md
+  - request_results.jsonl
+  - samples/<case>_samples.csv
+
+summary_command_template: >
+  python scripts/analyze_multi_model_evaluation.py
+  --run qwen2_5_7b:dense:vllm=results/p0_1_vllm
+  --run qwen2_5_7b:dense:lmcache_cpu=results/p0_2_lmcache_cpu
+  --run qwen2_5_7b:dense:lmcache_disk=results/p0_3_lmcache_disk
+  --run mixtral_small_or_equivalent:moe:vllm=results/moe_vllm
+  --run mixtral_small_or_equivalent:moe:astrakv_moe_prefetch=results/moe_astrakv
+  --output-dir results/p2_7_multi_model_evaluation

@@ -1,0 +1,11 @@
+# Optional physical-media probe. Credit results only when LMCache logs confirm O_DIRECT without alignment fallback.
+local_cpu: false
+max_local_cpu_size: 2.0
+local_disk: results/lmcache_gpu_ssd_store
+max_local_disk_size: 80.0
+internal_api_server_enabled: true
+internal_api_server_host: 127.0.0.1
+internal_api_server_port_start: 6999
+internal_api_server_include_index_list: [1]
+extra_config:
+  use_odirect: true

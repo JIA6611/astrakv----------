@@ -1,0 +1,46 @@
+{
+  "schema": "astrakv-text-kv-consistency-workload-v2",
+  "context_length": 32768,
+  "target_context_lengths": [
+    32768
+  ],
+  "target_block_size_tokens": 16,
+  "analysis_request_count": 3,
+  "warmup_request_count": 3,
+  "replay_request_count": 6,
+  "similarity_buckets": [
+    "exact",
+    "sim90",
+    "sim80"
+  ],
+  "warmup_conditions": [
+    "cold",
+    "warm",
+    "hot"
+  ],
+  "target_prefix_ratios": {
+    "exact": 1.0,
+    "sim90": 0.9,
+    "sim80": 0.8
+  },
+  "target_mutation_start_block": {
+    "exact": 2048,
+    "sim90": 1843,
+    "sim80": 1638
+  },
+  "expected_reusable_blocks": {
+    "exact": 2048,
+    "sim90": 1843,
+    "sim80": 1638
+  },
+  "analysis_request_ids": [
+    "exact-probe",
+    "sim90-probe",
+    "sim80-probe"
+  ],
+  "warmup_request_ids": [
+    "exact-anchor",
+    "sim90-anchor",
+    "sim80-anchor"
+  ]
+}

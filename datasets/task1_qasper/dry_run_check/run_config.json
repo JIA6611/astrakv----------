@@ -1,0 +1,16 @@
+{
+  "prompts": "任务一\\prompts\\qasper_random_prompts.jsonl",
+  "base_url": "http://127.0.0.1:8000",
+  "api_key": "EMPTY",
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "backend": "vllm",
+  "output_dir": "任务一\\dry_run_check",
+  "limit": 2,
+  "timeout": 600.0,
+  "max_tokens": 0,
+  "temperature": null,
+  "top_p": null,
+  "no_stream": false,
+  "dry_run": true,
+  "prompt_count": 2
+}

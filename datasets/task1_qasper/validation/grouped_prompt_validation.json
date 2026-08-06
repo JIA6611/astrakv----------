@@ -1,0 +1,15 @@
+{
+  "schema": "astra-workload-prompt-validation-v1",
+  "workload_path": "datasets\\workloads\\qasper\\grouped.jsonl",
+  "prompts_path": "results\\workload_prompts\\qasper\\grouped_prompts.jsonl",
+  "passed": true,
+  "error_count": 0,
+  "errors": [],
+  "checks": {
+    "prompt_count": 200,
+    "json_roundtrip": true,
+    "request_ids_unique": true,
+    "sample_order_preserved": true,
+    "question_answer_ground_truth_immutable": true
+  }
+}

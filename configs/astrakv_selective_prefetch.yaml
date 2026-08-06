@@ -1,0 +1,16 @@
+run_name: astrakv_selective_prefetch_overlay
+
+purpose: >
+  Real-runtime overlay config for AstraKV-W V0.1. This keeps the existing
+  SelectiveKVPrefetchMVP as a policy simulator and does not claim real vLLM KV
+  control until a concrete LMCache/vLLM adapter is enabled.
+
+base_real_benchmark_config: configs/dgx_spark_vllm_qwen7b.yaml
+
+policy_simulator:
+  module: astrakv.prefetch.selective_kv
+  gpu_capacity_blocks: 4
+  block_size_bytes: 16777216
+  prefetch_window: 2
+  max_queue_size: 16
+  note: "Simulator-only metrics must be reported separately from real endpoint metrics."

@@ -1,0 +1,43 @@
+run_name: stress_lmcache_cpu_extreme_memory_constrained
+
+backend:
+  name: vllm_lmcache_cpu_extreme_stress
+  base_url: http://127.0.0.1:8000/v1
+  api_key: EMPTY
+  model: /home/szl/Desktop/Inference-OS/models/Qwen2.5-7B-Instruct
+  timeout_seconds: 900
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  dtype: auto
+  gpu_memory_utilization: 0.45
+  max_model_len: 16384
+  tensor_parallel_size: 1
+  trust_remote_code: true
+
+lmcache:
+  enabled: true
+  backend: cpu
+  config_file: configs/lmcache_cpu_constrained.yaml
+  kv_transfer_config:
+    kv_connector: LMCacheConnectorV1
+    kv_role: kv_both
+
+matrix:
+  batch_sizes: [1, 2, 4, 8]
+  context_lengths: [8192, 12288, 16384]
+  output_tokens: 128
+  repeat: 2
+
+workload:
+  system_prompt: "You are a concise assistant for systems research stress tests."
+  prompt_seed: "AstraKV-W extreme memory-constrained LMCache CPU stress benchmark."
+  prompt_token_scale: 0.70
+  temperature: 0.0
+  top_p: 1.0
+
+metrics:
+  sample_interval_seconds: 0.5
+  disk_device: ""
+  process_name_filters: ["vllm", "lmcache", "python"]

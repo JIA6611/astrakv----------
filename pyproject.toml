@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "astrakv-w"
+version = "0.2.0"
+description = "Memory-Constrained LLM Inference with OS Virtual Memory Techniques"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "AstraKV-W Team"},
+]
+keywords = ["llm", "inference", "virtual-memory", "kv-cache", "prefetch", "offload"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "numpy>=1.24",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "torch>=2.0",
+    "transformers>=4.30",
+]
+report = [
+    "pandas>=2.0",
+    "tabulate>=0.9",
+]
+dev = [
+    "pytest>=7.0",
+]
+all = [
+    "astrakv-w[gpu,report,dev]",
+]
+
+[project.scripts]
+astrakv-benchmark = "astrakv.cli.benchmark:main"
+astrakv-prefetch = "astrakv.cli.prefetch:main"
+astrakv-analyze = "astrakv.cli.analyze:main"
+astrakv-vm = "astrakv.cli.vm:main"
+
+[project.urls]
+Homepage = "https://github.com/example/astrakv-w"
+Documentation = "https://github.com/example/astrakv-w/docs"
+
+[tool.setuptools.packages.find]
+include = ["astrakv*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

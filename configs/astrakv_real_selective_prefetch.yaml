@@ -1,0 +1,32 @@
+run_name: astrakv_real_selective_prefetch
+
+backend:
+  name: vllm_lmcache_selective_prefetch
+  base_url: http://127.0.0.1:8000/v1
+  api_key: EMPTY
+  model: /home/szl/Desktop/Inference-OS/models/Qwen2.5-7B-Instruct
+  timeout_seconds: 900
+
+matrix:
+  context_lengths: [1024, 2048, 4096]
+  output_tokens: 64
+  repeat: 3
+
+workload:
+  system_prompt: "You are a concise assistant for cache prefetch validation."
+  prompt_seed: "AstraKV-W real selective prefetch repeated-prefix validation."
+  prompt_token_scale: 0.70
+  temperature: 0.0
+  top_p: 1.0
+
+prefetch:
+  policy: repeated_prefix_warmup
+  target_tier: gpu
+  warmup_output_tokens: 1
+  hit_improvement_threshold_pct: 5.0
+  cache_events: []
+
+notes:
+  - "This config uses endpoint-level warmup requests as real prefetch hints."
+  - "Run against vLLM + LMCache CPU or disk backend for official cache evidence."
+  - "Parse server logs with scripts/extract_cache_events.py and attach cache_events.jsonl for final reporting."

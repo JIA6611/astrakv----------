@@ -1,0 +1,21 @@
+run_name: baseline_synthetic
+
+matrix:
+  batch_sizes: [1, 2, 4]
+  context_lengths: [128, 512, 1024]
+  output_tokens: 16
+  repeat: 1
+
+synthetic_backend:
+  prefill_ms_per_token: 0.018
+  decode_ms_per_token: 0.9
+  batch_overhead_ms: 1.5
+  deterministic_jitter_ratio: 0.04
+
+cache:
+  kv_cache_capacity: 16
+  prefetch_distance: 1
+
+disk_io:
+  scratch_file_mb: 8
+  block_mb: 1

@@ -1,0 +1,45 @@
+run_name: real_vllm_qwen3_8b
+require_canonical_workload: true
+workload_jsonl: ""
+
+backend:
+  name: vllm_openai
+  base_url: http://127.0.0.1:8000/v1
+  api_key: EMPTY
+  model: /opt/models/Qwen3-8B
+  fallback_model: /opt/models/Qwen2.5-7B-Instruct
+  timeout_seconds: 600
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  dtype: auto
+  gpu_memory_utilization: 0.78
+  max_model_len: 32768
+  tensor_parallel_size: 1
+  trust_remote_code: true
+
+matrix:
+  # P0-1 competition baseline matrix. Override these values from the CLI for
+  # quick smoke tests, for example `--context-lengths 512 --batch-sizes 1
+  # --output-tokens 8 --repeat 1`.
+  batch_sizes: [1, 2, 4]
+  context_lengths: [512, 1024, 2048, 4096, 8192]
+  output_tokens: 64
+  repeat: 5
+
+workload:
+  system_prompt: "You are a concise assistant for systems research experiments."
+  prompt_seed: "AstraKV-W evaluates memory-constrained large language model inference."
+  prompt_token_scale: 0.75
+  temperature: 0.0
+  top_p: 1.0
+
+metrics:
+  sample_interval_seconds: 0.5
+  disk_device: ""
+  process_name_filters: ["vllm", "python"]
+
+disk_io:
+  scratch_file_mb: 64
+  block_mb: 4

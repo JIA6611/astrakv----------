@@ -1,0 +1,175 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1500 1040">
+  <defs>
+    <style>
+      .title { font: bold 28px sans-serif; fill: #162033; }
+      .subtitle { font: 14px sans-serif; fill: #52606d; }
+      .section { font: bold 18px sans-serif; fill: #1f2937; }
+      .label { font: 14px sans-serif; fill: #1f2937; }
+      .small { font: 12px sans-serif; fill: #52606d; }
+      .note { font: 12px sans-serif; fill: #8a4b00; }
+      .box { stroke: #314a68; stroke-width: 2; rx: 12; ry: 12; }
+      .blue { fill: #eef5ff; }
+      .green { fill: #edf8ef; }
+      .orange { fill: #fff1e6; }
+      .violet { fill: #f6f0ff; }
+      .gray { fill: #f3f5f8; }
+      .cyan { fill: #e9f8fb; }
+      .pink { fill: #fff0f5; }
+      .line { stroke: #5f728b; stroke-width: 2.5; fill: none; marker-end: url(#arrow); }
+      .dashed { stroke: #c8862c; stroke-width: 2.5; fill: none; stroke-dasharray: 6 5; marker-end: url(#arrowOrange); }
+      .feedback { stroke: #6a7688; stroke-width: 2.5; fill: none; stroke-dasharray: 6 5; marker-end: url(#arrowGray); }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5f728b"/>
+    </marker>
+    <marker id="arrowOrange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#c8862c"/>
+    </marker>
+    <marker id="arrowGray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6a7688"/>
+    </marker>
+  </defs>
+
+  <text x="750" y="38" text-anchor="middle" class="title">AstraKV-W 控制平面与分析平面</text>
+  <text x="750" y="62" text-anchor="middle" class="subtitle">真实 endpoint + endpoint-level selective prefetch/warmup + cache events / ProfileDB / policy chain / report archive</text>
+
+  <rect x="40" y="95" width="1420" height="175" class="box blue"/>
+  <text x="750" y="122" text-anchor="middle" class="section">外部推理运行时（不修改第三方核心源码）</text>
+
+  <rect x="80" y="145" width="250" height="88" class="box blue"/>
+  <text x="205" y="178" text-anchor="middle" class="label">plain vLLM</text>
+  <text x="205" y="199" text-anchor="middle" class="small">baseline / stress / boundary</text>
+
+  <rect x="350" y="145" width="250" height="88" class="box blue"/>
+  <text x="475" y="178" text-anchor="middle" class="label">vLLM + LMCache CPU</text>
+  <text x="475" y="199" text-anchor="middle" class="small">CPU tier / KV offload evidence</text>
+
+  <rect x="620" y="145" width="250" height="88" class="box blue"/>
+  <text x="745" y="178" text-anchor="middle" class="label">vLLM + LMCache Disk</text>
+  <text x="745" y="199" text-anchor="middle" class="small">disk I/O / cache event evidence</text>
+
+  <rect x="890" y="145" width="250" height="88" class="box orange"/>
+  <text x="1015" y="178" text-anchor="middle" class="label">AstraKV endpoint warmup</text>
+  <text x="1015" y="199" text-anchor="middle" class="small">selective prefetch / warmup</text>
+
+  <rect x="1160" y="145" width="260" height="88" class="box gray"/>
+  <text x="1290" y="178" text-anchor="middle" class="label">可选扩展</text>
+  <text x="1290" y="199" text-anchor="middle" class="small">MoE / 其他后端，当前为离线分析</text>
+
+  <rect x="40" y="305" width="1420" height="165" class="box pink"/>
+  <text x="750" y="333" text-anchor="middle" class="section">提测编排与服务生命周期</text>
+
+  <rect x="75" y="355" width="250" height="84" class="box pink"/>
+  <text x="200" y="388" text-anchor="middle" class="label">cli.py / configs</text>
+  <text x="200" y="409" text-anchor="middle" class="small">统一入口与运行参数</text>
+
+  <rect x="350" y="355" width="250" height="84" class="box pink"/>
+  <text x="475" y="388" text-anchor="middle" class="label">launch scripts</text>
+  <text x="475" y="409" text-anchor="middle" class="small">launch_vllm / launch_lmcache</text>
+
+  <rect x="625" y="355" width="250" height="84" class="box pink"/>
+  <text x="750" y="388" text-anchor="middle" class="label">run_real_benchmark.py</text>
+  <text x="750" y="409" text-anchor="middle" class="small">CSV / JSONL / samples / charts</text>
+
+  <rect x="900" y="355" width="250" height="84" class="box pink"/>
+  <text x="1025" y="388" text-anchor="middle" class="label">run_competition_e2e.sh</text>
+  <text x="1025" y="409" text-anchor="middle" class="small">official / extreme / report</text>
+
+  <rect x="1175" y="355" width="245" height="84" class="box pink"/>
+  <text x="1297" y="388" text-anchor="middle" class="label">extended evidence</text>
+  <text x="1297" y="409" text-anchor="middle" class="small">32K boundary / VM / quality / archive</text>
+
+  <rect x="40" y="495" width="690" height="205" class="box cyan"/>
+  <text x="385" y="523" text-anchor="middle" class="section">观测与证据采集</text>
+
+  <rect x="75" y="548" width="185" height="120" class="box cyan"/>
+  <text x="168" y="577" text-anchor="middle" class="label">benchmark / log</text>
+  <text x="168" y="598" text-anchor="middle" class="small">benchmark_results.csv</text>
+  <text x="168" y="618" text-anchor="middle" class="small">request_results.jsonl</text>
+  <text x="168" y="638" text-anchor="middle" class="small">server log / samples</text>
+
+  <rect x="280" y="548" width="185" height="120" class="box cyan"/>
+  <text x="373" y="577" text-anchor="middle" class="label">cache events</text>
+  <text x="373" y="598" text-anchor="middle" class="small">hit / miss / store / load</text>
+  <text x="373" y="618" text-anchor="middle" class="small">trace schema</text>
+  <text x="373" y="638" text-anchor="middle" class="small">read-only parser</text>
+
+  <rect x="485" y="548" width="185" height="120" class="box cyan"/>
+  <text x="577" y="577" text-anchor="middle" class="label">VM evidence</text>
+  <text x="577" y="598" text-anchor="middle" class="small">mmap demo / DGX VM</text>
+  <text x="577" y="618" text-anchor="middle" class="small">resident ratio</text>
+  <text x="577" y="638" text-anchor="middle" class="small">cold / warm read</text>
+
+  <rect x="760" y="495" width="700" height="205" class="box violet"/>
+  <text x="1110" y="523" text-anchor="middle" class="section">ProfileDB 与策略链（advisory）</text>
+
+  <rect x="800" y="548" width="190" height="120" class="box violet"/>
+  <text x="895" y="577" text-anchor="middle" class="label">KV metadata</text>
+  <text x="895" y="598" text-anchor="middle" class="small">KVChunkMeta</text>
+  <text x="895" y="618" text-anchor="middle" class="small">KVBlockTable</text>
+  <text x="895" y="638" text-anchor="middle" class="small">RuntimeObjectManager</text>
+
+  <rect x="1015" y="548" width="190" height="120" class="box violet"/>
+  <text x="1110" y="577" text-anchor="middle" class="label">ProfileDB / scoring</text>
+  <text x="1110" y="598" text-anchor="middle" class="small">ChunkScorer</text>
+  <text x="1110" y="618" text-anchor="middle" class="small">Partial Load</text>
+  <text x="1110" y="638" text-anchor="middle" class="small">Load / Recompute</text>
+
+  <rect x="1230" y="548" width="190" height="120" class="box violet"/>
+  <text x="1325" y="577" text-anchor="middle" class="label">scheduler hints</text>
+  <text x="1325" y="598" text-anchor="middle" class="small">keep / offload / drop</text>
+  <text x="1325" y="618" text-anchor="middle" class="small">load vs recompute</text>
+  <text x="1325" y="638" text-anchor="middle" class="small">future adapter input</text>
+
+  <rect x="40" y="740" width="1420" height="210" class="box green"/>
+  <text x="750" y="768" text-anchor="middle" class="section">结果归档、边界证据与报告</text>
+
+  <rect x="75" y="795" width="265" height="112" class="box green"/>
+  <text x="208" y="824" text-anchor="middle" class="label">32K boundary</text>
+  <text x="208" y="845" text-anchor="middle" class="small">0.15 失败 / 0.16 可运行</text>
+  <text x="208" y="865" text-anchor="middle" class="small">KV cache capacity evidence</text>
+  <text x="208" y="885" text-anchor="middle" class="small">disk write / P95 / TTFT</text>
+
+  <rect x="365" y="795" width="265" height="112" class="box green"/>
+  <text x="498" y="824" text-anchor="middle" class="label">benchmark artifacts</text>
+  <text x="498" y="845" text-anchor="middle" class="small">comparison / stress / quality</text>
+  <text x="498" y="865" text-anchor="middle" class="small">samples / charts / reports</text>
+  <text x="498" y="885" text-anchor="middle" class="small">artifact inventory</text>
+
+  <rect x="655" y="795" width="265" height="112" class="box green"/>
+  <text x="788" y="824" text-anchor="middle" class="label">competition report</text>
+  <text x="788" y="845" text-anchor="middle" class="small">final markdown</text>
+  <text x="788" y="865" text-anchor="middle" class="small">archive / manifest</text>
+  <text x="788" y="885" text-anchor="middle" class="small">submission material</text>
+
+  <rect x="945" y="795" width="265" height="112" class="box gray"/>
+  <text x="1078" y="824" text-anchor="middle" class="label">推荐证据包</text>
+  <text x="1078" y="845" text-anchor="middle" class="small">完整扩展证据包</text>
+  <text x="1078" y="865" text-anchor="middle" class="small">32K 可运行边界证据</text>
+  <text x="1078" y="885" text-anchor="middle" class="small">32K 失败边界证据</text>
+
+  <rect x="1235" y="795" width="190" height="112" class="box gray"/>
+  <text x="1330" y="824" text-anchor="middle" class="label">optional research</text>
+  <text x="1330" y="845" text-anchor="middle" class="small">synthetic benchmark</text>
+  <text x="1330" y="865" text-anchor="middle" class="small">MoE route analysis</text>
+  <text x="1330" y="885" text-anchor="middle" class="small">offline extension</text>
+
+  <path d="M 205 233 L 205 355" class="dashed"/>
+  <path d="M 475 233 L 475 355" class="dashed"/>
+  <path d="M 745 233 L 745 355" class="dashed"/>
+  <path d="M 1015 233 L 1025 355" class="dashed"/>
+  <path d="M 1280 233 L 1280 355" class="feedback"/>
+
+  <path d="M 200 439 L 168 548" class="line"/>
+  <path d="M 475 439 L 373 548" class="line"/>
+  <path d="M 750 439 L 577 548" class="line"/>
+  <path d="M 1025 439 L 895 548" class="line"/>
+  <path d="M 1297 439 L 1110 548" class="line"/>
+
+  <path d="M 577 668 L 1110 548" class="feedback"/>
+  <path d="M 1110 668 L 788 795" class="line"/>
+  <path d="M 1325 668 L 1078 795" class="line"/>
+  <path d="M 1110 668 L 208 795" class="feedback"/>
+
+  <text x="40" y="1005" class="note">边界：预取是 endpoint-level warmup；策略链是 advisory 输出；OS VM 路径是机制 PoC，不声明替换 vLLM/LMCache 内部调度。</text>
+</svg>

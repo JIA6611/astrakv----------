@@ -1,0 +1,9 @@
+# DGX production topology: vLLM GPU cache plus LMCache SSD persistence only.
+# local_cpu=false disables the CPU hot cache; this bounded allocator is required as same-NUMA SSD I/O staging by LMCache LocalDiskBackend.
+# LMCache configuration keys can change across releases. Verify against the
+# installed LMCache documentation before using this file as a launcher input.
+
+local_cpu: false
+max_local_cpu_size: 2.0
+local_disk: results/lmcache_gpu_ssd_store
+max_local_disk_size: 80.0

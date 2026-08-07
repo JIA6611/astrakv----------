@@ -10,10 +10,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 from astrakv.runtime.runtime_control_host import RuntimeControlHost, RuntimeControlHostConfig
+from astrakv.runtime.kv_core_connector import KVCoreConnectorCallbacks
+from astrakv.runtime.kv_runtime_core import RuntimeMode, TierCapabilitySnapshot, TierTopology
+from astrakv.runtime.third_party_patch import PATCH_ID
 
 _LOCK = threading.Lock()
 _INSTALLED = False
 _HOST: RuntimeControlHost | None = None
+_KV_CORE_CALLBACKS: KVCoreConnectorCallbacks | None = None
 
 
 def _is_vllm_engine_child() -> bool:
@@ -34,11 +38,44 @@ def installed_runtime_control_host() -> RuntimeControlHost | None:
     return _HOST
 
 
+def installed_kv_core_callbacks() -> KVCoreConnectorCallbacks | None:
+    """Return callbacks for the vendor-patched connector, never for legacy hooks."""
+    return _KV_CORE_CALLBACKS
+
+
+def _environment_capability() -> TierCapabilitySnapshot:
+    topology = TierTopology(os.environ.get("ASTRAKV_KV_CORE_TOPOLOGY", "gpu_ssd"))
+    cpu_enabled = os.environ.get("ASTRAKV_KV_CORE_LOCAL_CPU", "false") == "true"
+    return TierCapabilitySnapshot(
+        topology=topology,
+        local_cpu_enabled=cpu_enabled,
+        local_disk_enabled=os.environ.get("ASTRAKV_KV_CORE_LOCAL_DISK", "true") == "true",
+        cpu_capacity_bytes=int(os.environ.get("ASTRAKV_KV_CORE_CPU_CAPACITY_BYTES", "0")),
+        cpu_used_bytes=int(os.environ.get("ASTRAKV_KV_CORE_CPU_USED_BYTES", "0")),
+        ssd_capacity_bytes=int(os.environ.get("ASTRAKV_KV_CORE_SSD_CAPACITY_BYTES", "0")),
+        ssd_used_bytes=int(os.environ.get("ASTRAKV_KV_CORE_SSD_USED_BYTES", "0")),
+        available_kv_blocks=int(os.environ.get("ASTRAKV_KV_CORE_AVAILABLE_KV_BLOCKS", "0")),
+        external_token_cap=int(os.environ.get("ASTRAKV_KV_CORE_EXTERNAL_TOKEN_CAP", "0")),
+        uma_available_bytes=int(os.environ.get("ASTRAKV_KV_CORE_UMA_AVAILABLE_BYTES", "0")),
+        memory_pressure=float(os.environ.get("ASTRAKV_KV_CORE_MEMORY_PRESSURE", "0")),
+        queue_depth=int(os.environ.get("ASTRAKV_KV_CORE_QUEUE_DEPTH", "0")),
+    )
+
+
+def _active_patch_verified() -> bool:
+    path = os.environ.get("ASTRAKV_KV_CORE_PATCH_VERIFICATION", "")
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return payload.get("compatible") is True and payload.get("patch_id") == PATCH_ID
+
+
 def install_from_environment(
     *,
     installer: Callable[..., Any] | None = None,
 ) -> bool:
-    global _HOST, _INSTALLED
+    global _HOST, _INSTALLED, _KV_CORE_CALLBACKS
     if os.environ.get("ASTRAKV_ENABLE_LMCACHE047_HOOKS", "false") != "true":
         return False
     if _INSTALLED:
@@ -54,10 +91,15 @@ def install_from_environment(
             # Observation must never break a serving request.
             return
 
+    mode = RuntimeMode(os.environ.get("ASTRAKV_KV_CORE_MODE", "off"))
+    if mode is RuntimeMode.ACTIVE and not _active_patch_verified():
+        raise RuntimeError("KV-Core active mode requires a verified vLLM/LMCache connector patch")
     if installer is None:
         from astrakv.runtime.lmcache047_runtime_patch import install_lmcache047_hooks
         installer = install_lmcache047_hooks
     run_id = os.environ.get("ASTRAKV_RUNTIME_CONTROL_RUN_ID", "")
+    if mode is RuntimeMode.ACTIVE and not run_id:
+        raise RuntimeError("KV-Core active mode requires a request-context runtime control host")
     if run_id and os.environ.get("ASTRAKV_RUNTIME_CONTROL_PROCESS_SCOPE", "") == "engine_child":
         if not _is_vllm_engine_child():
             return False
@@ -82,17 +124,35 @@ def install_from_environment(
                     Path(os.environ["ASTRAKV_ONLINE_PREDICTION_SIDECAR_PATH"])
                     if os.environ.get("ASTRAKV_ONLINE_PREDICTION_SIDECAR_PATH") else None
                 ),
+                profile_db_path=(
+                    Path(os.environ["ASTRAKV_ONLINE_PROFILE_DB_PATH"])
+                    if os.environ.get("ASTRAKV_ONLINE_PROFILE_DB_PATH") else None
+                ),
+                scheduler_hints_path=(
+                    Path(os.environ["ASTRAKV_ONLINE_SCHEDULER_HINTS_PATH"])
+                    if os.environ.get("ASTRAKV_ONLINE_SCHEDULER_HINTS_PATH") else None
+                ),
+                online_prefetch_dispatch_enabled=(
+                    os.environ.get("ASTRAKV_ENABLE_ONLINE_PREFETCH_DISPATCH", "true") == "true"
+                ),
+                online_prefetch_mode=os.environ.get("ASTRAKV_ONLINE_PREFETCH_MODE", "disabled"),
+                kv_core_mode=mode,
             ))
         except (KeyError, ValueError) as exc:
             raise RuntimeError("invalid ASTRAKV_RUNTIME_CONTROL_* configuration") from exc
         try:
             host.start()
-            host.install_hooks(installer)
+            if mode is RuntimeMode.ACTIVE:
+                # The vendor patch consumes these callbacks.  Do not install the
+                # legacy monkey patch, which can issue lifecycle-external I/O.
+                _KV_CORE_CALLBACKS = KVCoreConnectorCallbacks(mode=mode, capability=_environment_capability())
+            else:
+                host.install_hooks(installer)
         except Exception:
             host.close()
             raise
         _HOST = host
-    else:
+    elif mode is not RuntimeMode.ACTIVE:
         installer(sink)
     _INSTALLED = True
     print("AstraKV LMCache 0.4.7 runtime hooks installed", flush=True)

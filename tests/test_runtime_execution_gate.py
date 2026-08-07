@@ -26,11 +26,11 @@ def capability():
     )
 
 
-def released_binding():
+def released_binding(*, size_bytes=8):
     registry = BackendBindingRegistry(run_id="run-a", engine_instance_id="engine", worker_id="worker")
     context = RequestContext("run-a", "request-a", "prefix-a", ObjectLevel.PREFIX)
-    submitted = registry.observe("key", HookAction.CACHE_STORE, "submitted", context)
-    binding = registry.complete_operation("key", HookAction.CACHE_STORE, "completed", context, submitted.event.metadata["operation_lease"]).binding
+    submitted = registry.observe("key", HookAction.CACHE_STORE, "submitted", context, bytes=size_bytes)
+    binding = registry.complete_operation("key", HookAction.CACHE_STORE, "completed", context, submitted.event.metadata["operation_lease"], bytes=size_bytes).binding
     registry.observe("key", HookAction.RELEASE, "completed", context)
     return registry, context, binding
 
@@ -49,13 +49,13 @@ class RuntimeExecutionGateTests(unittest.TestCase):
         return RuntimeExecutionGate(run_id="run-a", endpoint=HOOK_URL, capabilities=capability(), binding_registry=registry, **kwargs)
 
     def test_rejects_incompatible_capability(self):
-        registry, _, binding = released_binding()
+        registry, _, binding = released_binding(size_bytes=9)
         denied = RuntimeExecutionGate(run_id="run-a", endpoint=HOOK_URL, capabilities=None, binding_registry=registry)
         self.assertEqual(denied.authorize(command(binding), now_ns=2).reason, "capability_preflight")
 
-    def test_ignores_generation_as_a_runtime_identity_field(self):
+    def test_rejects_generation_mismatch_as_a_runtime_identity_field(self):
         registry, _, binding = released_binding()
-        self.assertTrue(self.gate(registry).authorize(command(binding, generation=2), now_ns=2).allowed)
+        self.assertEqual(self.gate(registry).authorize(command(binding, generation=2), now_ns=2).reason, "binding_not_found")
 
     def test_rejects_replaced_bindings(self):
         registry, context, binding = released_binding()
@@ -85,13 +85,20 @@ class RuntimeExecutionGateTests(unittest.TestCase):
         self.assertEqual(self.gate(PinnedRegistry()).authorize(command(binding), now_ns=2).reason, "pinned_binding")
 
     def test_rejects_expired_duplicate_byte_rate_and_concurrency_budgets(self):
-        registry, _, binding = released_binding()
+        registry, _, binding = released_binding(size_bytes=9)
         gate = self.gate(registry, budget=ExecutionBudget(max_bytes_per_command=8, max_bytes_per_window=12, max_commands_per_window=1, window_ns=10, max_concurrent=1))
         self.assertEqual(gate.authorize(command(binding, deadline_ns=1), now_ns=2).reason, "deadline_expired")
         self.assertEqual(gate.authorize(command(binding, command_id="too-big", bytes=9), now_ns=2).reason, "byte_budget")
+        registry, _, binding = released_binding(size_bytes=8)
+        gate = self.gate(registry, budget=ExecutionBudget(max_bytes_per_command=8, max_bytes_per_window=12, max_commands_per_window=1, window_ns=10, max_concurrent=1))
         self.assertTrue(gate.authorize(command(binding, command_id="first", bytes=8), now_ns=2).allowed)
         self.assertEqual(gate.authorize(command(binding, command_id="first", bytes=8), now_ns=2).reason, "duplicate_command")
         self.assertEqual(gate.authorize(command(binding, command_id="second", bytes=8), now_ns=2).reason, "rate_budget")
+
+    def test_uses_observed_binding_size_not_command_metadata(self):
+        registry, _, binding = released_binding(size_bytes=8)
+        gate = self.gate(registry, budget=ExecutionBudget(max_bytes_per_command=8))
+        self.assertTrue(gate.authorize(command(binding, bytes=1_000_000), now_ns=2).allowed)
 
     def test_rejects_when_concurrency_budget_is_exhausted(self):
         registry, _, binding = released_binding()

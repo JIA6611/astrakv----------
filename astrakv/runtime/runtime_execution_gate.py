@@ -68,7 +68,14 @@ class RuntimeExecutionGate:
             self._command_ids.add(command.command_id)
             self._inflight.add(command.command_id)
             self._window_commands += 1
-            self._window_bytes += _command_bytes(command)
+            snapshot = self.binding_registry.snapshot(command.binding_id)
+            amount = _command_bytes(snapshot)
+            if amount is None:  # _validate already rejects this, retain fail-closed behavior.
+                self._command_ids.remove(command.command_id)
+                self._inflight.remove(command.command_id)
+                self._window_commands -= 1
+                return GateDecision(False, "physical_size_unknown")
+            self._window_bytes += amount
             self._persist()
             return GateDecision(True, "admitted")
 
@@ -119,7 +126,9 @@ class RuntimeExecutionGate:
             return "pinned_binding"
         if command.command_id in self._command_ids:
             return "duplicate_command"
-        amount = _command_bytes(command)
+        amount = _command_bytes(snapshot)
+        if amount is None:
+            return "physical_size_unknown"
         if amount > self.budget.max_bytes_per_command:
             return "byte_budget"
         self._rotate_window(now_ns)
@@ -157,9 +166,10 @@ class RuntimeExecutionGate:
         os.replace(temporary, self.state_path)
 
 
-def _command_bytes(command: BackendActionCommand) -> int:
+def _command_bytes(snapshot: dict[str, Any]) -> int | None:
+    """Use the observed physical binding size, never policy-provided metadata."""
     try:
-        amount = int(command.metadata.get("bytes", 0))
+        amount = int(snapshot.get("size_bytes"))
     except (TypeError, ValueError):
-        return 0
-    return max(0, amount)
+        return None
+    return amount if amount > 0 else None

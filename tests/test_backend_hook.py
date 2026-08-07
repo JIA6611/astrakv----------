@@ -122,7 +122,7 @@ class BackendHookContractTests(unittest.TestCase):
                 binding_generation=0,
             )
 
-    def test_command_and_receipt_ignore_binding_generation_for_runtime_identity(self) -> None:
+    def test_command_and_receipt_require_binding_generation_for_runtime_identity(self) -> None:
         command = BackendActionCommand(
             "run-1", "command-1", "decision-1", "request-1", "prefix-1",
             ObjectLevel.PREFIX, "binding-1", "vllm:block:7", HookAction.DROP, 1,
@@ -136,7 +136,7 @@ class BackendHookContractTests(unittest.TestCase):
         self.assertEqual(command.to_record()["binding_generation"], 2)
         self.assertEqual(BackendActionCommand.from_record(command.to_record()), command)
         self.assertEqual(BackendActionReceipt.from_record(receipt.to_record()), receipt)
-        self.assertTrue(receipt.matches_command(command))
+        self.assertFalse(receipt.matches_command(command))
 
     def test_rejected_receipt_round_trips_audit_fields(self) -> None:
         receipt = BackendActionReceipt(

@@ -12,6 +12,8 @@ from astrakv.runtime.backend_bridge import OnlineBackendBridge
 from astrakv.runtime.backend_hook import BackendHookEvent, HookAction
 from astrakv.runtime.eviction import ObjectLevel, OfflineEvictionDecision, RuntimeActionResult, RuntimeEvictionEvent
 from astrakv.runtime.profile_db import ChunkProfile, ProfileDB
+from astrakv.runtime.prefix_learning import prefix_key_from_binding
+from astrakv.runtime.kv_runtime_core import RuntimeMode
 from astrakv.runtime.scheduler_hints import SchedulerHintIndex
 from astrakv.runtime.online_profile import OnlineProfileStore
 from astrakv.runtime.prediction_sidecar import PredictionSidecarIndex, SidecarPrediction
@@ -21,6 +23,7 @@ from astrakv.runtime.runtime_plan import (
     RuntimeLayerRange,
     RuntimeObjectKind,
     RuntimePlacementTier,
+    RuntimePrefetchWindow,
     RuntimeProfileGuard,
     RuntimeTokenRange,
 )
@@ -36,6 +39,16 @@ class OnlinePolicyControllerConfig:
     load_latency_hot_threshold_ms: float = 10.0
     memory_pressure: float = 0.0
     deadline_ms: float = 120.0
+    enable_prefetch_dispatch: bool = True
+    online_prefetch_mode: str = "disabled"
+    inter_arrival_required_window_ms: float = 50.0
+    inter_arrival_borderline_ratio: float = 0.75
+    runtime_prefix_min_reuse_count: int = 2
+    runtime_prefix_min_observation_count: int = 3
+    runtime_prefix_confidence_threshold: float = 0.55
+    # Direct controller users retain the historic active default. The service
+    # host explicitly supplies off/shadow/active and defaults to off.
+    kv_core_mode: RuntimeMode = RuntimeMode.ACTIVE
 
 
 class OnlinePolicyController:
@@ -121,6 +134,8 @@ class OnlinePolicyController:
             self.observed_profile_db.get_chunk(binding.backend_object_id, workload_id=self.workload_id)
             or self.profile_db.get_chunk(binding.backend_object_id, workload_id=self.workload_id)
         )
+        prefix_key = prefix_key_from_binding(binding, object_state)
+        runtime_prefix_profile = None if not prefix_key else self.profile_store.prefix_profile(prefix_key)
         execution_actions = {} if binding.execution_spec is None else dict(binding.execution_spec.actions)
         active_refs = _as_int(object_state.get("active_reference_count"))
         request_count = _as_int(object_state.get("request_count"))
@@ -132,6 +147,7 @@ class OnlinePolicyController:
         load_target_id = _load_target_id(binding, object_state)
         load_target_reqmeta_id = _load_target_runtime_reqmeta_id(binding)
         owner_reqmeta_id = str(object_state.get("owner_runtime_reqmeta_id") or "")
+        prefetch_mode = str(self.config.online_prefetch_mode or "disabled")
         same_request_load_target = bool(
             load_target_id
             and load_target_reqmeta_id
@@ -162,12 +178,35 @@ class OnlinePolicyController:
             object_state=object_state,
             workload_id=self.workload_id,
         )
+        prefetch_window = _prefetch_window_for_binding(
+            bridge=self.bridge,
+            binding=binding,
+            object_state=object_state,
+            runtime_prefix_profile=runtime_prefix_profile,
+            required_window_ms=max(
+                self.config.inter_arrival_required_window_ms,
+                load_latency_ms if load_latency_ms > 0 else 0.0,
+            ),
+            borderline_ratio=self.config.inter_arrival_borderline_ratio,
+        )
+        runtime_prefix_candidate = _runtime_prefix_prefetch_candidate(
+            runtime_prefix_profile=runtime_prefix_profile,
+            current_tier=current_tier,
+            prefetch_ready=prefetch_ready,
+            same_request_load_target=same_request_load_target,
+            prefetch_window=prefetch_window,
+            min_reuse_count=self.config.runtime_prefix_min_reuse_count,
+            min_observation_count=self.config.runtime_prefix_min_observation_count,
+            confidence_threshold=self.config.runtime_prefix_confidence_threshold,
+        )
         prefix_prefetch_candidate = _prefix_prefetch_candidate(
             binding=binding,
             profile=profile,
             object_state=object_state,
             prefetch_ready=prefetch_ready,
             profile_guard=profile_guard,
+            scheduler_hint=scheduler_hint,
+            prefetch_mode=prefetch_mode,
         )
         prediction_gate_reason = _prediction_prefetch_gate_reason(
             bridge=self.bridge,
@@ -177,6 +216,14 @@ class OnlinePolicyController:
             same_request_load_target=same_request_load_target,
             prefetch_waste=prefetch_waste,
             prefetch_waste_tolerance=self.config.prefetch_waste_tolerance,
+        )
+        prefix_prefetch_gate_reason = _prefix_prefetch_gate_reason(
+            current_tier=current_tier,
+            prefetch_ready=prefetch_ready,
+            prefix_prefetch_candidate=prefix_prefetch_candidate,
+            prefetch_mode=prefetch_mode,
+            prefetch_window=prefetch_window,
+            runtime_prefix_candidate=runtime_prefix_candidate,
         )
         breaker = self.profile_store.controller_state().get("breaker") or {}
         breaker_state = str(breaker.get("state") or "closed")
@@ -260,7 +307,15 @@ class OnlinePolicyController:
             elif scheduler_hint is not None and scheduler_action == "recompute" and profile_guard.recompute_allowed:
                 action = "recompute"
                 reason = f"online policy: scheduler hint requested recompute ({scheduler_hint.reason})"
-            elif scheduler_hint is not None and scheduler_action == "prefetch" and prefix_prefetch_candidate and prefetch_ready:
+            elif prefetch_mode == "hybrid" and runtime_prefix_candidate["eligible"]:
+                action = "prefetch"
+                target_tier = "cpu"
+                reason = str(runtime_prefix_candidate["reason"])
+            elif (
+                scheduler_hint is not None
+                and scheduler_action == "prefetch"
+                and prefix_prefetch_gate_reason is None
+            ):
                 action = "prefetch"
                 target_tier = "cpu"
                 reason = f"online policy: scheduler hint requested prefix prefetch ({scheduler_hint.reason})"
@@ -278,27 +333,27 @@ class OnlinePolicyController:
                 action = "load"
                 target_tier = "gpu"
                 reason = "online profile: SSD-resident object has a dynamic load target and load is more valuable than waiting for recompute"
-            elif prediction_gate_reason is None and prediction is not None:
+            elif prefetch_mode != "prefix_only" and prediction_gate_reason is None and prediction is not None:
                 action = "prefetch"
                 target_tier = "cpu"
                 reason = (
                     "online profile: sidecar exact-next advisory passed runtime gates, "
                     "so CPU prefetch is preferred before future demand"
                 )
-            elif prefix_prefetch_candidate and prefetch_ready:
+            elif prefix_prefetch_gate_reason is None:
                 action = "prefetch"
                 target_tier = "cpu"
                 reason = "online profile: prefix reuse profile nominated this SSD object for prefix prefetch"
-            elif prediction is not None:
+            elif prefetch_mode != "prefix_only" and prediction is not None:
                 action = "defer"
                 reason = (
                     "online profile: sidecar exact-next advisory is present but not runtime-ready, "
                     f"so dispatch stays advisory-only ({prediction_gate_reason})"
                 )
-            elif self.prediction_source is not None:
+            elif prefetch_mode != "prefix_only" and self.prediction_source is not None:
                 action = "defer"
                 reason = "online profile: no exact-next advisory matched this SSD object, so speculative dispatch stays advisory-only"
-            elif prefetch_ready and not same_request_load_target and (
+            elif prefetch_mode != "prefix_only" and prefetch_ready and not same_request_load_target and (
                 active_refs > 0
                 or
                 policy_reuse_frequency >= self.config.hot_reuse_threshold
@@ -418,6 +473,11 @@ class OnlinePolicyController:
                 "prediction_score": None if prediction is None else prediction.score,
                 "prediction_runtime_ready": prediction is not None and prediction_gate_reason is None,
                 "prediction_gate_reason": "" if prediction_gate_reason is None else prediction_gate_reason,
+                "prefix_prefetch_gate_reason": "" if prefix_prefetch_gate_reason is None else prefix_prefetch_gate_reason,
+                "online_prefetch_mode": prefetch_mode,
+                "prefix_key": prefix_key,
+                "runtime_prefix_profile": {} if runtime_prefix_profile is None else dict(runtime_prefix_profile),
+                "runtime_prefix_candidate": dict(runtime_prefix_candidate),
             },
         )
         if load_target_id:
@@ -435,13 +495,34 @@ class OnlinePolicyController:
                 "metadata": dict(scheduler_hint.metadata),
             }
         decision.metadata["prefix_prefetch_candidate"] = bool(prefix_prefetch_candidate)
+        decision.metadata["dispatch_origin"] = _dispatch_origin_from_object_state(object_state)
+        decision.metadata["prefetch_candidate_source"] = _prefetch_candidate_source(
+            action=action,
+            prefetch_mode=prefetch_mode,
+            scheduler_hint=scheduler_hint,
+            runtime_prefix_candidate=runtime_prefix_candidate,
+            prefix_prefetch_candidate=prefix_prefetch_candidate,
+        )
         decision.metadata["prefetch_kind"] = _prefetch_kind(
             action=action,
             scheduler_hint=scheduler_hint,
             prediction=prediction,
             prefix_prefetch_candidate=prefix_prefetch_candidate,
         )
+        decision.metadata["prefetch_skip_reason"] = _prefetch_skip_reason(
+            action=action,
+            prefix_prefetch_gate_reason=prefix_prefetch_gate_reason,
+            prediction_gate_reason=prediction_gate_reason,
+            scheduler_hint=scheduler_hint,
+            same_request_load_target=same_request_load_target,
+            prefetch_mode=prefetch_mode,
+        )
         decision.metadata["prefetch_source_tier"] = current_tier if action == "prefetch" and current_tier in {"cpu", "ssd"} else ""
+        decision.metadata["prefetch_window"] = prefetch_window.to_record()
+        decision.metadata.update(prefetch_window.to_record())
+        decision.metadata["runtime_prefix_confidence"] = float(runtime_prefix_candidate.get("runtime_prefix_confidence") or 0.0)
+        decision.metadata["runtime_prefix_observation_count"] = int(runtime_prefix_candidate.get("runtime_prefix_observation_count") or 0)
+        decision.metadata["cold_start_seed_used"] = bool(action == "prefetch" and not runtime_prefix_candidate["eligible"])
         if binding.execution_spec is not None:
             decision.metadata["execution_spec_id"] = binding.execution_spec.spec_id
         partial_load_target = _extract_partial_load_target(
@@ -451,6 +532,14 @@ class OnlinePolicyController:
         )
         if partial_load_target is not None:
             decision.metadata["partial_load_target"] = partial_load_target.to_record()
+        resolved_decision_source = _resolved_decision_source(
+            action=action,
+            prefetch_mode=prefetch_mode,
+            runtime_prefix_candidate=runtime_prefix_candidate,
+            profile_guard=profile_guard,
+            scheduler_hint=scheduler_hint,
+        )
+        decision.metadata["decision_source"] = resolved_decision_source
         action_plan = _build_runtime_action_plan(
             decision=decision,
             binding=binding,
@@ -459,7 +548,7 @@ class OnlinePolicyController:
             partial_load_target=partial_load_target,
         )
         decision.metadata.update({
-            "decision_source": action_plan.decision_source,
+            "decision_source": resolved_decision_source,
             "fallback_mode": action_plan.fallback_mode,
             "profile_guard": action_plan.profile_guard.profile_guard if action_plan.profile_guard is not None else "none",
             "profile_guard_reason": (
@@ -476,6 +565,20 @@ class OnlinePolicyController:
 
     def dispatch(self, decision: OfflineEvictionDecision) -> RuntimeActionResult:
         breaker = None if self.bridge.execution_gate is None else self.bridge.execution_gate.breaker
+        if self.config.kv_core_mode is RuntimeMode.OFF:
+            result = RuntimeActionResult("kv_core_off", "KV-Core mode is off; no runtime command was issued")
+            self.profile_store.record_dispatch(
+                decision, result, execution_enabled=False, breaker_state=_breaker_snapshot(breaker),
+            )
+            self.profile_store.checkpoint()
+            return result
+        if self.config.kv_core_mode is RuntimeMode.SHADOW:
+            result = RuntimeActionResult("shadow_only", "KV-Core shadow mode recorded the decision without runtime execution")
+            self.profile_store.record_dispatch(
+                decision, result, execution_enabled=False, breaker_state=_breaker_snapshot(breaker),
+            )
+            self.profile_store.checkpoint()
+            return result
         if not self.execution_enabled:
             result = RuntimeActionResult("advisory_only", "online execution requires explicit enablement")
             self.profile_store.record_dispatch(
@@ -496,6 +599,29 @@ class OnlinePolicyController:
         )
         if live_skip_reason is not None:
             result = RuntimeActionResult("no_dispatch_required", live_skip_reason)
+            self.profile_store.record_dispatch(
+                decision,
+                result,
+                execution_enabled=self.execution_enabled,
+                breaker_state=_breaker_snapshot(breaker),
+            )
+            self.profile_store.checkpoint()
+            return result
+        if decision.predicted_action == "load":
+            result = RuntimeActionResult(
+                "native_connector_required",
+                "generic load dispatch is disabled; only a request-owned native connector may load paged KV",
+            )
+            self.profile_store.record_dispatch(
+                decision, result, execution_enabled=self.execution_enabled, breaker_state=_breaker_snapshot(breaker),
+            )
+            self.profile_store.checkpoint()
+            return result
+        if decision.predicted_action == "prefetch" and not self.config.enable_prefetch_dispatch:
+            result = RuntimeActionResult(
+                "no_dispatch_required",
+                "prefetch dispatch disabled by controller config",
+            )
             self.profile_store.record_dispatch(
                 decision,
                 result,
@@ -860,7 +986,7 @@ def _build_runtime_action_plan(
         allow_partial=partial_load_target is not None and profile_guard.partial_load_allowed,
         allow_recompute_fallback=action is RuntimeActionKind.LOAD,
         priority=max(0, _as_int(decision.metadata.get("request_count")) + int(float(decision.metadata.get("policy_reuse_frequency") or 0.0) * 100)),
-        decision_source=profile_guard.decision_source,
+        decision_source=str(decision.metadata.get("decision_source") or profile_guard.decision_source),
         fallback_mode="recompute" if action is RuntimeActionKind.LOAD else "none",
         trigger_reason=decision.reason,
         profile_guard=profile_guard,
@@ -868,8 +994,27 @@ def _build_runtime_action_plan(
             "binding_id": str(decision.metadata.get("binding_id") or binding.binding_id),
             "prediction_present": bool(decision.metadata.get("prediction_present")),
             "load_target_id": str(decision.metadata.get("load_target_id") or ""),
+            "dispatch_origin": str(decision.metadata.get("dispatch_origin") or ""),
+            "prefetch_skip_reason": str(decision.metadata.get("prefetch_skip_reason") or ""),
+            "prefetch_window": dict(decision.metadata.get("prefetch_window") or {}),
         },
     )
+
+
+def _resolved_decision_source(
+    *,
+    action: str,
+    prefetch_mode: str,
+    runtime_prefix_candidate: dict[str, Any],
+    profile_guard: RuntimeProfileGuard,
+    scheduler_hint: Any,
+) -> str:
+    if action == "prefetch":
+        if prefetch_mode == "hybrid" and bool(runtime_prefix_candidate.get("eligible")):
+            return "runtime-observed"
+        if scheduler_hint is not None and str(getattr(scheduler_hint, "action", "") or "") == "prefetch":
+            return "offline-profile"
+    return profile_guard.decision_source
 
 
 def _load_target_id(binding: Any, object_state: dict[str, Any]) -> str:
@@ -951,10 +1096,14 @@ def _scheduler_hint_for_binding(
 ):
     if scheduler_hints is None:
         return None
+    prefix_id = str(binding.metadata.get("prefix_id") or "")
+    prefix_hash = str(binding.metadata.get("prefix_hash") or "")
     return scheduler_hints.best_hint_for_object(
         request_id=binding.request_id,
         backend_object_id=binding.backend_object_id,
         object_key=binding.object_key,
+        prefix_id=prefix_id,
+        prefix_hash=prefix_hash,
     )
 
 
@@ -983,7 +1132,11 @@ def _prefix_prefetch_candidate(
     object_state: dict[str, Any],
     prefetch_ready: bool,
     profile_guard: RuntimeProfileGuard,
+    scheduler_hint: Any,
+    prefetch_mode: str,
 ) -> bool:
+    if prefetch_mode not in {"prefix_only", "combined", "hybrid"}:
+        return False
     if not prefetch_ready:
         return False
     if not profile_guard.partial_load_allowed and not profile_guard.recompute_allowed:
@@ -991,6 +1144,8 @@ def _prefix_prefetch_candidate(
     prefix_id = str(binding.metadata.get("prefix_id") or "") or str(object_state.get("prefix_id") or "")
     if not prefix_id and binding.object_level is not ObjectLevel.PREFIX:
         return False
+    if scheduler_hint is not None and str(getattr(scheduler_hint, "action", "") or "") == "prefetch":
+        return True
     if profile is None:
         return False
     if _as_int(object_state.get("prefetch_waste_count")) > 0:
@@ -1059,6 +1214,191 @@ def _prediction_prefetch_gate_reason(
     return None
 
 
+def _prefetch_window_for_binding(
+    *,
+    bridge: OnlineBackendBridge,
+    binding: Any,
+    object_state: dict[str, Any],
+    runtime_prefix_profile: dict[str, Any] | None,
+    required_window_ms: float,
+    borderline_ratio: float,
+) -> RuntimePrefetchWindow:
+    snapshot = bridge.binding_snapshot(binding.binding_id) or {}
+    source_event = str(object_state.get("last_dispatch_origin") or "")
+    source_timestamp_ns = _as_int(object_state.get("last_timestamp_ns"))
+    next_request_submit_timestamp_ns = _as_int(snapshot.get("last_request_submit_timestamp_ns"))
+    next_request_id = str(snapshot.get("last_request_id") or "")
+    if source_timestamp_ns <= 0 and runtime_prefix_profile is not None:
+        source_timestamp_ns = _as_int(runtime_prefix_profile.get("last_release_or_offload_ns"))
+    if next_request_submit_timestamp_ns <= 0:
+        next_request_submit_timestamp_ns = _as_int(object_state.get("last_request_submit_timestamp_ns"))
+    if next_request_submit_timestamp_ns <= 0 and runtime_prefix_profile is not None:
+        next_request_submit_timestamp_ns = _as_int(runtime_prefix_profile.get("last_next_submit_ns"))
+    if next_request_submit_timestamp_ns <= source_timestamp_ns or source_timestamp_ns <= 0:
+        return RuntimePrefetchWindow(
+            source_event=source_event,
+            source_timestamp_ns=source_timestamp_ns,
+            next_request_id=next_request_id,
+            next_request_submit_timestamp_ns=next_request_submit_timestamp_ns,
+            inter_arrival_window_ms=0.0,
+            required_window_ms=max(0.0, required_window_ms),
+            window_feasibility="unknown",
+            prefetch_completion_before_demand=None,
+        )
+    window_ms = max(0.0, (next_request_submit_timestamp_ns - source_timestamp_ns) / 1_000_000)
+    required_ms = max(0.0, required_window_ms)
+    if required_ms <= 0:
+        feasibility = "window_sufficient"
+    elif window_ms >= required_ms:
+        feasibility = "window_sufficient"
+    elif window_ms >= required_ms * max(0.0, borderline_ratio):
+        feasibility = "window_borderline"
+    else:
+        feasibility = "window_insufficient"
+    return RuntimePrefetchWindow(
+        source_event=source_event,
+        source_timestamp_ns=source_timestamp_ns,
+        next_request_id=next_request_id,
+        next_request_submit_timestamp_ns=next_request_submit_timestamp_ns,
+        inter_arrival_window_ms=window_ms,
+        required_window_ms=required_ms,
+        window_feasibility=feasibility,
+        prefetch_completion_before_demand=(feasibility == "window_sufficient"),
+    )
+
+
+def _prefix_prefetch_gate_reason(
+    *,
+    current_tier: str,
+    prefetch_ready: bool,
+    prefix_prefetch_candidate: bool,
+    prefetch_mode: str,
+    prefetch_window: RuntimePrefetchWindow,
+    runtime_prefix_candidate: dict[str, Any],
+) -> str | None:
+    if prefetch_mode not in {"prefix_only", "combined", "hybrid"}:
+        return "prefetch_mode_disabled"
+    if current_tier != "ssd":
+        return "tier_not_ssd"
+    if not prefetch_ready:
+        return "prefetch_not_ready"
+    if prefetch_mode == "hybrid" and bool(runtime_prefix_candidate.get("eligible")):
+        return None
+    if not prefix_prefetch_candidate:
+        return "prefix_hint_miss"
+    if prefetch_window.window_feasibility == "window_insufficient":
+        return "insufficient_inter_arrival_window"
+    return None
+
+
+def _runtime_prefix_prefetch_candidate(
+    *,
+    runtime_prefix_profile: dict[str, Any] | None,
+    current_tier: str,
+    prefetch_ready: bool,
+    same_request_load_target: bool,
+    prefetch_window: RuntimePrefetchWindow,
+    min_reuse_count: int,
+    min_observation_count: int,
+    confidence_threshold: float,
+) -> dict[str, Any]:
+    base = {
+        "eligible": False,
+        "candidate_source": "runtime-observed",
+        "priority": 0,
+        "reason": "",
+        "runtime_prefix_confidence": 0.0,
+        "runtime_prefix_observation_count": 0,
+    }
+    if runtime_prefix_profile is None:
+        return base | {"reason": "runtime prefix learner has no profile for this prefix"}
+    observation_count = _as_int(runtime_prefix_profile.get("observation_count"))
+    reuse_count = _as_int(runtime_prefix_profile.get("reuse_count"))
+    confidence = _as_float(runtime_prefix_profile.get("runtime_confidence"))
+    hit_rate = _as_float(runtime_prefix_profile.get("prefetch_hit_rate"))
+    waste = _as_int(runtime_prefix_profile.get("prefetch_waste"))
+    base.update({
+        "runtime_prefix_confidence": confidence,
+        "runtime_prefix_observation_count": observation_count,
+    })
+    if current_tier != "ssd":
+        return base | {"reason": "runtime prefix candidate requires SSD residency"}
+    if not prefetch_ready:
+        return base | {"reason": "runtime prefix candidate is not prefetch-ready"}
+    if same_request_load_target:
+        return base | {"reason": "candidate_suppressed_same_request"}
+    if prefetch_window.window_feasibility == "window_insufficient":
+        return base | {"reason": "candidate_suppressed_window_insufficient"}
+    if observation_count < max(1, min_observation_count):
+        return base | {"reason": "runtime prefix candidate lacks enough observations"}
+    if reuse_count < max(1, min_reuse_count):
+        return base | {"reason": "runtime prefix candidate lacks enough reuse"}
+    if confidence < max(0.0, confidence_threshold):
+        return base | {"reason": "runtime prefix confidence is below threshold"}
+    if waste > 0 and hit_rate <= 0.0:
+        return base | {"reason": "runtime prefix candidate shows only prefetch waste"}
+    priority = max(1, min(100, int(round(confidence * 100)) + reuse_count))
+    return base | {
+        "eligible": True,
+        "priority": priority,
+        "reason": "online profile: runtime-observed prefix learner predicts this SSD prefix will be reused soon enough to prefetch",
+    }
+
+
+def _dispatch_origin_from_object_state(object_state: dict[str, Any]) -> str:
+    action_name = str(object_state.get("last_action") or "")
+    if action_name == HookAction.RELEASE.value:
+        return "release_completed"
+    if action_name == HookAction.OFFLOAD.value:
+        return "offload_completed"
+    if action_name == HookAction.CACHE_LOAD.value:
+        return "cache_load_available"
+    return ""
+
+
+def _prefetch_skip_reason(
+    *,
+    action: str,
+    prefix_prefetch_gate_reason: str | None,
+    prediction_gate_reason: str | None,
+    scheduler_hint: Any,
+    same_request_load_target: bool,
+    prefetch_mode: str,
+) -> str:
+    if action == "prefetch":
+        return ""
+    if same_request_load_target:
+        return "same_request_load_target"
+    if prefetch_mode == "prefix_only":
+        return "" if prefix_prefetch_gate_reason is None else prefix_prefetch_gate_reason
+    if prefetch_mode == "hybrid" and prefix_prefetch_gate_reason is not None:
+        return prefix_prefetch_gate_reason
+    if scheduler_hint is not None and str(getattr(scheduler_hint, "action", "") or "") == "prefetch":
+        return "" if prefix_prefetch_gate_reason is None else prefix_prefetch_gate_reason
+    if prefix_prefetch_gate_reason is not None:
+        return prefix_prefetch_gate_reason
+    return "" if prediction_gate_reason is None else prediction_gate_reason
+
+
+def _prefetch_candidate_source(
+    *,
+    action: str,
+    prefetch_mode: str,
+    scheduler_hint: Any,
+    runtime_prefix_candidate: dict[str, Any],
+    prefix_prefetch_candidate: bool,
+) -> str:
+    if action != "prefetch":
+        return ""
+    if prefetch_mode == "hybrid" and bool(runtime_prefix_candidate.get("eligible")):
+        return "runtime-observed"
+    if scheduler_hint is not None and str(getattr(scheduler_hint, "action", "") or "") == "prefetch":
+        return "offline-profile"
+    if prefix_prefetch_candidate:
+        return "heuristic"
+    return "heuristic"
+
+
 def _live_dispatch_skip_reason(controller: OnlinePolicyController, decision: OfflineEvictionDecision) -> str | None:
     binding = controller.bridge.binding_for(
         decision.object_level,
@@ -1091,7 +1431,10 @@ def _live_dispatch_skip_reason(controller: OnlinePolicyController, decision: Off
         return "same_request_load_target"
     if decision.predicted_action == "prefetch":
         if _resolve_current_tier(object_state, binding) != "ssd":
-            return "not_ssd_resident"
+            return "tier_not_ssd"
+        window = decision.metadata.get("prefetch_window") or {}
+        if str(window.get("window_feasibility") or "") == "window_insufficient":
+            return "insufficient_inter_arrival_window"
         try:
             prediction_expires_at_ns = int(decision.metadata.get("prediction_expires_at_ns") or 0)
         except (TypeError, ValueError):

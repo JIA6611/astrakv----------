@@ -11,6 +11,7 @@ from typing import Any
 
 from astrakv.runtime.backend_hook import BackendHookEvent, HookAction
 from astrakv.runtime.eviction import OfflineEvictionDecision, RuntimeActionResult
+from astrakv.runtime.prefix_learning import RuntimePrefixIndex
 
 
 ONLINE_PROFILE_SCHEMA = "astrakv-online-profile-v1"
@@ -30,6 +31,7 @@ class OnlineProfileStore:
         self._events: list[BackendHookEvent] = []
         self._dispatches: list[dict[str, Any]] = []
         self._objects: dict[str, dict[str, Any]] = {}
+        self._prefix_index = RuntimePrefixIndex()
         self._last_event_id: str | None = None
         self._controller_state: dict[str, Any] = {
             "execution_enabled": False,
@@ -49,6 +51,8 @@ class OnlineProfileStore:
             "last_runtime_event_id": None,
             "last_dispatch_timestamp_ns": None,
             "last_rejection_reason": None,
+            "last_dispatch_origin": "",
+            "last_prefetch_skip_reason": "",
             "breaker": {},
         }
         if self.checkpoint_path is not None and self.checkpoint_path.exists():
@@ -71,6 +75,7 @@ class OnlineProfileStore:
                 return False
             self._event_fingerprints[event.event_id] = fingerprint
             self._events.append(event)
+            self._prefix_index.observe(event)
             self._last_event_id = event.event_id
             state = self._objects.setdefault(
                 event.backend_object_id,
@@ -85,6 +90,7 @@ class OnlineProfileStore:
             state["last_object_level"] = event.object_level.value
             state["last_timestamp_ns"] = max(state["last_timestamp_ns"], event.timestamp_ns)
             state["actions"][event.action.value] = state["actions"].get(event.action.value, 0) + 1
+            state["last_action"] = event.action.value
             state["last_arrival_index"] = max(
                 int(state["last_arrival_index"]),
                 int(event.metadata.get("arrival_index") or 0),
@@ -112,6 +118,11 @@ class OnlineProfileStore:
                     state["owner_runtime_reqmeta_id"] = str(event.metadata["runtime_reqmeta_id"])
             if event.action in {HookAction.CACHE_HIT, HookAction.CACHE_MISS, HookAction.CACHE_LOAD, HookAction.CACHE_STORE}:
                 state["last_access_time_ns"] = max(state["last_access_time_ns"], event.timestamp_ns)
+            if event.action == HookAction.CACHE_STORE and event.status == "submitted":
+                state["last_request_submit_timestamp_ns"] = max(
+                    int(state["last_request_submit_timestamp_ns"]),
+                    event.timestamp_ns,
+                )
             if event.action == HookAction.CACHE_HIT:
                 state["cache_hits"] += 1
                 state["reuse_count"] += 1
@@ -229,6 +240,8 @@ class OnlineProfileStore:
             "receipt_status": receipt.status if receipt is not None else None if event is None else event.metadata.get("receipt_status"),
             "rejection_reason": None if receipt is None else receipt.rejection_reason or None,
             "timestamp_ns": receipt.timestamp_ns if receipt is not None else None if event is None else event.timestamp_ns,
+            "dispatch_origin": str(decision.metadata.get("dispatch_origin") or ""),
+            "prefetch_skip_reason": str(decision.metadata.get("prefetch_skip_reason") or ""),
         }
         fingerprint = _fingerprint(entry)
         with self._lock:
@@ -258,6 +271,8 @@ class OnlineProfileStore:
             controller["last_runtime_event_id"] = entry["runtime_event_id"]
             controller["last_dispatch_timestamp_ns"] = entry["timestamp_ns"]
             controller["last_rejection_reason"] = entry["rejection_reason"]
+            controller["last_dispatch_origin"] = entry["dispatch_origin"]
+            controller["last_prefetch_skip_reason"] = entry["prefetch_skip_reason"]
             controller["breaker"] = dict(breaker_state or {})
             if backend_object_id:
                 state = self._objects.setdefault(
@@ -290,6 +305,8 @@ class OnlineProfileStore:
                 state["last_command_id"] = command_id
                 state["last_receipt_id"] = receipt_id
                 state["last_runtime_event_id"] = entry["runtime_event_id"]
+                state["last_dispatch_origin"] = entry["dispatch_origin"]
+                state["last_prefetch_skip_reason"] = entry["prefetch_skip_reason"]
                 state["last_request_id"] = decision.request_id
                 state["last_object_key"] = decision.object_key
                 state["last_object_level"] = decision.object_level.value
@@ -325,8 +342,14 @@ class OnlineProfileStore:
                 "dispatch_count": len(self._dispatches),
                 "last_event_id": self._last_event_id,
                 "objects": {key: self._objects[key] for key in sorted(self._objects)},
+                "prefix_profiles": self._prefix_index.to_records(),
                 "controller_state": json.loads(json.dumps(self._controller_state, sort_keys=True)),
             }
+
+    def prefix_profile(self, prefix_key: str) -> dict[str, Any] | None:
+        with self._lock:
+            profile = self._prefix_index.profile_for(prefix_key)
+            return None if profile is None else profile.to_record()
 
     def checkpoint(self) -> None:
         if self.checkpoint_path is None:
@@ -354,6 +377,7 @@ class OnlineProfileStore:
         if len(self._dispatch_fingerprints) != len(self._dispatches):
             raise ValueError("online profile checkpoint has invalid dispatch index")
         self._objects = dict(payload.get("objects") or {})
+        self._prefix_index = RuntimePrefixIndex.from_records(payload.get("prefix_profiles") or ())
         self._last_event_id = payload.get("last_event_id")
         restored_controller = dict(payload.get("controller_state") or {})
         self._controller_state = {
@@ -405,6 +429,8 @@ def _new_object_state(backend_object_id: str, *, binding_generation: Any) -> dic
         "last_resolved_tier": "unknown",
         "last_receipt_status": None,
         "last_rejection_reason": None,
+        "last_dispatch_origin": "",
+        "last_prefetch_skip_reason": "",
         "last_decision_source": "heuristic",
         "last_fallback_mode": "none",
         "last_profile_guard": "none",
@@ -418,6 +444,7 @@ def _new_object_state(backend_object_id: str, *, binding_generation: Any) -> dic
         "last_command_id": None,
         "last_receipt_id": None,
         "last_runtime_event_id": None,
+        "last_request_submit_timestamp_ns": 0,
         "actions": {},
         "last_timestamp_ns": 0,
         "prefetched_since_access": False,

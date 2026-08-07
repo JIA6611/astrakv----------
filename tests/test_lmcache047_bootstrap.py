@@ -81,6 +81,15 @@ class LMCache047BootstrapTests(unittest.TestCase):
         }, clear=False):
             self.assertFalse(install_from_environment(installer=lambda *_args, **_kwargs: self.fail("must not install")))
 
+    def test_active_kv_core_refuses_unverified_connector_patch(self):
+        with patch("astrakv.runtime.lmcache047_bootstrap._INSTALLED", False), patch.dict(os.environ, {
+            "ASTRAKV_ENABLE_LMCACHE047_HOOKS": "true",
+            "ASTRAKV_KV_CORE_MODE": "active",
+            "ASTRAKV_RUNTIME_CONTROL_RUN_ID": "run-a",
+        }, clear=False):
+            with self.assertRaisesRegex(RuntimeError, "verified vLLM/LMCache connector patch"):
+                install_from_environment(installer=lambda *_args, **_kwargs: self.fail("legacy installer must not run"))
+
 
 if __name__ == "__main__":
     unittest.main()

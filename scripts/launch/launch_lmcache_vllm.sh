@@ -10,8 +10,11 @@ if [[ "$BACKEND" == "disk" ]]; then
   export ASTRAKV_GPU_MEMORY_UTILIZATION="${ASTRAKV_GPU_MEMORY_UTILIZATION:-0.72}"
   LMCACHE_DISK_PATH="${LMCACHE_DISK_PATH:-results/lmcache_gpu_ssd_store}"
   mkdir -p "$LMCACHE_DISK_PATH"
+elif [[ "$BACKEND" == "cpu" ]]; then
+  export LMCACHE_CONFIG_FILE="${LMCACHE_CONFIG_FILE:-configs/lmcache_cpu_example.yaml}"
+  export ASTRAKV_GPU_MEMORY_UTILIZATION="${ASTRAKV_GPU_MEMORY_UTILIZATION:-0.72}"
 else
-  echo "DGX production topology is GPU+SSD only; requested backend '$BACKEND' is unsupported." >&2
+  echo "Supported LMCache backends are 'disk' (GPU+SSD) and 'cpu' (GPU+CPU+SSD experiment topology)." >&2
   exit 2
 fi
 if [[ -z "${ASTRAKV_KV_TRANSFER_CONFIG:-}" ]]; then

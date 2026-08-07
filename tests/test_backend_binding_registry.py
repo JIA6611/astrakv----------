@@ -54,7 +54,7 @@ class BackendBindingRegistryTests(unittest.TestCase):
 
         self.assertIsNotNone(second.binding)
         self.assertNotEqual(second.binding.binding_id, first.binding.binding_id)
-        self.assertEqual(second.binding.binding_generation, 1)
+        self.assertEqual(second.binding.binding_generation, first.binding.binding_generation + 1)
         self.assertEqual(second.binding.object_key, "prefix-b")
         self.assertIsNone(self.registry.current_binding(
             binding_id=first.binding.binding_id,
@@ -75,7 +75,7 @@ class BackendBindingRegistryTests(unittest.TestCase):
         second = self.registry.complete_operation("key-a", HookAction.CACHE_STORE, "completed", context, next_submit.event.metadata["operation_lease"])
 
         self.assertNotEqual(second.binding.binding_id, first.binding.binding_id)
-        self.assertEqual(second.binding.binding_generation, 1)
+        self.assertEqual(second.binding.binding_generation, first.binding.binding_generation + 1)
         self.assertFalse(self.registry.eligible_for_bridge(first.binding.binding_id, first.binding.binding_generation))
         self.assertFalse(self.registry.eligible_for_bridge(second.binding.binding_id, second.binding.binding_generation))
 
@@ -99,7 +99,7 @@ class BackendBindingRegistryTests(unittest.TestCase):
         next_submit = self.registry.observe("key-a", HookAction.CACHE_STORE, "submitted", context)
 
         self.assertNotEqual(next_submit.binding.binding_id, completed.binding.binding_id)
-        self.assertEqual(next_submit.binding.binding_generation, 1)
+        self.assertEqual(next_submit.binding.binding_generation, completed.binding.binding_generation + 1)
         with self.assertRaisesRegex(ValueError, "stale"):
             self.registry.complete_operation("key-a", HookAction.CACHE_STORE, "completed", context, lease)
 

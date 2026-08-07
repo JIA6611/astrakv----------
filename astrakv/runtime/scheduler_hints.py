@@ -17,17 +17,47 @@ from astrakv.scheduler.hints import SchedulerHint
 @dataclass(slots=True)
 class SchedulerHintIndex:
     by_request: dict[str, list[SchedulerHint]] = field(default_factory=dict)
+    by_backend_object: dict[str, list[SchedulerHint]] = field(default_factory=dict)
+    by_object_key: dict[str, list[SchedulerHint]] = field(default_factory=dict)
+    by_cache_key: dict[str, list[SchedulerHint]] = field(default_factory=dict)
+    by_prefix_id: dict[str, list[SchedulerHint]] = field(default_factory=dict)
+    by_prefix_hash: dict[str, list[SchedulerHint]] = field(default_factory=dict)
 
     @classmethod
     def from_hints(cls, hints: Iterable[SchedulerHint]) -> "SchedulerHintIndex":
         index = cls()
         for hint in hints:
-            index.by_request.setdefault(hint.request_id, []).append(hint)
-        for request_id, rows in index.by_request.items():
-            index.by_request[request_id] = sorted(
-                rows,
-                key=lambda item: (-int(item.priority), str(item.action), request_id),
-            )
+            metadata = dict(hint.metadata)
+            if hint.request_id:
+                index.by_request.setdefault(hint.request_id, []).append(hint)
+            backend_object_id = str(metadata.get("chunk_id") or metadata.get("backend_object_id") or "")
+            if backend_object_id:
+                index.by_backend_object.setdefault(backend_object_id, []).append(hint)
+            object_key = str(metadata.get("object_key") or "")
+            if object_key:
+                index.by_object_key.setdefault(object_key, []).append(hint)
+            cache_key = str(metadata.get("cache_key") or "")
+            if cache_key:
+                index.by_cache_key.setdefault(cache_key, []).append(hint)
+            prefix_id = str(metadata.get("prefix_id") or "")
+            if prefix_id:
+                index.by_prefix_id.setdefault(prefix_id, []).append(hint)
+            prefix_hash = str(metadata.get("prefix_hash") or "")
+            if prefix_hash:
+                index.by_prefix_hash.setdefault(prefix_hash, []).append(hint)
+        for mapping in (
+            index.by_request,
+            index.by_backend_object,
+            index.by_object_key,
+            index.by_cache_key,
+            index.by_prefix_id,
+            index.by_prefix_hash,
+        ):
+            for key, rows in mapping.items():
+                mapping[key] = sorted(
+                    rows,
+                    key=lambda item: (-int(item.priority), str(item.action), key, str(item.reason)),
+                )
         return index
 
     @classmethod
@@ -64,16 +94,36 @@ class SchedulerHintIndex:
         request_id: str,
         backend_object_id: str,
         object_key: str,
+        prefix_id: str = "",
+        prefix_hash: str = "",
     ) -> SchedulerHint | None:
-        for hint in self.by_request.get(request_id, ()):  # already sorted by priority desc
-            metadata = hint.metadata
-            if str(metadata.get("chunk_id") or "") == backend_object_id:
-                return hint
-            if str(metadata.get("object_key") or "") == object_key:
-                return hint
-            if str(metadata.get("cache_key") or "") == object_key:
-                return hint
-            if str(metadata.get("prefix_id") or "") == object_key:
-                return hint
+        seen: set[int] = set()
+        candidates = (
+            self.by_backend_object.get(backend_object_id, ()),
+            self.by_object_key.get(object_key, ()),
+            self.by_cache_key.get(object_key, ()),
+            self.by_prefix_id.get(prefix_id, ()) if prefix_id else (),
+            self.by_prefix_id.get(object_key, ()) if object_key else (),
+            self.by_prefix_hash.get(prefix_hash, ()) if prefix_hash else (),
+            self.by_request.get(request_id, ()),
+        )
+        for bucket in candidates:
+            for hint in bucket:
+                marker = id(hint)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                metadata = hint.metadata
+                if str(metadata.get("chunk_id") or metadata.get("backend_object_id") or "") == backend_object_id:
+                    return hint
+                if str(metadata.get("object_key") or "") == object_key:
+                    return hint
+                if str(metadata.get("cache_key") or "") == object_key:
+                    return hint
+                if str(metadata.get("prefix_id") or "") in {object_key, prefix_id}:
+                    return hint
+                if prefix_hash and str(metadata.get("prefix_hash") or "") == prefix_hash:
+                    return hint
+                if hint.request_id and hint.request_id == request_id:
+                    return hint
         return None
-

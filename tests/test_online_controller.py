@@ -454,6 +454,7 @@ class OnlineControllerTests(unittest.TestCase):
             workload_id="w",
             bridge=bridge,
             scheduler_hints=scheduler_hints,
+            config=OnlinePolicyControllerConfig(online_prefetch_mode="prefix_only"),
         )
         self.assertTrue(controller.ingest(
             BackendHookEvent("run", "event-store", "req", "prefix-hot", ObjectLevel.PREFIX, "block-prefetch", HookAction.CACHE_STORE, "submitted", 1, tier_after="ssd")
@@ -777,6 +778,275 @@ class OnlineControllerTests(unittest.TestCase):
         proposed = controller.propose_for("prefix", ObjectLevel.PREFIX)
         self.assertEqual(proposed.predicted_action, "prefetch")
         self.assertFalse(proposed.metadata["load_target_present"])
+
+    def test_prefix_only_mode_prefetches_from_scheduler_hint_without_same_request_load(self):
+        execution_spec = BackendExecutionSpec(
+            spec_id="spec-prefix-only",
+            binding_id="bind",
+            binding_generation=1,
+            backend_object_id="block-prefix-only",
+            object_key="prefix-prefetch",
+            object_level=ObjectLevel.PREFIX,
+            runtime_owner="owner",
+            owner_channel="channel",
+            key_identity="key",
+            lifecycle="released",
+            actions={
+                "prefetch": {"status": "ready"},
+                "evict": {"status": "ready"},
+                "drop": {"status": "ready"},
+            },
+        )
+        binding = BackendObjectBinding(
+            "run",
+            "req-a",
+            "prefix-prefetch",
+            ObjectLevel.PREFIX,
+            "block-prefix-only",
+            "bind",
+            metadata={"prefix_id": "prefix-prefetch", "prefix_hash": "prefix-prefetch"},
+            execution_spec=execution_spec,
+        )
+        bridge = OnlineBackendBridge(
+            run_id="run",
+            bindings=[binding],
+            hook_client=object(),
+            hook_url="http://127.0.0.1:7900/actions",
+            gate=gate(),
+        )
+        hints = SchedulerHintIndex.from_hints([
+            SchedulerHint(
+                request_id="",
+                action="prefetch",
+                reason="prefix reuse ready",
+                priority=10,
+                metadata={"prefix_id": "prefix-prefetch", "object_key": "prefix-prefetch"},
+            )
+        ])
+        controller = OnlinePolicyController(
+            run_id="run",
+            workload_id="w",
+            bridge=bridge,
+            scheduler_hints=hints,
+            config=OnlinePolicyControllerConfig(online_prefetch_mode="prefix_only"),
+        )
+        self.assertTrue(controller.ingest(
+            BackendHookEvent(
+                "run", "event-store", "req-a", "prefix-prefetch", ObjectLevel.PREFIX,
+                "block-prefix-only", HookAction.CACHE_STORE, "completed", 1, tier_after="ssd",
+                metadata={"prefix_id": "prefix-prefetch", "prefix_hash": "prefix-prefetch"},
+            )
+        ))
+        self.assertTrue(controller.ingest(
+            BackendHookEvent(
+                "run", "event-release", "req-a", "prefix-prefetch", ObjectLevel.PREFIX,
+                "block-prefix-only", HookAction.RELEASE, "completed", 2, tier_before="ssd", tier_after="ssd",
+                metadata={"prefix_id": "prefix-prefetch", "prefix_hash": "prefix-prefetch"},
+            )
+        ))
+
+        proposed = controller.propose_for("prefix-prefetch", ObjectLevel.PREFIX)
+
+        self.assertEqual(proposed.predicted_action, "prefetch")
+        self.assertEqual(proposed.metadata["dispatch_origin"], "release_completed")
+        self.assertEqual(proposed.metadata["prefetch_skip_reason"], "")
+        self.assertEqual(proposed.metadata["online_prefetch_mode"], "prefix_only")
+
+    def test_prefix_only_mode_marks_insufficient_inter_arrival_window(self):
+        execution_spec = BackendExecutionSpec(
+            spec_id="spec-window",
+            binding_id="bind",
+            binding_generation=1,
+            backend_object_id="block-window",
+            object_key="prefix-window",
+            object_level=ObjectLevel.PREFIX,
+            runtime_owner="owner",
+            owner_channel="channel",
+            key_identity="key",
+            lifecycle="released",
+            actions={
+                "prefetch": {"status": "ready"},
+                "drop": {"status": "ready"},
+            },
+        )
+        binding = BackendObjectBinding(
+            "run",
+            "req-a",
+            "prefix-window",
+            ObjectLevel.PREFIX,
+            "block-window",
+            "bind",
+            metadata={"prefix_id": "prefix-window", "prefix_hash": "prefix-window"},
+            execution_spec=execution_spec,
+        )
+        bridge = OnlineBackendBridge(
+            run_id="run",
+            bindings=[binding],
+            hook_client=object(),
+            hook_url="http://127.0.0.1:7900/actions",
+            gate=gate(),
+        )
+        hints = SchedulerHintIndex.from_hints([
+            SchedulerHint(
+                request_id="",
+                action="prefetch",
+                reason="prefix reuse ready",
+                priority=10,
+                metadata={"prefix_id": "prefix-window", "object_key": "prefix-window"},
+            )
+        ])
+        controller = OnlinePolicyController(
+            run_id="run",
+            workload_id="w",
+            bridge=bridge,
+            scheduler_hints=hints,
+            config=OnlinePolicyControllerConfig(
+                online_prefetch_mode="prefix_only",
+                inter_arrival_required_window_ms=100.0,
+            ),
+        )
+        self.assertTrue(controller.ingest(
+            BackendHookEvent(
+                "run", "event-store", "req-a", "prefix-window", ObjectLevel.PREFIX,
+                "block-window", HookAction.CACHE_STORE, "submitted", 90, tier_after="ssd",
+                metadata={"prefix_id": "prefix-window", "prefix_hash": "prefix-window"},
+            )
+        ))
+        self.assertTrue(controller.ingest(
+            BackendHookEvent(
+                "run", "event-release", "req-a", "prefix-window", ObjectLevel.PREFIX,
+                "block-window", HookAction.RELEASE, "completed", 100, tier_before="ssd", tier_after="ssd",
+                metadata={"prefix_id": "prefix-window", "prefix_hash": "prefix-window"},
+            )
+        ))
+        controller.profile_store._objects["block-window"]["last_request_submit_timestamp_ns"] = 120
+
+        proposed = controller.propose_for("prefix-window", ObjectLevel.PREFIX)
+
+        self.assertNotEqual(proposed.predicted_action, "prefetch")
+        self.assertEqual(proposed.metadata["prefetch_skip_reason"], "insufficient_inter_arrival_window")
+        self.assertEqual(proposed.metadata["window_feasibility"], "window_insufficient")
+
+    def test_hybrid_mode_uses_runtime_observed_candidate_without_hints(self):
+        execution_spec = BackendExecutionSpec(
+            spec_id="spec-hybrid-runtime",
+            binding_id="bind",
+            binding_generation=1,
+            backend_object_id="block-hybrid",
+            object_key="prefix-hybrid",
+            object_level=ObjectLevel.PREFIX,
+            runtime_owner="owner",
+            owner_channel="channel",
+            key_identity="key",
+            lifecycle="released",
+            actions={
+                "prefetch": {"status": "ready"},
+                "drop": {"status": "ready"},
+            },
+        )
+        binding = BackendObjectBinding(
+            "run",
+            "req-2",
+            "prefix-hybrid",
+            ObjectLevel.PREFIX,
+            "block-hybrid",
+            "bind",
+            metadata={"prefix_id": "prefix-hybrid", "prefix_hash": "prefix-hybrid"},
+            execution_spec=execution_spec,
+        )
+        bridge = OnlineBackendBridge(
+            run_id="run",
+            bindings=[binding],
+            hook_client=object(),
+            hook_url="http://127.0.0.1:7900/actions",
+            gate=gate(),
+        )
+        controller = OnlinePolicyController(
+            run_id="run",
+            workload_id="w",
+            bridge=bridge,
+            config=OnlinePolicyControllerConfig(
+                online_prefetch_mode="hybrid",
+                runtime_prefix_min_reuse_count=1,
+                runtime_prefix_min_observation_count=2,
+                runtime_prefix_confidence_threshold=0.1,
+            ),
+        )
+        meta1 = {"prefix_id": "prefix-hybrid", "prefix_hash": "prefix-hybrid", "cache_key": "prefix-hybrid", "arrival_index": 1}
+        meta2 = {"prefix_id": "prefix-hybrid", "prefix_hash": "prefix-hybrid", "cache_key": "prefix-hybrid", "arrival_index": 2}
+        self.assertTrue(controller.ingest(BackendHookEvent("run", "store-1", "req-2", "prefix-hybrid", ObjectLevel.PREFIX, "block-hybrid", HookAction.CACHE_STORE, "submitted", 100, tier_after="ssd", metadata=meta1)))
+        self.assertTrue(controller.ingest(BackendHookEvent("run", "release-1", "req-2", "prefix-hybrid", ObjectLevel.PREFIX, "block-hybrid", HookAction.RELEASE, "completed", 200, tier_before="ssd", tier_after="ssd", metadata=meta1)))
+        self.assertTrue(controller.ingest(BackendHookEvent("run", "store-2", "req-2", "prefix-hybrid", ObjectLevel.PREFIX, "block-hybrid", HookAction.CACHE_STORE, "submitted", 280, tier_after="ssd", metadata=meta2)))
+        self.assertTrue(controller.ingest(BackendHookEvent("run", "release-2", "req-2", "prefix-hybrid", ObjectLevel.PREFIX, "block-hybrid", HookAction.RELEASE, "completed", 360, tier_before="ssd", tier_after="ssd", metadata=meta2)))
+
+        proposed = controller.propose_for("prefix-hybrid", ObjectLevel.PREFIX)
+
+        self.assertEqual(proposed.predicted_action, "prefetch")
+        self.assertEqual(proposed.metadata["prefetch_candidate_source"], "runtime-observed")
+        self.assertEqual(proposed.metadata["decision_source"], "runtime-observed")
+        self.assertGreater(proposed.metadata["runtime_prefix_confidence"], 0.0)
+
+    def test_hybrid_mode_runtime_candidate_overrides_offline_prefetch_seed(self):
+        execution_spec = BackendExecutionSpec(
+            spec_id="spec-hybrid-override",
+            binding_id="bind",
+            binding_generation=1,
+            backend_object_id="block-override",
+            object_key="prefix-override",
+            object_level=ObjectLevel.PREFIX,
+            runtime_owner="owner",
+            owner_channel="channel",
+            key_identity="key",
+            lifecycle="released",
+            actions={
+                "prefetch": {"status": "ready"},
+                "drop": {"status": "ready"},
+            },
+        )
+        binding = BackendObjectBinding(
+            "run",
+            "req-2",
+            "prefix-override",
+            ObjectLevel.PREFIX,
+            "block-override",
+            "bind",
+            metadata={"prefix_id": "prefix-override", "prefix_hash": "prefix-override"},
+            execution_spec=execution_spec,
+        )
+        bridge = OnlineBackendBridge(
+            run_id="run",
+            bindings=[binding],
+            hook_client=object(),
+            hook_url="http://127.0.0.1:7900/actions",
+            gate=gate(),
+        )
+        hints = SchedulerHintIndex.from_hints([
+            SchedulerHint(request_id="", action="prefetch", reason="offline warm seed", priority=1, metadata={"prefix_id": "prefix-override", "object_key": "prefix-override"})
+        ])
+        controller = OnlinePolicyController(
+            run_id="run",
+            workload_id="w",
+            bridge=bridge,
+            scheduler_hints=hints,
+            config=OnlinePolicyControllerConfig(
+                online_prefetch_mode="hybrid",
+                runtime_prefix_min_reuse_count=1,
+                runtime_prefix_min_observation_count=2,
+                runtime_prefix_confidence_threshold=0.1,
+            ),
+        )
+        meta1 = {"prefix_id": "prefix-override", "prefix_hash": "prefix-override", "cache_key": "prefix-override", "arrival_index": 1}
+        meta2 = {"prefix_id": "prefix-override", "prefix_hash": "prefix-override", "cache_key": "prefix-override", "arrival_index": 2}
+        self.assertTrue(controller.ingest(BackendHookEvent("run", "store-1", "req-2", "prefix-override", ObjectLevel.PREFIX, "block-override", HookAction.CACHE_STORE, "submitted", 100, tier_after="ssd", metadata=meta1)))
+        self.assertTrue(controller.ingest(BackendHookEvent("run", "release-1", "req-2", "prefix-override", ObjectLevel.PREFIX, "block-override", HookAction.RELEASE, "completed", 200, tier_before="ssd", tier_after="ssd", metadata=meta1)))
+        self.assertTrue(controller.ingest(BackendHookEvent("run", "store-2", "req-2", "prefix-override", ObjectLevel.PREFIX, "block-override", HookAction.CACHE_STORE, "submitted", 280, tier_after="ssd", metadata=meta2)))
+        self.assertTrue(controller.ingest(BackendHookEvent("run", "release-2", "req-2", "prefix-override", ObjectLevel.PREFIX, "block-override", HookAction.RELEASE, "completed", 360, tier_before="ssd", tier_after="ssd", metadata=meta2)))
+
+        proposed = controller.propose_for("prefix-override", ObjectLevel.PREFIX)
+
+        self.assertEqual(proposed.predicted_action, "prefetch")
+        self.assertEqual(proposed.metadata["prefetch_candidate_source"], "runtime-observed")
+        self.assertEqual(proposed.metadata["decision_source"], "runtime-observed")
 
     def test_propose_for_evicts_cold_ssd_object_after_prefetch_waste(self):
         execution_spec = BackendExecutionSpec(

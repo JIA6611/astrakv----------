@@ -31,6 +31,14 @@ class RuntimePlacementTier(str, Enum):
 
 
 class RuntimeActionKind(str, Enum):
+    ADMIT_EXTERNAL_PREFIX = "admit_external_prefix"
+    PREFETCH_SSD_TO_CPU = "prefetch_ssd_to_cpu"
+    NATIVE_LOAD_TO_PAGED_GPU = "native_load_to_paged_gpu"
+    RECOMPUTE_MISSING_SUFFIX = "recompute_missing_suffix"
+    DEMOTE_CPU_COPY = "demote_cpu_copy"
+    INVALIDATE_EXTERNAL_COPY = "invalidate_external_copy"
+    # Legacy names remain only to deserialize historic artifacts. New policy
+    # code must use one of the request-owned actions above.
     LOAD = "load"
     PREFETCH = "prefetch"
     OFFLOAD = "offload"
@@ -152,4 +160,28 @@ class RuntimeActionPlan:
             "trigger_reason": self.trigger_reason,
             "profile_guard": None if self.profile_guard is None else self.profile_guard.to_record(),
             "metadata": dict(self.metadata),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimePrefetchWindow:
+    source_event: str = ""
+    source_timestamp_ns: int = 0
+    next_request_id: str = ""
+    next_request_submit_timestamp_ns: int = 0
+    inter_arrival_window_ms: float = 0.0
+    required_window_ms: float = 0.0
+    window_feasibility: str = "unknown"
+    prefetch_completion_before_demand: bool | None = None
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "source_event": self.source_event,
+            "source_timestamp_ns": self.source_timestamp_ns,
+            "next_request_id": self.next_request_id,
+            "next_request_submit_timestamp_ns": self.next_request_submit_timestamp_ns,
+            "inter_arrival_window_ms": self.inter_arrival_window_ms,
+            "required_window_ms": self.required_window_ms,
+            "window_feasibility": self.window_feasibility,
+            "prefetch_completion_before_demand": self.prefetch_completion_before_demand,
         }

@@ -71,10 +71,10 @@ def released_runtime_binding(binding_cycles: int = 1) -> tuple[BackendBindingReg
     context = RequestContext("run-1", "request-1", "prefix-1", ObjectLevel.PREFIX)
     binding = None
     for _ in range(binding_cycles):
-        submitted = registry.observe("key-a", HookAction.CACHE_STORE, "submitted", context)
+        submitted = registry.observe("key-a", HookAction.CACHE_STORE, "submitted", context, bytes=2)
         binding = registry.complete_operation(
             "key-a", HookAction.CACHE_STORE, "completed", context,
-            submitted.event.metadata["operation_lease"],
+            submitted.event.metadata["operation_lease"], bytes=2,
         ).binding
         registry.observe("key-a", HookAction.RELEASE, "completed", context)
     assert binding is not None

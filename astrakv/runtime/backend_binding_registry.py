@@ -82,6 +82,7 @@ class _PhysicalBinding:
     action_reservation: str | None = None
     previous_binding_id: str = ""
     binding_replacement_reason: str = ""
+    size_bytes: int = 0
 
 
 @dataclass(slots=True)
@@ -225,6 +226,16 @@ class BackendBindingRegistry:
         ):
             raise ValueError("action reservation blocks new cache I/O")
 
+        if bytes is not None:
+            try:
+                observed_bytes = int(bytes)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("physical object bytes must be an integer") from exc
+            if observed_bytes < 0:
+                raise ValueError("physical object bytes must be non-negative")
+            if action in {HookAction.CACHE_CREATE, HookAction.CACHE_STORE, HookAction.CACHE_HIT, HookAction.CACHE_LOAD}:
+                physical.size_bytes = max(physical.size_bytes, observed_bytes)
+
         issued_lease = self._validate_or_issue_lease(physical, action, status, context.request_id, operation_lease)
         self._advance(physical, action, status, context.request_id, issued_lease)
         binding = BackendObjectBinding(
@@ -243,6 +254,7 @@ class BackendBindingRegistry:
                 "lifecycle": physical.lifecycle,
                 "pin_count": physical.pin_count,
                 "pending_io": physical.pending_io,
+                "size_bytes": physical.size_bytes,
                 **(
                     {"runtime_reqmeta_id": str(base_metadata["runtime_reqmeta_id"])}
                     if base_metadata.get("runtime_reqmeta_id")
@@ -309,7 +321,8 @@ class BackendBindingRegistry:
             except ValueError:
                 return False
             return bool(
-                physical.lifecycle in {"active", "released"}
+                physical.binding_generation == binding_generation
+                and physical.lifecycle in {"active", "released"}
                 and not physical.active_request_ids
                 and physical.pin_count == 0
                 and physical.pending_io == 0
@@ -332,7 +345,9 @@ class BackendBindingRegistry:
             return bool(
                 association is not None
                 and physical.binding_id == binding_id
+                and physical.binding_generation == binding_generation
                 and physical.backend_object_id == backend_object_id
+                and association.binding_generation == binding_generation
                 and association.backend_object_id == backend_object_id
                 and physical.lifecycle in {"active", "released"}
                 and not physical.active_request_ids
@@ -379,6 +394,7 @@ class BackendBindingRegistry:
             physical = reservation.physical
             if (
                 binding_id is not None and physical.binding_id != binding_id
+                or binding_generation is not None and physical.binding_generation != binding_generation
                 or backend_object_id is not None and physical.backend_object_id != backend_object_id
             ):
                 return False
@@ -463,7 +479,11 @@ class BackendBindingRegistry:
                 physical = self._require_current(binding_id)
             except ValueError:
                 return None
-            return binding if physical.binding_id == binding_id else None
+            return binding if (
+                physical.binding_id == binding_id
+                and physical.binding_generation == binding_generation
+                and binding.binding_generation == binding_generation
+            ) else None
 
     def binding_status(self, binding_id: str) -> str:
         with self._lock:
@@ -483,7 +503,7 @@ class BackendBindingRegistry:
             return {
                 "binding_id": physical.binding_id,
                 "backend_object_id": physical.backend_object_id,
-                "binding_generation": 1,
+                "binding_generation": physical.binding_generation,
                 "binding_identity_mode": "unique_binding_id",
                 "lifecycle": physical.lifecycle,
                 "active_request_ids": tuple(sorted(physical.active_request_ids)),
@@ -491,6 +511,7 @@ class BackendBindingRegistry:
                 "pending_io": physical.pending_io,
                 "pending_operations": tuple(sorted(physical.pending_operations)),
                 "action_reservation": physical.action_reservation,
+                "size_bytes": physical.size_bytes,
             }
 
     def _create_physical(
@@ -523,7 +544,7 @@ class BackendBindingRegistry:
         previous_binding_id = physical.binding_id
         digest = hashlib.sha256(physical.canonical_key.encode("utf-8")).hexdigest()[:20]
         physical.binding_id = self._new_binding_id(digest)
-        physical.binding_generation = 1
+        physical.binding_generation += 1
         physical.logical_object_key = object_key
         physical.logical_object_level = object_level
         physical.lifecycle = "created"
@@ -537,7 +558,7 @@ class BackendBindingRegistry:
         self._retired_bindings[previous_binding_id] = {
             "binding_id": previous_binding_id,
             "backend_object_id": physical.backend_object_id,
-            "binding_generation": 1,
+            "binding_generation": physical.binding_generation - 1,
             "binding_identity_mode": "unique_binding_id",
             "lifecycle": "replaced",
             "active_request_ids": (),
@@ -545,6 +566,7 @@ class BackendBindingRegistry:
             "pending_io": 0,
             "pending_operations": (),
             "action_reservation": None,
+            "size_bytes": physical.size_bytes,
             "previous_binding_id": previous_binding_id,
             "replaced_by_binding_id": physical.binding_id,
             "binding_replacement_reason": replacement_reason,

@@ -123,6 +123,12 @@ class RequestResult:
     runtime_request_id: str = ""
     runtime_event_id: str = ""
     request_context_error: str = ""
+    # vLLM returns these only when its token-evidence options are enabled.
+    # They make KV-Core correctness comparisons about generated token IDs, not
+    # merely decoded text that can hide tokenizer-boundary differences.
+    output_token_ids: tuple[int, ...] = ()
+    finish_reason: str = ""
+    deterministic_logprob: float | None = None
 
 
 def main() -> int:
@@ -509,6 +515,10 @@ def run_one_request(
     observed_tokens = 0
     usage_tokens: int | None = None
     output_parts: list[str] = []
+    output_token_ids: list[int] = []
+    finish_reason = ""
+    deterministic_logprob = 0.0
+    logprob_observed = False
     status = "ok"
     error = ""
     nonce = _canonical_request_nonce(request_nonce)
@@ -576,6 +586,11 @@ def run_one_request(
                 "user": str(request_id),
                 "_astrakv_request_id": str(request_id),
             }
+            if backend == "vllm-lmcache-kv-core":
+                # vLLM's documented compatibility extension returns stable
+                # token identifiers in streamed choices.  Other benchmark
+                # backends retain their existing request shape.
+                payload.update({"return_tokens_as_token_ids": True, "logprobs": True, "top_logprobs": 1})
             for event in stream_chat_completion(
                 f"{base_url}/v1/chat/completions",
                 payload,
@@ -598,6 +613,27 @@ def run_one_request(
                 for choice in choices:
                     if not isinstance(choice, dict):
                         continue
+                    if choice.get("finish_reason") is not None:
+                        finish_reason = str(choice["finish_reason"])
+                    token_ids = choice.get("token_ids")
+                    if not isinstance(token_ids, list):
+                        delta_value = choice.get("delta")
+                        token_ids = delta_value.get("token_ids") if isinstance(delta_value, dict) else None
+                    if isinstance(token_ids, list):
+                        for token_id in token_ids:
+                            if isinstance(token_id, int) and not isinstance(token_id, bool):
+                                output_token_ids.append(token_id)
+                    logprobs = choice.get("logprobs")
+                    content_logprobs = logprobs.get("content") if isinstance(logprobs, dict) else None
+                    if isinstance(content_logprobs, list):
+                        for token in content_logprobs:
+                            if not isinstance(token, dict):
+                                continue
+                            try:
+                                deterministic_logprob += float(token["logprob"])
+                                logprob_observed = True
+                            except (KeyError, TypeError, ValueError):
+                                continue
                     delta = choice.get("delta")
                     content = delta.get("content") if isinstance(delta, dict) else None
                     if content:
@@ -684,6 +720,9 @@ def run_one_request(
         runtime_request_id=runtime_request_id,
         runtime_event_id=runtime_event_id,
         request_context_error=request_context_error,
+        output_token_ids=tuple(output_token_ids),
+        finish_reason=finish_reason,
+        deterministic_logprob=deterministic_logprob if logprob_observed else None,
     )
 
 

@@ -1,0 +1,63 @@
+schema: astrakv-kv-core-experiment-v1
+target:
+  model: /opt/models/Qwen3-8B
+  model_revision: local-qwen3-8b
+  tokenizer_revision: local-qwen3-8b
+  chat_template_revision: qwen3-default
+  quantization: unquantized
+  dtype: bfloat16
+  vllm_version: 0.23.0
+  lmcache_version: 0.4.7
+  single_worker: true
+hardware:
+  platform: DGX Spark GB10
+  memory_model: uma
+runtime:
+  default_mode: off
+  gpu_memory_utilization: 0.72
+  max_model_len: 32768
+  topology:
+    demand_load: gpu_ssd
+    cpu_prefetch: gpu_cpu_ssd
+  cpu_prefetch_budget_fraction: 0.05
+  block_size_tokens: 16
+  partial_load: continuous_prefix_from_zero_block_aligned
+experiments:
+  E0:
+    mode: off
+    admission: false
+    cpu_prefetch: false
+    partial_prefix_upper_bound: false
+  E1:
+    mode: shadow
+    admission: false
+    cpu_prefetch: false
+    partial_prefix_upper_bound: false
+  E2:
+    mode: active
+    admission: true
+    cpu_prefetch: false
+    partial_prefix_upper_bound: false
+  E3:
+    mode: active
+    admission: true
+    cpu_prefetch: true
+    partial_prefix_upper_bound: false
+  E4:
+    mode: active
+    admission: true
+    cpu_prefetch: true
+    partial_prefix_upper_bound: true
+workloads:
+  required:
+    - repeated_long_prefix
+    - random_no_reuse
+    - constrained_kv_churn
+    - queued_concurrency
+  cache_states: [cold, warm]
+acceptance:
+  e3_ttft_p95_improvement_percent: 5.0
+  max_throughput_regression_percent: 2.0
+  min_kv_capacity_saving_percent: 10.0
+  max_uma_peak_regression_percent: 2.0
+  max_no_reuse_ttft_p95_regression_percent: 2.0

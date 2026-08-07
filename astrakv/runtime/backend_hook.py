@@ -97,6 +97,16 @@ class HookAction(str, Enum):
     EVICT = "evict"
     DROP = "drop"
     RELEASE = "release"
+    # KV-Core actions have explicit ownership.  The native connector is the
+    # only component allowed to emit the GPU load and recompute outcomes.
+    ADMIT_EXTERNAL_PREFIX = "admit_external_prefix"
+    NATIVE_LOOKUP = "native_lookup"
+    NATIVE_LOAD_TO_PAGED_GPU = "native_load_to_paged_gpu"
+    RECOMPUTE_MISSING_SUFFIX = "recompute_missing_suffix"
+    PREFETCH_SSD_TO_CPU = "prefetch_ssd_to_cpu"
+    DEMOTE_CPU_COPY = "demote_cpu_copy"
+    INVALIDATE_EXTERNAL_COPY = "invalidate_external_copy"
+    PREFETCH_CANCELLED = "prefetch_cancelled"
 
 
 def _required(record: dict[str, Any], name: str) -> str:
@@ -403,6 +413,7 @@ class BackendActionReceipt:
             and self.command_id == command.command_id
             and self.binding_id == command.binding_id
             and self.backend_object_id == command.backend_object_id
+            and self.binding_generation == command.binding_generation
             and self.action == command.action
             and (not self.decision_id or self.decision_id == command.decision_id)
             and (not self.request_id or self.request_id == command.request_id)

@@ -12,6 +12,7 @@ from astrakv.runtime.backend_binding_registry import RequestContext
 from astrakv.runtime.backend_hook import BackendActionCommand, BackendActionReceipt, BackendHookEvent, HookAction
 from astrakv.runtime.eviction import ObjectLevel
 from astrakv.runtime.lmcache047_action_service import command_integrity_digest
+from astrakv.runtime.kv_runtime_core import RuntimeMode
 
 
 class RuntimeControlHostTests(unittest.TestCase):
@@ -61,7 +62,7 @@ class RuntimeControlHostTests(unittest.TestCase):
             host = RuntimeControlHost(RuntimeControlHostConfig(
                 run_id="run-a", state_dir=Path(directory), secret=b"a" * 32,
                 engine_instance_id="engine", worker_id="worker", observed_versions={"vllm": "0.23.0", "lmcache": "0.4.7"},
-                online_policy_enabled=True, offline_gate_record={"status": "accepted", "reasons": [], "workload_ids": [], "aggregate": {}, "checks": {}},
+                online_policy_enabled=True, offline_gate_record={"status": "accepted", "reasons": [], "workload_ids": [], "aggregate": {}, "checks": {}}, kv_core_mode=RuntimeMode.ACTIVE,
             ))
             try:
                 host.start()
@@ -117,7 +118,7 @@ class RuntimeControlHostTests(unittest.TestCase):
             host = RuntimeControlHost(RuntimeControlHostConfig(
                 run_id="run-a", state_dir=Path(directory), secret=b"a" * 32,
                 engine_instance_id="engine", worker_id="worker", observed_versions={"vllm": "0.23.0", "lmcache": "0.4.7"},
-                online_policy_enabled=True, offline_gate_record={"status": "accepted", "reasons": [], "workload_ids": [], "aggregate": {}, "checks": {}},
+                online_policy_enabled=True, offline_gate_record={"status": "accepted", "reasons": [], "workload_ids": [], "aggregate": {}, "checks": {}}, kv_core_mode=RuntimeMode.ACTIVE,
             ))
             remove_started = threading.Event()
             allow_remove = threading.Event()
@@ -132,8 +133,8 @@ class RuntimeControlHostTests(unittest.TestCase):
                 host.start()
                 host.install_hooks(lambda *_args, **_kwargs: object())
                 context = RequestContext("run-a", "request-a", "prefix-a", ObjectLevel.PREFIX)
-                submitted = host.binding_registry.observe("key-a", HookAction.CACHE_STORE, "submitted", context)
-                completed = host.binding_registry.complete_operation("key-a", HookAction.CACHE_STORE, "completed", context, submitted.event.metadata["operation_lease"])
+                submitted = host.binding_registry.observe("key-a", HookAction.CACHE_STORE, "submitted", context, bytes=4096)
+                completed = host.binding_registry.complete_operation("key-a", HookAction.CACHE_STORE, "completed", context, submitted.event.metadata["operation_lease"], bytes=4096)
                 assert completed.binding is not None
                 host.action_endpoint.action_registration_enabled = True
                 manager = BlockingManager()
@@ -185,7 +186,7 @@ class RuntimeControlHostTests(unittest.TestCase):
             host = RuntimeControlHost(RuntimeControlHostConfig(
                 run_id="run-a", state_dir=Path(directory), secret=b"a" * 32,
                 engine_instance_id="engine", worker_id="worker", observed_versions={"vllm": "0.23.0", "lmcache": "0.4.7"},
-                online_policy_enabled=True, offline_gate_record={"status": "accepted", "reasons": [], "workload_ids": [], "aggregate": {}, "checks": {}},
+                online_policy_enabled=True, offline_gate_record={"status": "accepted", "reasons": [], "workload_ids": [], "aggregate": {}, "checks": {}}, kv_core_mode=RuntimeMode.ACTIVE,
             ))
 
             class Manager:
@@ -195,8 +196,8 @@ class RuntimeControlHostTests(unittest.TestCase):
                 host.start()
                 host.install_hooks(lambda *_args, **_kwargs: object())
                 context = RequestContext("run-a", "request-a", "prefix-a", ObjectLevel.PREFIX)
-                submitted = host.binding_registry.observe("key-a", HookAction.CACHE_STORE, "submitted", context)
-                completed = host.binding_registry.complete_operation("key-a", HookAction.CACHE_STORE, "completed", context, submitted.event.metadata["operation_lease"])
+                submitted = host.binding_registry.observe("key-a", HookAction.CACHE_STORE, "submitted", context, bytes=4096)
+                completed = host.binding_registry.complete_operation("key-a", HookAction.CACHE_STORE, "completed", context, submitted.event.metadata["operation_lease"], bytes=4096)
                 assert completed.binding is not None
                 host.action_endpoint.action_registration_enabled = True
                 manager = Manager()
@@ -254,7 +255,7 @@ class RuntimeControlHostTests(unittest.TestCase):
             host = RuntimeControlHost(RuntimeControlHostConfig(
                 run_id="run-a", state_dir=Path(directory), secret=b"a" * 32,
                 engine_instance_id="engine", worker_id="worker", observed_versions={"vllm": "0.23.0", "lmcache": "0.4.7"},
-                online_policy_enabled=True, offline_gate_record={"status": "rejected", "reasons": ["offline gate blocked"], "workload_ids": [], "aggregate": {}, "checks": {}},
+                online_policy_enabled=True, offline_gate_record={"status": "rejected", "reasons": ["offline gate blocked"], "workload_ids": [], "aggregate": {}, "checks": {}}, kv_core_mode=RuntimeMode.ACTIVE,
             ))
 
             class Manager:
@@ -359,10 +360,10 @@ class RuntimeControlHostTests(unittest.TestCase):
             try:
                 host.start()
                 context = RequestContext("run-a", "request-a", "prefix-a", ObjectLevel.PREFIX)
-                submitted = host.binding_registry.observe("key-a", HookAction.CACHE_STORE, "submitted", context)
+                submitted = host.binding_registry.observe("key-a", HookAction.CACHE_STORE, "submitted", context, bytes=4096)
                 binding = host.binding_registry.complete_operation(
                     "key-a", HookAction.CACHE_STORE, "completed", context,
-                    submitted.event.metadata["operation_lease"],
+                    submitted.event.metadata["operation_lease"], bytes=4096,
                 ).binding
                 host.binding_registry.observe("key-a", HookAction.RELEASE, "completed", context)
                 assert binding is not None
@@ -682,12 +683,12 @@ class RuntimeControlHostTests(unittest.TestCase):
             finally:
                 host.close()
 
-    def test_online_controller_dispatches_load_after_dynamic_load_target_signal(self):
+    def test_online_controller_never_dispatches_generic_load_after_dynamic_load_target_signal(self):
         with tempfile.TemporaryDirectory() as directory:
             host = RuntimeControlHost(RuntimeControlHostConfig(
                 run_id="run-a", state_dir=Path(directory), secret=b"a" * 32,
                 engine_instance_id="engine", worker_id="worker", observed_versions={"vllm": "0.23.0", "lmcache": "0.4.7"},
-                online_policy_enabled=False, offline_gate_record={"status": "accepted", "reasons": [], "workload_ids": [], "aggregate": {}, "checks": {}},
+                online_policy_enabled=False, offline_gate_record={"status": "accepted", "reasons": [], "workload_ids": [], "aggregate": {}, "checks": {}}, kv_core_mode=RuntimeMode.ACTIVE,
             ))
 
             class FakeTensor:
@@ -792,23 +793,9 @@ class RuntimeControlHostTests(unittest.TestCase):
                 decision = host.online_controller.propose_for("prefix-a", ObjectLevel.PREFIX)
                 self.assertEqual(decision.predicted_action, "load")
                 result = host.online_controller.dispatch(decision)
-                self.assertEqual(result.status, "executed")
-                if host.online_bridge.commands:
-                    host._write_command(host.online_bridge.commands[-1])
-                if host.online_bridge.receipts:
-                    host._write_receipt(host.online_bridge.receipts[-1])
-
-                receipt_path = Path(directory) / "runtime_command_receipts.jsonl"
-                structured_path = Path(directory) / "runtime_structured_events.jsonl"
-                receipts = [json.loads(line) for line in receipt_path.read_text(encoding="utf-8").splitlines()]
-                structured = [json.loads(line) for line in structured_path.read_text(encoding="utf-8").splitlines()]
-                self.assertEqual(receipts[-1]["action"], "cache_load")
-                self.assertEqual(receipts[-1]["status"], "completed")
-                self.assertEqual(receipts[-1]["metadata"]["load_target_id"], "load-target-1")
-                self.assertEqual(receipts[-1]["metadata"]["runtime_reqmeta_id"], "reqmeta-1")
-                self.assertEqual(structured[-1]["actual_action"], "load")
-                self.assertEqual(structured[-1]["metadata"]["load_target_id"], "load-target-1")
-                self.assertEqual(manager.engine.load_calls[-1]["kwargs"]["req_id"], "reqmeta-1")
+                self.assertEqual(result.status, "native_connector_required")
+                self.assertFalse(host.online_bridge.commands)
+                self.assertFalse(manager.engine.load_calls)
             finally:
                 host.close()
 

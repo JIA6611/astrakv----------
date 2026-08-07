@@ -46,11 +46,12 @@ from astrakv.runtime.artifact_contract import canonical_artifact_path
 from astrakv.runtime.lmcache047_action_service import InMemoryRuntimeActionClient
 from astrakv.runtime.eviction import ObjectLevel
 from astrakv.runtime.offline_safety import OfflineSafetyGate, OfflineSafetyGateResult
-from astrakv.runtime.online_controller import OnlinePolicyController
+from astrakv.runtime.online_controller import OnlinePolicyController, OnlinePolicyControllerConfig
 from astrakv.runtime.online_profile import OnlineProfileStore
 from astrakv.runtime.prediction_sidecar import PredictionSidecarIndex
 from astrakv.runtime.profile_db import ProfileDB
 from astrakv.runtime.scheduler_hints import SchedulerHintIndex
+from astrakv.runtime.kv_runtime_core import RuntimeMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +72,9 @@ class RuntimeControlHostConfig:
     prediction_sidecar_path: Path | None = None
     profile_db_path: Path | None = None
     scheduler_hints_path: Path | None = None
+    online_prefetch_dispatch_enabled: bool = True
+    online_prefetch_mode: str = "disabled"
+    kv_core_mode: RuntimeMode = RuntimeMode.OFF
 
     def __post_init__(self) -> None:
         if not all((self.run_id, self.engine_instance_id, self.worker_id)):
@@ -83,6 +87,8 @@ class RuntimeControlHostConfig:
             raise ValueError("online_policy_queue_size must be positive")
         if not self.online_policy_dispatch_deadline_s > 0:
             raise ValueError("online_policy_dispatch_deadline_s must be positive")
+        if not isinstance(self.kv_core_mode, RuntimeMode):
+            raise ValueError("kv_core_mode must be a RuntimeMode")
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,6 +405,11 @@ class RuntimeControlHost:
             profile_store=OnlineProfileStore(
                 run_id=self.config.run_id,
                 checkpoint_path=canonical_artifact_path(self.state_dir, "online_profile_checkpoint"),
+            ),
+            config=OnlinePolicyControllerConfig(
+                enable_prefetch_dispatch=self.config.online_prefetch_dispatch_enabled,
+                online_prefetch_mode=self.config.online_prefetch_mode,
+                kv_core_mode=self.config.kv_core_mode,
             ),
             prediction_source=prediction_source,
             profile_db=profile_db,

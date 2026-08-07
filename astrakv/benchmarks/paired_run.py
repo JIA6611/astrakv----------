@@ -21,7 +21,7 @@ from astrakv.runtime.backend_capabilities import (
 PAIRED_RUN_SCHEMA = "astrakv-paired-run-manifest-v2"
 MANIFEST_SCHEMA = "astrakv-experiment-manifest-v2"
 BACKEND_HOOK_SCHEMA = "astrakv-backend-hook-v2"
-VALID_CLAIM_SCOPES = {"benchmark", "online_control"}
+VALID_CLAIM_SCOPES = {"benchmark", "online_control", "kv_core"}
 SOURCE_ARTIFACTS = ("workload", "matrix", "environment")
 COMMON_ARTIFACTS = SOURCE_ARTIFACTS + ("benchmark", "requests", "quality")
 ONLINE_CONTROL_ARTIFACTS = (

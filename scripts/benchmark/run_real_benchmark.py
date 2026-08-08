@@ -241,7 +241,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--connector-version", default=None)
     parser.add_argument("--pair-id", default=None, help="Required identity shared by a baseline/variant pair.")
     parser.add_argument("--pair-role", choices=("baseline", "variant"), default=None)
-    parser.add_argument("--claim-scope", choices=("benchmark", "online_control"), default=None)
+    parser.add_argument("--claim-scope", choices=("benchmark", "online_control", "kv_core"), default=None)
     parser.add_argument(
         "--online-artifact", action="append", default=None,
         help=(

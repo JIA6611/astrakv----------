@@ -15,11 +15,13 @@ class ThirdPartyPatchVerificationTests(unittest.TestCase):
             root = Path(raw_tmp)
             source = root / "connector.py"
             source.write_text("patched connector", encoding="utf-8")
+            marker = root / ".astrakv-kv-core"
+            marker.write_text(PATCH_ID + "\n", encoding="utf-8")
             manifest = root / "deployment.json"
             manifest.write_text(json.dumps({
                 "schema": PATCH_SCHEMA, "patch_id": PATCH_ID,
                 "callbacks": list(REQUIRED_CALLBACKS),
-                "patch_marker": {"id": PATCH_ID, "path": "/opt/vllm/.astrakv-kv-core"},
+                "patch_marker": {"id": PATCH_ID, "path": str(marker)},
                 "source_files": [{"path": str(source), "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}],
             }), encoding="utf-8")
             result = verify_connector_patch(

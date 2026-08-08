@@ -101,7 +101,11 @@ run_one() {
   cleanup
   ASTRAKV_MODEL="$MODEL" ASTRAKV_HOST="$HOST" ASTRAKV_PORT="$PORT" \
   ASTRAKV_GPU_MEMORY_UTILIZATION="$GPU_MEMORY_UTILIZATION" ASTRAKV_MAX_MODEL_LEN="32768" \
-  ASTRAKV_PREFIX_CACHING=true ASTRAKV_ENABLE_LMCACHE047_HOOKS=true \
+  LMCACHE_CONFIG_FILE="${LMCACHE_CONFIG_FILE:?pair-scoped LMCache config is required}" \
+  # Disable vLLM's in-process prefix cache for this external-KV experiment.
+  # Both pair members have the same setting; the only source of a cross-worker
+  # reuse is the pair-scoped LMCache disk store populated by the baseline.
+  ASTRAKV_PREFIX_CACHING=false ASTRAKV_ENABLE_LMCACHE047_HOOKS=true \
   ASTRAKV_RUNTIME_CONTROL_PROCESS_SCOPE=engine_child ASTRAKV_RUNTIME_CONTROL_RUN_ID="$run_id" \
   ASTRAKV_RUNTIME_CONTROL_STATE_DIR="$state_dir" ASTRAKV_RUNTIME_CONTROL_ENGINE_ID="$run_id-engine" \
   ASTRAKV_RUNTIME_CONTROL_WORKER_ID=worker-0 ASTRAKV_RUNTIME_CONTROL_CONTEXT_PORT="$CONTEXT_PORT" \
@@ -133,8 +137,19 @@ run_one() {
 
 run_pair() {
   local label="$1" baseline_phase="$2" variant_phase="$3" workload="$4" cache_state="$5"
-  run_one "$label" "$baseline_phase" baseline "$workload" "$cache_state" "$label"
-  run_one "$label" "$variant_phase" variant "$workload" "$cache_state" "$label"
+  local cache_dir="$OUTPUT_DIR/lmcache-store/$label/$workload/$cache_state"
+  local cache_config="$OUTPUT_DIR/lmcache-config/$label/$workload/$cache_state.yaml"
+  mkdir -p "$cache_dir" "$(dirname "$cache_config")"
+  # Baseline and variant share only this explicit store.  A new output root
+  # therefore yields a cold first member without mutating unrelated cache data.
+  cat > "$cache_config" <<EOF
+local_cpu: false
+max_local_cpu_size: 0.0
+local_disk: $cache_dir
+max_local_disk_size: 80.0
+EOF
+  LMCACHE_CONFIG_FILE="$cache_config" run_one "$label" "$baseline_phase" baseline "$workload" "$cache_state" "$label"
+  LMCACHE_CONFIG_FILE="$cache_config" run_one "$label" "$variant_phase" variant "$workload" "$cache_state" "$label"
   "$PYTHON" scripts/reporting/validate_kv_core_acceptance.py \
     --baseline "$OUTPUT_DIR/$label/$workload/$cache_state/baseline" \
     --variant "$OUTPUT_DIR/$label/$workload/$cache_state/variant" \

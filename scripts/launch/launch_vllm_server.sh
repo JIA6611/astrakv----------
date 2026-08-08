@@ -46,8 +46,12 @@ case "$LMCACHE047_HOOKS" in
   *) echo "ASTRAKV_ENABLE_LMCACHE047_HOOKS must be true or false, got: $LMCACHE047_HOOKS" >&2; exit 2 ;;
 esac
 if [[ "$LMCACHE047_HOOKS" == "true" ]]; then
-  export PYTHONPATH="$ROOT/scripts/runtime:$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+  # The vendor-patched connector imports AstraKV directly.  Do not prepend
+  # scripts/runtime: it contains sitecustomize.py, whose legacy monkey patch
+  # must never own KV-Core lifecycle or socket state.
+  export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
   export ASTRAKV_LMCACHE047_EVENTS="${ASTRAKV_LMCACHE047_EVENTS:-$ROOT/results/lmcache047_events.jsonl}"
+  export ASTRAKV_KV_CORE_VENDOR_PATCH="${ASTRAKV_KV_CORE_VENDOR_PATCH:-true}"
 fi
 if [[ -n "$RUNTIME_CONTROL_RUN_ID" ]]; then
   if [[ "$LMCACHE047_HOOKS" != "true" ]]; then
@@ -69,6 +73,10 @@ fi
 # Use HF mirror to bypass GFW block on huggingface.co and Xet CDN (cas-bridge.xethub.hf.co)
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-0}"
+# LMCache falls back to Python's builtin hash on this deployment.  A fixed
+# process-independent seed is required for the same token prefix to resolve
+# to the same external LMCache key after the worker is restarted.
+export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"
 
 # Python dev headers (python3.12-dev) for Triton/CUDA JIT compilation
 # Installed locally at ~/.local/include to avoid sudo requirement

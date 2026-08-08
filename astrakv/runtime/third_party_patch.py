@@ -15,10 +15,10 @@ PATCH_ID = "astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7"
 SUPPORTED_VLLM = "0.23.0"
 SUPPORTED_LMCACHE = "0.4.7"
 REQUIRED_CALLBACKS = (
-    "submit_intent",
-    "record_scheduler_lookup",
-    "record_scheduler_admission",
-    "record_native_load_completion",
+    "scheduler_exact_lookup",
+    "scheduler_external_admission",
+    "connector_metadata",
+    "native_load_completion",
 )
 
 
@@ -83,8 +83,20 @@ def verify_connector_patch(
             elif sha256_file(path) != expected:
                 reasons.append(f"source_hash_mismatch:{path.name}")
     marker = payload.get("patch_marker")
-    if not isinstance(marker, dict) or marker.get("id") != PATCH_ID or not str(marker.get("path") or ""):
+    marker_path = Path(str(marker.get("path") or "")) if isinstance(marker, dict) else None
+    if (
+        not isinstance(marker, dict)
+        or marker.get("id") != PATCH_ID
+        or marker_path is None
+        or not marker_path.is_file()
+    ):
         reasons.append("patch_marker_missing")
+    else:
+        try:
+            if PATCH_ID not in marker_path.read_text(encoding="utf-8"):
+                reasons.append("patch_marker_invalid")
+        except OSError:
+            reasons.append("patch_marker_invalid")
     if callback_smoke is None:
         reasons.append("callback_smoke_missing")
     else:

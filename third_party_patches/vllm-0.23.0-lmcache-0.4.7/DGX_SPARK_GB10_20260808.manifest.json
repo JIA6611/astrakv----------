@@ -1,0 +1,26 @@
+{
+  "schema": "astrakv-kv-core-connector-patch-v1",
+  "patch_id": "astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7",
+  "vllm_version": "0.23.0",
+  "lmcache_version": "0.4.7",
+  "callbacks": [
+    "scheduler_exact_lookup",
+    "scheduler_external_admission",
+    "connector_metadata",
+    "native_load_completion"
+  ],
+  "patch_marker": {
+    "id": "astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7",
+    "path": "/home/zyx/astrakv-W/deployments/kv-core-vllm-0.23.0-lmcache-0.4.7-20260808/PATCH_MARKER"
+  },
+  "source_files": [
+    {
+      "path": "/home/zyx/venv_for_zyx/lib/python3.12/site-packages/lmcache/integration/vllm/vllm_v1_adapter.py",
+      "sha256": "d45a804d2d6998cd3143182936422e6f4ef680d3cd1f2b1f1cb946c082ecb6c8"
+    },
+    {
+      "path": "/home/zyx/venv_for_zyx/lib/python3.12/site-packages/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_connector.py",
+      "sha256": "ae9fa2de201a5df9329e2cf8900ebf3e4bee1f4ba8d6658b69c785bae86b339d"
+    }
+  ]
+}

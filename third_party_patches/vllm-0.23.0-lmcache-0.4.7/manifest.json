@@ -4,10 +4,10 @@
   "vllm_version": "0.23.0",
   "lmcache_version": "0.4.7",
   "callbacks": [
-    "submit_intent",
-    "record_scheduler_lookup",
-    "record_scheduler_admission",
-    "record_native_load_completion"
+    "scheduler_exact_lookup",
+    "scheduler_external_admission",
+    "connector_metadata",
+    "native_load_completion"
   ],
   "patch_marker": {
     "id": "astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7",

@@ -74,9 +74,11 @@ def _active_patch_verified() -> bool:
 def install_from_environment(
     *,
     installer: Callable[..., Any] | None = None,
+    vendor_engine_child: bool = False,
 ) -> bool:
     global _HOST, _INSTALLED, _KV_CORE_CALLBACKS
-    if os.environ.get("ASTRAKV_ENABLE_LMCACHE047_HOOKS", "false") != "true":
+    vendor_patch = os.environ.get("ASTRAKV_KV_CORE_VENDOR_PATCH", "false") == "true"
+    if os.environ.get("ASTRAKV_ENABLE_LMCACHE047_HOOKS", "false") != "true" and not vendor_patch:
         return False
     if _INSTALLED:
         return True
@@ -101,7 +103,7 @@ def install_from_environment(
     if mode is RuntimeMode.ACTIVE and not run_id:
         raise RuntimeError("KV-Core active mode requires a request-context runtime control host")
     if run_id and os.environ.get("ASTRAKV_RUNTIME_CONTROL_PROCESS_SCOPE", "") == "engine_child":
-        if not _is_vllm_engine_child():
+        if not vendor_engine_child and not _is_vllm_engine_child():
             return False
     if run_id:
         try:
@@ -142,7 +144,7 @@ def install_from_environment(
             raise RuntimeError("invalid ASTRAKV_RUNTIME_CONTROL_* configuration") from exc
         try:
             host.start()
-            if mode is RuntimeMode.ACTIVE:
+            if vendor_patch and mode in {RuntimeMode.ACTIVE, RuntimeMode.SHADOW}:
                 # The vendor patch consumes these callbacks.  Do not install the
                 # legacy monkey patch, which can issue lifecycle-external I/O.
                 _KV_CORE_CALLBACKS = KVCoreConnectorCallbacks(mode=mode, capability=_environment_capability())
@@ -155,5 +157,10 @@ def install_from_environment(
     elif mode is not RuntimeMode.ACTIVE:
         installer(sink)
     _INSTALLED = True
-    print("AstraKV LMCache 0.4.7 runtime hooks installed", flush=True)
+    print(
+        "AstraKV KV-Core vendor callbacks installed"
+        if vendor_patch and mode in {RuntimeMode.ACTIVE, RuntimeMode.SHADOW}
+        else "AstraKV LMCache 0.4.7 legacy hooks installed",
+        flush=True,
+    )
     return True

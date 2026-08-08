@@ -48,6 +48,9 @@ class ExperimentManifest:
     pair_role: str = ""
     matrix_sha256: str = ""
     environment_sha256: str = ""
+    # The full environment is run-specific audit evidence.  This fingerprint
+    # contains only variables that must remain fixed across a paired control.
+    control_environment_sha256: str = ""
     artifact_paths: dict[str, str] = field(default_factory=dict)
     artifact_hashes: dict[str, str] = field(default_factory=dict)
     claim_scope: str = "benchmark"
@@ -76,6 +79,7 @@ class ExperimentManifest:
             "pair_role": self.pair_role,
             "matrix_sha256": self.matrix_sha256,
             "environment_sha256": self.environment_sha256,
+            "control_environment_sha256": self.control_environment_sha256,
             "artifact_paths": dict(self.artifact_paths),
             "artifact_hashes": dict(self.artifact_hashes),
             "claim_scope": self.claim_scope or "benchmark",

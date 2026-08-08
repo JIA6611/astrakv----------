@@ -66,6 +66,7 @@ class VendorCallbackBridge:
         physical = self._physical(connector, request_id, token_ids, request_configs)
         if physical is None:
             return
+        self._write_run_metadata(connector)
         callbacks = self._callbacks()
         if callbacks is None:
             return
@@ -98,6 +99,7 @@ class VendorCallbackBridge:
                     "native_key": physical.native_key,
                     "lookup_hit_tokens": int(lookup_hit_tokens),
                 })
+                self._append_request_accounting(request_id, physical)
         except (TypeError, ValueError) as exc:
             self._record("scheduler_exact_lookup", {"request_id": request_id, "status": "rejected", "reason": str(exc)})
 
@@ -112,6 +114,7 @@ class VendorCallbackBridge:
                 allocated_external_tokens=max(0, int(allocated_external_tokens)),
             )
             self._record("scheduler_external_admission", asdict(admission))
+            self._append_request_accounting(request_id, physical)
         except (TypeError, ValueError) as exc:
             self._record("scheduler_external_admission", {"request_id": request_id, "status": "rejected", "reason": str(exc)})
 
@@ -154,6 +157,7 @@ class VendorCallbackBridge:
             record["native_bytes"] = max(0, int(native_bytes))
             self._append("kv_core_native_receipts.jsonl", record)
             self._record("native_load_completion", record)
+            self._append_request_accounting(request_id, physical)
         except (TypeError, ValueError) as exc:
             self._record("native_load_completion", {"request_id": request_id, "status": "rejected", "reason": str(exc)})
 
@@ -252,6 +256,86 @@ class VendorCallbackBridge:
             "cgroup_memory_current_bytes": cgroup,
             "process_rss_bytes": rss,
         })
+
+    def _append_request_accounting(self, request_id: str, physical: PhysicalKVObject) -> None:
+        """Persist request-level truth without manufacturing a load receipt.
+
+        A scheduler decline is already a terminal recompute decision.  An
+        admitted request remains non-terminal until the native connector
+        reports ``start_load_kv`` completion.  The validator selects the last
+        record per request and rejects incomplete admissions.
+        """
+        callbacks = self._callbacks()
+        if callbacks is None:
+            return
+        intent = callbacks._intents.get(request_id)
+        lookup = callbacks._lookups.get(request_id)
+        if intent is None or lookup is None:
+            return
+        admission = callbacks._admissions.get(request_id)
+        receipt = callbacks.receipt_for(request_id)
+        allocated = 0 if admission is None else admission.allocated_external_tokens
+        loaded = 0 if receipt is None else receipt.actual_loaded_tokens
+        if receipt is not None:
+            terminal_reason = "native_load_completed"
+            terminal = True
+        elif admission is not None and allocated == 0:
+            terminal_reason = "scheduler_declined_recompute"
+            terminal = True
+        elif admission is not None:
+            terminal_reason = "native_load_pending"
+            terminal = False
+        else:
+            terminal_reason = "scheduler_admission_pending"
+            terminal = False
+        self._append("kv_core_request_accounting.jsonl", {
+            "request_id": request_id,
+            "physical_object_id": physical.physical_object_id,
+            "binding_generation": physical.binding_generation,
+            "native_key": physical.native_key,
+            "requested_prefix_tokens": intent.requested_prefix_tokens,
+            "lookup_hit_tokens": lookup.lookup_hit_tokens,
+            "allocated_external_tokens": allocated,
+            "actual_loaded_tokens": loaded,
+            "recomputed_tokens": max(0, intent.requested_prefix_tokens - loaded),
+            "native_retrieved_tokens": 0 if receipt is None else receipt.actual_loaded_tokens,
+            "native_bytes": 0 if receipt is None else receipt.bytes_loaded,
+            "load_latency_ns": 0 if receipt is None else receipt.load_latency_ns,
+            "terminal": terminal,
+            "terminal_reason": terminal_reason,
+            "timestamp_ns": time.time_ns(),
+        })
+
+    def _write_run_metadata(self, connector: Any) -> None:
+        """Record runtime-observed topology and vLLM allocation, never a plan.
+
+        The fields are intentionally absent when the installed connector does
+        not expose them.  Capacity acceptance then fails closed instead of
+        turning a configured budget into claimed physical evidence.
+        """
+        if self._state_dir is None:
+            return
+        config = getattr(connector, "config", None)
+        vllm_config = getattr(connector, "_vllm_config", None)
+        cache_config = getattr(vllm_config, "cache_config", None)
+        num_gpu_blocks = getattr(cache_config, "num_gpu_blocks", None)
+        try:
+            budget = int(num_gpu_blocks)
+        except (TypeError, ValueError):
+            budget = 0
+        payload = {
+            "schema": "astrakv-kv-core-runtime-metadata-v1",
+            "topology": os.environ.get("ASTRAKV_KV_CORE_TOPOLOGY", "unknown"),
+            "lmcache_local_cpu_enabled": bool(getattr(config, "local_cpu", False)),
+            "lmcache_local_disk_enabled": bool(getattr(config, "local_disk", False)),
+            "vllm_kv_block_budget": budget if budget > 0 else None,
+            "vllm_block_size_tokens": getattr(connector, "_block_size", None),
+            "lmcache_chunk_size_tokens": getattr(connector, "_lmcache_chunk_size", None),
+            "observed_at_ns": time.time_ns(),
+        }
+        (self._state_dir / "kv_core_run_metadata.json").write_text(
+            json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
+        )
 
     def _append_smoke(self) -> None:
         if self._state_dir is None:

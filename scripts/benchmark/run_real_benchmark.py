@@ -962,10 +962,34 @@ def finalize_experiment_manifest(output_dir: Path, args: argparse.Namespace, con
         "gpu": ExperimentManifest(run_id="environment").to_record()["gpu"],
         "config_sha256": file_sha256(args.config),
     }, sort_keys=True, indent=2), encoding="utf-8")
+    # Runtime mode and request-specific secrets must differ between pair
+    # members.  Keep them in the full environment artifact above, but derive a
+    # separate immutable control fingerprint for paired comparisons.
+    control_environment = output_dir / "control_environment_source.json"
+    control_environment.write_text(json.dumps({
+        "model": args.model,
+        "model_revision": args.model_revision,
+        "tokenizer_revision": args.tokenizer_revision,
+        "dtype": args.dtype,
+        "quantization": args.quantization,
+        "random_seed": args.random_seed,
+        "cache_state": args.cache_state,
+        "connector_version": args.connector_version,
+        "base_url": args.base_url,
+        "max_model_len": os.environ.get("ASTRAKV_MAX_MODEL_LEN", ""),
+        "gpu_memory_utilization": os.environ.get("ASTRAKV_GPU_MEMORY_UTILIZATION", ""),
+        "prefix_caching": os.environ.get("ASTRAKV_PREFIX_CACHING", ""),
+        "kv_transfer_config": os.environ.get("ASTRAKV_KV_TRANSFER_CONFIG", ""),
+        "lmcache_config_sha256": file_sha256(os.environ.get("LMCACHE_CONFIG_FILE", "")),
+        "software": ExperimentManifest(run_id="control-environment").to_record()["software"],
+        "gpu": ExperimentManifest(run_id="control-environment").to_record()["gpu"],
+        "config_sha256": file_sha256(args.config),
+    }, sort_keys=True, indent=2), encoding="utf-8")
     quality = output_dir / "quality_results.csv"
     _write_quality_provenance(quality, output_dir / "request_results.jsonl")
     artifact_paths = {
         "workload": workload.name, "matrix": matrix.name, "environment": environment.name,
+        "control_environment": control_environment.name,
         "benchmark": "benchmark_results.csv", "requests": "request_results.jsonl", "quality": quality.name,
     }
     runtime_state_dir = str(getattr(args, "runtime_state_dir", "") or "")
@@ -989,7 +1013,8 @@ def finalize_experiment_manifest(output_dir: Path, args: argparse.Namespace, con
             random_seed=args.random_seed, cache_state=args.cache_state, command=redacted_command(sys.argv),
             connector_version=args.connector_version, input_hashes=input_hashes((args.workload_jsonl, args.config)),
             pair_id=str(getattr(args, "pair_id", "") or ""), pair_role=str(getattr(args, "pair_role", "") or ""),
-            matrix_sha256=file_sha256(matrix), environment_sha256=file_sha256(environment), artifact_paths=artifact_paths,
+            matrix_sha256=file_sha256(matrix), environment_sha256=file_sha256(environment),
+            control_environment_sha256=file_sha256(control_environment), artifact_paths=artifact_paths,
             claim_scope=str(getattr(args, "claim_scope", "benchmark") or "benchmark"),
         ),
     )

@@ -22,7 +22,7 @@ PAIRED_RUN_SCHEMA = "astrakv-paired-run-manifest-v2"
 MANIFEST_SCHEMA = "astrakv-experiment-manifest-v2"
 BACKEND_HOOK_SCHEMA = "astrakv-backend-hook-v2"
 VALID_CLAIM_SCOPES = {"benchmark", "online_control", "kv_core"}
-SOURCE_ARTIFACTS = ("workload", "matrix", "environment")
+SOURCE_ARTIFACTS = ("workload", "matrix", "environment", "control_environment")
 COMMON_ARTIFACTS = SOURCE_ARTIFACTS + ("benchmark", "requests", "quality")
 ONLINE_CONTROL_ARTIFACTS = (
     "backend_capabilities",
@@ -122,6 +122,9 @@ def _validate_manifest_identity(label: str, manifest: dict[str, Any], errors: li
     for field in ("run_id", "pair_id", "pair_role", "workload_sha256", "matrix_sha256", "environment_sha256"):
         if not _identity(manifest.get(field)):
             errors.append(f"empty_identity:{label}:{field}")
+    control_hash = _identity(manifest.get("control_environment_sha256"))
+    if control_hash and len(control_hash) != 64:
+        errors.append(f"invalid_identity:{label}:control_environment_sha256")
     for field in ("model", "model_revision", "tokenizer_revision", "dtype", "quantization"):
         if not _identity(manifest.get(field)):
             errors.append(f"empty_model_identity:{label}:{field}")
@@ -155,9 +158,21 @@ def _require_claim_scope(baseline: dict[str, Any], variant: dict[str, Any], erro
 
 
 def _require_equal_identities(baseline: dict[str, Any], variant: dict[str, Any], errors: list[str]) -> None:
-    for field in ("workload_sha256", "matrix_sha256", "environment_sha256"):
+    for field in ("workload_sha256", "matrix_sha256"):
         if _identity(baseline.get(field)) != _identity(variant.get(field)):
             errors.append(f"{field}_mismatch")
+    baseline_control = _identity(baseline.get("control_environment_sha256"))
+    variant_control = _identity(variant.get("control_environment_sha256"))
+    if baseline_control or variant_control:
+        if not baseline_control or not variant_control:
+            errors.append("control_environment_sha256_missing")
+        elif baseline_control != variant_control:
+            errors.append("control_environment_sha256_mismatch")
+    else:
+        # Preserve strict validation for pre-contract manifests.  New KV-Core
+        # runs always carry the explicit control fingerprint above.
+        if _identity(baseline.get("environment_sha256")) != _identity(variant.get("environment_sha256")):
+            errors.append("environment_sha256_mismatch")
     if tuple(_identity(baseline.get(field)) for field in ("model", "model_revision", "tokenizer_revision", "dtype", "quantization")) != tuple(_identity(variant.get(field)) for field in ("model", "model_revision", "tokenizer_revision", "dtype", "quantization")):
         errors.append("model_identity_mismatch")
 
@@ -165,7 +180,12 @@ def _require_equal_identities(baseline: dict[str, Any], variant: dict[str, Any],
 def _validate_artifacts(run: PairedRunInput, manifest: dict[str, Any], errors: list[str]) -> dict[str, Path]:
     paths = manifest.get("artifact_paths") if isinstance(manifest.get("artifact_paths"), dict) else {}
     hashes = manifest.get("artifact_hashes") if isinstance(manifest.get("artifact_hashes"), dict) else {}
-    required = COMMON_ARTIFACTS + (ONLINE_CONTROL_ARTIFACTS if manifest.get("claim_scope") == "online_control" else ())
+    source_artifacts = SOURCE_ARTIFACTS
+    if not _identity(manifest.get("control_environment_sha256")):
+        source_artifacts = tuple(role for role in SOURCE_ARTIFACTS if role != "control_environment")
+    required = source_artifacts + ("benchmark", "requests", "quality") + (
+        ONLINE_CONTROL_ARTIFACTS if manifest.get("claim_scope") == "online_control" else ()
+    )
     result: dict[str, Path] = {}
     for role in required:
         target = _artifact_path(run.run_path, paths.get(role))
@@ -177,7 +197,9 @@ def _validate_artifacts(run: PairedRunInput, manifest: dict[str, Any], errors: l
             errors.append(f"artifact_hash_mismatch:{run.label}:{role}")
             continue
         result[role] = target
-    for role, field in (("workload", "workload_sha256"), ("matrix", "matrix_sha256"), ("environment", "environment_sha256")):
+    for role, field in (("workload", "workload_sha256"), ("matrix", "matrix_sha256"), ("environment", "environment_sha256"), ("control_environment", "control_environment_sha256")):
+        if role == "control_environment" and not _identity(manifest.get(field)):
+            continue
         if role in result and manifest.get(field) != file_sha256(result[role]):
             errors.append(f"source_hash_mismatch:{run.label}:{role}")
     return result

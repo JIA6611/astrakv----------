@@ -100,7 +100,50 @@ def validate_quality(baseline: list[dict[str, Any]], variant: list[dict[str, Any
             errors.append(f"quality_logprob_missing:{sample_id}")
 
 
-def validate_receipts(rows: list[dict[str, Any]], expected_request_ids: set[str], errors: list[str]) -> None:
+def validate_request_accounting(rows: list[dict[str, Any]], expected_request_ids: set[str], errors: list[str]) -> list[dict[str, Any]]:
+    """Validate the last native observation for every request.
+
+    These records are not synthetic load receipts: a zero-allocation terminal
+    record proves scheduler-declined recompute, while a positive allocation is
+    terminal only after the native connector reports completion.
+    """
+    latest: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        request_id = str(row.get("request_id") or "")
+        if not request_id:
+            errors.append("accounting_request_identity_missing")
+            continue
+        latest[request_id] = row
+    if set(latest) != expected_request_ids:
+        errors.append("accounting_request_coverage_mismatch")
+    for request_id, row in latest.items():
+        try:
+            lookup = int(row["lookup_hit_tokens"])
+            allocated = int(row["allocated_external_tokens"])
+            loaded = int(row["actual_loaded_tokens"])
+            requested = int(row["requested_prefix_tokens"])
+            recomputed = int(row["recomputed_tokens"])
+            generation = int(row["binding_generation"])
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"invalid_request_accounting:{request_id}")
+            continue
+        if not (lookup >= allocated >= loaded >= 0) or recomputed != max(0, requested - loaded) or generation <= 0:
+            errors.append(f"accounting_invariant_failed:{request_id}")
+        if row.get("terminal") is not True:
+            errors.append(f"accounting_not_terminal:{request_id}")
+        reason = str(row.get("terminal_reason") or "")
+        if allocated == 0 and reason != "scheduler_declined_recompute":
+            errors.append(f"accounting_invalid_recompute_reason:{request_id}")
+        if allocated > 0 and reason != "native_load_completed":
+            errors.append(f"accounting_missing_native_completion:{request_id}")
+    return list(latest.values())
+
+
+def validate_receipts(rows: list[dict[str, Any]], accounting: list[dict[str, Any]], errors: list[str]) -> None:
+    expected_loaded = {
+        str(row.get("request_id")) for row in accounting
+        if int(row.get("actual_loaded_tokens") or 0) > 0
+    }
     seen: set[str] = set()
     for row in rows:
         request_id = str(row.get("request_id") or "")
@@ -120,7 +163,7 @@ def validate_receipts(rows: list[dict[str, Any]], expected_request_ids: set[str]
             continue
         if not (lookup >= allocated >= loaded >= 0) or recomputed != max(0, requested - loaded) or generation <= 0:
             errors.append(f"receipt_invariant_failed:{request_id}")
-    if seen != expected_request_ids:
+    if not expected_loaded.issubset(seen):
         errors.append("receipt_request_coverage_mismatch")
 
 
@@ -159,6 +202,25 @@ def kv_block_budget(run: Path) -> int | None:
     return value if value > 0 else None
 
 
+def runtime_metadata(run: Path) -> dict[str, Any]:
+    try:
+        value = json.loads((run / "kv_core_run_metadata.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def validate_prefetch(rows: list[dict[str, Any]], errors: list[str]) -> None:
+    consumed = 0
+    for row in rows:
+        if str(row.get("source_tier")) != "ssd" or str(row.get("target_tier")) != "cpu":
+            continue
+        if row.get("status") == "consumed" and int(row.get("completed_bytes") or 0) > 0:
+            consumed += 1
+    if not consumed:
+        errors.append("e3_prefetch_consumption_evidence_missing")
+
+
 def load_run_artifact(run: Path, filename: str) -> list[dict[str, Any]]:
     return read_jsonl(run / filename)
 
@@ -179,15 +241,18 @@ def main() -> int:
     request_ids = {str(row.get("request_id") or "") for row in variant_requests}
     if "" in request_ids:
         errors.append("request_identity_missing")
+    accounting: list[dict[str, Any]] = []
     if args.phase != "E1":
+        accounting = load_run_artifact(variant_path, "kv_core_request_accounting.jsonl")
+        accounting = validate_request_accounting(accounting, request_ids, errors)
         receipts = load_run_artifact(variant_path, "kv_core_native_receipts.jsonl")
-        validate_receipts(receipts, request_ids, errors)
+        validate_receipts(receipts, accounting, errors)
     baseline_uma = load_run_artifact(baseline_path, "uma_resource_samples.jsonl")
     variant_uma = load_run_artifact(variant_path, "uma_resource_samples.jsonl")
     base_peak, variant_peak = uma_peak(baseline_uma), uma_peak(variant_uma)
-    if base_peak is None or variant_peak is None:
+    if args.phase != "E1" and (base_peak is None or variant_peak is None):
         errors.append("uma_evidence_missing")
-    elif variant_peak > base_peak * 1.02:
+    elif args.phase != "E1" and variant_peak is not None and base_peak is not None and variant_peak > base_peak * 1.02:
         errors.append("uma_peak_regression")
     point, interval = paired_ttft_bootstrap(baseline_requests, variant_requests)
     if point is None:
@@ -213,9 +278,14 @@ def main() -> int:
             errors.append("kv_block_budget_evidence_missing")
         elif variant_budget > baseline_budget * 0.90:
             errors.append("kv_capacity_saving_not_proven")
+    if args.phase in {"E3", "E4"}:
+        metadata = runtime_metadata(variant_path)
+        if metadata.get("topology") != "gpu_cpu_ssd" or metadata.get("lmcache_local_cpu_enabled") is not True:
+            errors.append("e3_local_cpu_topology_not_proven")
+        validate_prefetch(load_run_artifact(variant_path, "kv_core_prefetch_tickets.jsonl"), errors)
     if args.phase == "E4":
         # Upper-bound partial load must retain receipt accounting, enforced above.
-        partial_rows = [row for row in load_run_artifact(variant_path, "kv_core_native_receipts.jsonl") if int(row.get("allocated_external_tokens") or 0) < int(row.get("lookup_hit_tokens") or 0)]
+        partial_rows = [row for row in accounting if int(row.get("allocated_external_tokens") or 0) < int(row.get("lookup_hit_tokens") or 0)]
         if not partial_rows:
             errors.append("e4_partial_prefix_evidence_missing")
     record = {
@@ -229,6 +299,8 @@ def main() -> int:
         "uma_peak_bytes": {"baseline": base_peak, "variant": variant_peak},
         "throughput_tokens_s": {"baseline": baseline_throughput, "variant": variant_throughput},
         "vllm_kv_block_budget": {"baseline": baseline_budget, "variant": variant_budget},
+        "request_accounting_count": len(accounting),
+        "uma_measurement": "not_measured" if args.phase == "E1" and (base_peak is None or variant_peak is None) else "observed",
     }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

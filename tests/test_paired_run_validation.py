@@ -59,6 +59,29 @@ class PairedRunValidationTests(unittest.TestCase):
             self.assertIn("workload_sha256_mismatch", result.errors)
             self.assertIn("case_coverage_mismatch", result.errors)
 
+    def test_control_environment_allows_runtime_mode_difference_but_rejects_changed_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            baseline = make_run(root / "baseline", role="baseline")
+            variant = make_run(root / "variant", role="variant")
+            attach_control_environment(baseline, {"model": "m@r1", "kv_budget": 1024})
+            attach_control_environment(variant, {"model": "m@r1", "kv_budget": 1024})
+            # Full environment remains a per-run audit artifact and can differ.
+            (variant / "environment.json").write_text(json.dumps({"runtime_mode": "shadow"}), encoding="utf-8")
+            manifest_path = variant / "experiment_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["environment_sha256"] = file_sha256(variant / "environment.json")
+            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            refresh_artifact_hashes(variant)
+
+            result = validate_paired_runs(PairedRunInput("baseline", baseline), PairedRunInput("variant", variant))
+
+            self.assertTrue(result.eligible)
+            attach_control_environment(variant, {"model": "m@r1", "kv_budget": 768})
+            result = validate_paired_runs(PairedRunInput("baseline", baseline), PairedRunInput("variant", variant))
+            self.assertFalse(result.eligible)
+            self.assertIn("control_environment_sha256_mismatch", result.errors)
+
     def test_rejects_missing_artifacts_and_unproven_quality_samples(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)
@@ -228,6 +251,17 @@ def refresh_artifact_hashes(root: Path) -> None:
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["artifact_hashes"] = {role: file_sha256(root / relpath) for role, relpath in payload["artifact_paths"].items()}
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def attach_control_environment(root: Path, payload: dict[str, object]) -> None:
+    control = root / "control_environment.json"
+    control.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    manifest_path = root / "experiment_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["control_environment_sha256"] = file_sha256(control)
+    manifest["artifact_paths"]["control_environment"] = control.name
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    refresh_artifact_hashes(root)
 
 
 def write_rows(path: Path, fields: list[str], rows: list[dict[str, object]]) -> None:

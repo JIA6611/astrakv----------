@@ -5,7 +5,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import mock_open, patch
 
-from astrakv.runtime.lmcache047_bootstrap import _is_vllm_engine_child, install_from_environment, installed_runtime_control_host
+from astrakv.runtime.lmcache047_bootstrap import (
+    _is_vllm_engine_child,
+    install_from_environment,
+    installed_kv_core_callbacks,
+    installed_runtime_control_host,
+)
 from astrakv.runtime.lmcache047_runtime_patch import patch_usage_context_cpu_info
 
 
@@ -89,6 +94,27 @@ class LMCache047BootstrapTests(unittest.TestCase):
         }, clear=False):
             with self.assertRaisesRegex(RuntimeError, "verified vLLM/LMCache connector patch"):
                 install_from_environment(installer=lambda *_args, **_kwargs: self.fail("legacy installer must not run"))
+
+    def test_vendor_worker_installs_callbacks_without_control_host(self):
+        with tempfile.TemporaryDirectory() as raw_tmp, patch(
+            "astrakv.runtime.lmcache047_bootstrap._INSTALLED", False,
+        ), patch(
+            "astrakv.runtime.lmcache047_bootstrap._HOST", None,
+        ), patch(
+            "astrakv.runtime.lmcache047_bootstrap._KV_CORE_CALLBACKS", None,
+        ), patch.dict(os.environ, {
+            "ASTRAKV_KV_CORE_VENDOR_PATCH": "true",
+            "ASTRAKV_KV_CORE_MODE": "shadow",
+            "ASTRAKV_RUNTIME_CONTROL_RUN_ID": "worker-run",
+            "ASTRAKV_RUNTIME_CONTROL_STATE_DIR": raw_tmp,
+            "ASTRAKV_RUNTIME_CONTROL_PROCESS_SCOPE": "engine_child",
+        }, clear=False):
+            self.assertTrue(install_from_environment(
+                vendor_engine_child=True,
+                start_runtime_host=False,
+            ))
+            self.assertIsNone(installed_runtime_control_host())
+            self.assertIsNotNone(installed_kv_core_callbacks())
 
 
 if __name__ == "__main__":

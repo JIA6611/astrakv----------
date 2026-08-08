@@ -1,16 +1,19 @@
 {
-  "schema": "astrakv-kv-core-connector-patch-v1",
-  "patch_id": "astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7",
+  "schema": "astrakv-kv-core-connector-patch-v2",
+  "patch_id": "astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7-v2",
   "vllm_version": "0.23.0",
   "lmcache_version": "0.4.7",
   "callbacks": [
     "scheduler_exact_lookup",
     "scheduler_external_admission",
     "connector_metadata",
-    "native_load_completion"
+    "native_load_start",
+    "native_load_completion",
+    "scheduler_compute_progress",
+    "request_finished"
   ],
   "patch_marker": {
-    "id": "astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7",
+    "id": "astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7-v2",
     "path": "REPLACE_WITH_DEPLOYED_PATCH_MARKER"
   },
   "source_files": []

@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from astrakv.runtime.third_party_patch import REQUIRED_CALLBACKS, verify_connector_patch
+from astrakv.runtime.third_party_patch import PATCH_ID, REQUIRED_CALLBACKS, verify_connector_patch
 
 
 def main() -> int:
@@ -28,7 +28,7 @@ def main() -> int:
             payload = json.loads(smoke_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return False
-        return payload.get("patch_id") == "astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7" and tuple(payload.get("callbacks") or ()) == REQUIRED_CALLBACKS and payload.get("passed") is True
+        return payload.get("patch_id") == PATCH_ID and tuple(payload.get("callbacks") or ()) == REQUIRED_CALLBACKS and payload.get("passed") is True
 
     result = verify_connector_patch(args.deployment_manifest, callback_smoke=callback_smoke)
     encoded = json.dumps(result.record, indent=2, sort_keys=True)

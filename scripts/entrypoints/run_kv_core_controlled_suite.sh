@@ -14,12 +14,17 @@ WORKLOAD_DIR=""
 OUTPUT_DIR="$ROOT/results/kv-core-$(date -u +%Y%m%dT%H%M%SZ)"
 PATCH_MANIFEST=""
 CALLBACK_SMOKE=""
+WARM_STORE_DIR=""
 PHASES="E1"
 HOST="127.0.0.1"
 PORT="18000"
 CONTEXT_PORT="17900"
 TIMEOUT="900"
 GPU_MEMORY_UTILIZATION="0.72"
+WORKLOADS="repeated_long_prefix,random_no_reuse,constrained_kv_churn,queued_concurrency"
+CACHE_STATES="cold,warm"
+ALLOW_INELIGIBLE=false
+OFFLINE_PROFILE=""
 
 usage() {
   cat <<'EOF'
@@ -39,6 +44,7 @@ while [[ $# -gt 0 ]]; do
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
     --patch-manifest) PATCH_MANIFEST="$2"; shift 2 ;;
     --callback-smoke) CALLBACK_SMOKE="$2"; shift 2 ;;
+    --warm-store-dir) WARM_STORE_DIR="$2"; shift 2 ;;
     --phases) PHASES="$2"; shift 2 ;;
     --model) MODEL="$2"; shift 2 ;;
     --host) HOST="$2"; shift 2 ;;
@@ -46,12 +52,17 @@ while [[ $# -gt 0 ]]; do
     --context-port) CONTEXT_PORT="$2"; shift 2 ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
     --gpu-memory-utilization) GPU_MEMORY_UTILIZATION="$2"; shift 2 ;;
+    --workloads) WORKLOADS="$2"; shift 2 ;;
+    --cache-states) CACHE_STATES="$2"; shift 2 ;;
+    --allow-ineligible) ALLOW_INELIGIBLE=true; shift ;;
+    --offline-profile) OFFLINE_PROFILE="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
 [[ -n "$WORKLOAD_DIR" && -d "$WORKLOAD_DIR" ]] || { echo "--workload-dir is required" >&2; exit 2; }
+[[ -z "$OFFLINE_PROFILE" || -f "$OFFLINE_PROFILE" ]] || { echo "invalid --offline-profile" >&2; exit 2; }
 [[ "$HOST" == "127.0.0.1" || "$HOST" == "localhost" ]] || { echo "only a loopback server is supported" >&2; exit 2; }
 IFS=',' read -r -a SELECTED_PHASES <<< "$PHASES"
 [[ "${#SELECTED_PHASES[@]}" -gt 0 ]] || { echo "--phases must not be empty" >&2; exit 2; }
@@ -63,8 +74,16 @@ done
 if [[ "$ACTIVE_PHASE_SELECTED" == true ]]; then
   [[ -f "$PATCH_MANIFEST" && -f "$CALLBACK_SMOKE" ]] || { echo "verified deployment inputs are required for E2-E4" >&2; exit 2; }
 fi
-for workload in repeated_long_prefix random_no_reuse constrained_kv_churn queued_concurrency; do
+IFS=',' read -r -a SELECTED_WORKLOADS <<< "$WORKLOADS"
+IFS=',' read -r -a SELECTED_CACHE_STATES <<< "$CACHE_STATES"
+for workload in "${SELECTED_WORKLOADS[@]}"; do
+  [[ "$workload" =~ ^(repeated_long_prefix|random_no_reuse|constrained_kv_churn|queued_concurrency)$ ]] || {
+    echo "invalid workload: $workload" >&2; exit 2;
+  }
   [[ -f "$WORKLOAD_DIR/$workload.jsonl" ]] || { echo "Missing $workload.jsonl" >&2; exit 2; }
+done
+for cache_state in "${SELECTED_CACHE_STATES[@]}"; do
+  [[ "$cache_state" =~ ^(cold|warm)$ ]] || { echo "invalid cache state: $cache_state" >&2; exit 2; }
 done
 
 mkdir -p "$OUTPUT_DIR"
@@ -103,6 +122,15 @@ assert_lmcache_healthy() {
   fi
 }
 
+assert_lmcache_runtime_healthy() {
+  local log_path="$1"
+  if grep -Eq "No eviction candidates found in local cpu backend|Memory allocation failed during (async )?disk load" "$log_path"; then
+    echo "LMCache CPU staging pool was exhausted; refusing to accept a stalled or partial disk restore." >&2
+    tail -n 180 "$log_path" >&2 || true
+    return 1
+  fi
+}
+
 run_one() {
   local label="$1" phase="$2" role="$3" workload="$4" cache_state="$5" baseline_label="$6"
   local run_id="kv-core-${phase}-${workload}-${cache_state}-${role}-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -130,6 +158,7 @@ run_one() {
   # Both pair members have the same setting; reuse comes only from the
   # pair-scoped LMCache disk store.
   ASTRAKV_MODEL="$MODEL" ASTRAKV_HOST="$HOST" ASTRAKV_PORT="$PORT" \
+  PYTHONHASHSEED=0 \
   ASTRAKV_GPU_MEMORY_UTILIZATION="$GPU_MEMORY_UTILIZATION" ASTRAKV_MAX_MODEL_LEN="32768" \
   LMCACHE_CONFIG_FILE="${LMCACHE_CONFIG_FILE:?pair-scoped LMCache config is required}" \
   ASTRAKV_PREFIX_CACHING=false ASTRAKV_ENABLE_LMCACHE047_HOOKS=true \
@@ -137,28 +166,41 @@ run_one() {
   ASTRAKV_RUNTIME_CONTROL_STATE_DIR="$state_dir" ASTRAKV_RUNTIME_CONTROL_ENGINE_ID="$run_id-engine" \
   ASTRAKV_RUNTIME_CONTROL_WORKER_ID=worker-0 ASTRAKV_RUNTIME_CONTROL_CONTEXT_PORT="$CONTEXT_PORT" \
   ASTRAKV_RUNTIME_CONTROL_SESSION_ID="$run_id-session" ASTRAKV_RUNTIME_CONTROL_SECRET_HEX="$runtime_secret_hex" \
+  ASTRAKV_KV_CORE_VENDOR_PATCH=true ASTRAKV_MODEL_ID="Qwen3-8B" \
+  ASTRAKV_MODEL_REVISION="local-qwen3-8b" ASTRAKV_TOKENIZER_REVISION="local-qwen3-8b" \
+  ASTRAKV_CHAT_TEMPLATE_REVISION="qwen3-default" \
+  ASTRAKV_REQUIRE_EXACT_TOKEN_IDS=true \
   ASTRAKV_KV_CORE_MODE="$mode" ASTRAKV_KV_CORE_TOPOLOGY="$topology" \
   ASTRAKV_KV_CORE_LOCAL_CPU="$([[ "$topology" == gpu_cpu_ssd ]] && echo true || echo false)" \
   ASTRAKV_KV_CORE_PATCH_VERIFICATION="$OUTPUT_DIR/connector_patch_verification.json" \
   ASTRAKV_KV_CORE_ADMISSION_ENABLED="$admission" ASTRAKV_KV_CORE_CPU_PREFETCH_ENABLED="$prefetch" \
   ASTRAKV_KV_CORE_PARTIAL_PREFIX_UPPER_BOUND_ENABLED="$partial" \
+  ASTRAKV_KV_CORE_EXTERNAL_TOKEN_CAP="8192" ASTRAKV_KV_CORE_PARTIAL_PREFIX_TOKENS="2048" \
+  ASTRAKV_KV_CORE_BOOTSTRAP_LOADS="2" ASTRAKV_KV_CORE_SSD_READ_GBPS="3.0" \
+  ASTRAKV_KV_CORE_PREFILL_MS_PER_TOKEN="${ASTRAKV_PAIR_PREFILL_MS_PER_TOKEN:-0}" \
+  ASTRAKV_KV_CORE_OFFLINE_PROFILE="$OFFLINE_PROFILE" \
   nohup bash scripts/launch/launch_lmcache_vllm.sh "$backend" > "$log_path" 2>&1 < /dev/null &
   SERVER_PID="$!"
   wait_for_server "$log_path"
   assert_lmcache_healthy "$log_path"
-  "$PYTHON" scripts/benchmark/run_real_benchmark.py \
+  if ! "$PYTHON" scripts/benchmark/run_real_benchmark.py \
     --base-url "http://${HOST}:${PORT}/v1" --model "$MODEL" --backend "vllm-lmcache-kv-core" \
     --output-dir "$run_dir" --workload-jsonl "$WORKLOAD_DIR/$workload.jsonl" \
     --run-id "$run_id" --workload-id "$workload" --model-revision local-qwen3-8b \
     --tokenizer-revision local-qwen3-8b --dtype bfloat16 --quantization unquantized \
+    --tokenizer-path "$MODEL" --chat-template-revision qwen3-default \
     --random-seed 0 --cache-state "$cache_state" --connector-version "lmcache-vllm-v1-0.4.7" \
     --pair-id "${label}-${workload}-${cache_state}" --pair-role "$role" --claim-scope kv_core \
     --runtime-state-dir "$state_dir" --request-context-url "http://${HOST}:${CONTEXT_PORT}/request-context" \
     --request-context-session-id "$run_id-session" --request-context-secret-hex "$runtime_secret_hex" \
-    --timeout "$TIMEOUT" --output-tokens 128
+    --timeout "$TIMEOUT" --output-tokens 128; then
+    assert_lmcache_runtime_healthy "$log_path" || true
+    return 1
+  fi
+  assert_lmcache_runtime_healthy "$log_path"
   # These artifacts are emitted by the version-locked connector patch after
   # native events.  Do not synthesize estimated receipts or block capacity.
-  for artifact in kv_core_native_receipts.jsonl kv_core_request_accounting.jsonl kv_core_prefetch_tickets.jsonl uma_resource_samples.jsonl kv_core_run_metadata.json; do
+  for artifact in callback-smoke.json kv_core_native_callbacks.jsonl kv_core_native_receipts.jsonl kv_core_request_accounting.jsonl kv_core_prefetch_tickets.jsonl kv_core_policy_decisions.jsonl uma_resource_samples.jsonl kv_core_run_metadata.json; do
     if [[ -f "$state_dir/$artifact" ]]; then
       cp "$state_dir/$artifact" "$run_dir/$artifact"
     elif [[ "$phase" =~ ^E[2-4]$ && "$artifact" == kv_core_request_accounting.jsonl ]]; then
@@ -166,16 +208,24 @@ run_one() {
       return 1
     fi
   done
+  if [[ -d "$state_dir/native_receipts" ]]; then
+    cp -a "$state_dir/native_receipts" "$run_dir/native_receipts"
+  fi
   cleanup
 }
 
 run_pair() {
   local label="$1" baseline_phase="$2" variant_phase="$3" workload="$4" cache_state="$5"
-  local cache_dir="$OUTPUT_DIR/lmcache-store/$label/$workload/$cache_state"
-  local cache_config="$OUTPUT_DIR/lmcache-config/$label/$workload/$cache_state.yaml"
+  local baseline_cache_dir="$OUTPUT_DIR/lmcache-store/$label/$workload/$cache_state/baseline"
+  local variant_cache_dir="$OUTPUT_DIR/lmcache-store/$label/$workload/$cache_state/variant"
+  local baseline_cache_config="$OUTPUT_DIR/lmcache-config/$label/$workload/$cache_state-baseline.yaml"
+  local variant_cache_config="$OUTPUT_DIR/lmcache-config/$label/$workload/$cache_state-variant.yaml"
   # LMCache 0.4.7 requires a LocalCPUBackend object whenever LocalDiskBackend
   # is configured. Keep it non-hot for gpu_ssd: staging only, not prefetch.
-  local local_cpu="false" local_cpu_size="0.10" control_topology="gpu_ssd"
+  # A Qwen3-8B 256-token chunk is about 36 MiB; 0.1 GiB holds only two chunks
+  # and makes the synchronous disk-restore allocator busy-loop indefinitely.
+  # Two GiB is the LMCache gpu_ssd staging budget, shared by both pair members.
+  local local_cpu="false" local_cpu_size="2.0" control_topology="gpu_ssd"
   if [[ "$variant_phase" == E3 || "$variant_phase" == E4 ]]; then
     local_cpu="true"
     control_topology="gpu_cpu_ssd"
@@ -183,27 +233,58 @@ run_pair() {
     # prove the observed LocalCPUBackend capacity before using prefetch.
     local_cpu_size="5.0"
   fi
-  mkdir -p "$cache_dir" "$(dirname "$cache_config")"
-  # Baseline and variant share only this explicit store.  A new output root
-  # therefore yields a cold first member without mutating unrelated cache data.
-  cat > "$cache_config" <<EOF
+  mkdir -p "$baseline_cache_dir" "$variant_cache_dir" "$(dirname "$baseline_cache_config")"
+  if [[ "$cache_state" == warm ]]; then
+    [[ -n "$WARM_STORE_DIR" && -d "$WARM_STORE_DIR/$workload" ]] || {
+      echo "Warm pair requires --warm-store-dir/$workload; refusing an unseeded warm claim" >&2
+      return 1
+    }
+    cp -a "$WARM_STORE_DIR/$workload/." "$baseline_cache_dir/"
+    cp -a "$WARM_STORE_DIR/$workload/." "$variant_cache_dir/"
+  fi
+  cat > "$baseline_cache_config" <<EOF
 local_cpu: $local_cpu
 max_local_cpu_size: $local_cpu_size
-local_disk: $cache_dir
+local_disk: $baseline_cache_dir
+max_local_disk_size: 80.0
+EOF
+  cat > "$variant_cache_config" <<EOF
+local_cpu: $local_cpu
+max_local_cpu_size: $local_cpu_size
+local_disk: $variant_cache_dir
 max_local_disk_size: 80.0
 EOF
   ASTRAKV_CONTROL_TOPOLOGY="$control_topology" \
-    LMCACHE_CONFIG_FILE="$cache_config" run_one "$label" "$baseline_phase" baseline "$workload" "$cache_state" "$label"
-  ASTRAKV_CONTROL_TOPOLOGY="$control_topology" \
-    LMCACHE_CONFIG_FILE="$cache_config" run_one "$label" "$variant_phase" variant "$workload" "$cache_state" "$label"
-  "$PYTHON" scripts/reporting/validate_kv_core_acceptance.py \
-    --baseline "$OUTPUT_DIR/$label/$workload/$cache_state/baseline" \
-    --variant "$OUTPUT_DIR/$label/$workload/$cache_state/variant" \
-    --phase "$variant_phase" --output "$OUTPUT_DIR/$label/$workload/$cache_state/acceptance.json"
+    LMCACHE_CONFIG_FILE="$baseline_cache_config" run_one "$label" "$baseline_phase" baseline "$workload" "$cache_state" "$label"
+  local prefill_ms_per_token
+  prefill_ms_per_token="$("$PYTHON" - "$OUTPUT_DIR/$label/$workload/$cache_state/baseline/request_results.jsonl" <<'PY'
+import json
+import statistics
+import sys
+values = []
+with open(sys.argv[1], encoding="utf-8") as handle:
+    for line in handle:
+        row = json.loads(line)
+        ttft = row.get("ttft_ms")
+        tokens = row.get("context_length")
+        if isinstance(ttft, (int, float)) and isinstance(tokens, int) and ttft > 0 and tokens > 0:
+            values.append(float(ttft) / tokens)
+print(statistics.median(values) if values else 0.0)
+PY
+)"
+  ASTRAKV_PAIR_PREFILL_MS_PER_TOKEN="$prefill_ms_per_token" \
+    ASTRAKV_CONTROL_TOPOLOGY="$control_topology" \
+    LMCACHE_CONFIG_FILE="$variant_cache_config" run_one "$label" "$variant_phase" variant "$workload" "$cache_state" "$label"
+  if ! "$PYTHON" scripts/reporting/validate_kv_core_acceptance.py \
+      --baseline "$OUTPUT_DIR/$label/$workload/$cache_state/baseline" \
+      --variant "$OUTPUT_DIR/$label/$workload/$cache_state/variant" \
+      --phase "$variant_phase" --output "$OUTPUT_DIR/$label/$workload/$cache_state/acceptance.json"; then
+    [[ "$ALLOW_INELIGIBLE" == true ]] || return 1
+  fi
 }
 
-for workload in repeated_long_prefix random_no_reuse constrained_kv_churn queued_concurrency; do
-  for cache_state in cold warm; do
+for workload in "${SELECTED_WORKLOADS[@]}"; do
+  for cache_state in "${SELECTED_CACHE_STATES[@]}"; do
     for phase in "${SELECTED_PHASES[@]}"; do
       case "$phase" in
         E1) run_pair E1 E0 E1 "$workload" "$cache_state" ;;

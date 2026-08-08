@@ -36,6 +36,15 @@ class DGXGPUSSDConfigTests(unittest.TestCase):
         self.assertIn("ASTRAKV_VLLM_DEV_MODE", script)
         self.assertIn("export VLLM_SERVER_DEV_MODE=1", script)
 
+    def test_kv_core_suite_provisions_disk_staging_and_rejects_pressure(self):
+        script = (
+            ROOT / "scripts" / "entrypoints" / "run_kv_core_controlled_suite.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('local local_cpu="false" local_cpu_size="2.0"', script)
+        self.assertIn("assert_lmcache_runtime_healthy", script)
+        self.assertIn("No eviction candidates found in local cpu backend", script)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,7 @@ KV writer.
 from __future__ import annotations
 
 import time
+import threading
 from dataclasses import dataclass
 
 from astrakv.runtime.kv_runtime_core import (
@@ -17,6 +18,7 @@ from astrakv.runtime.kv_runtime_core import (
     PrefetchTicket,
     PrefetchTicketStore,
     RequestKVIntent,
+    RequestKVAccounting,
     RuntimeMode,
     TierCapabilitySnapshot,
 )
@@ -27,6 +29,7 @@ class SchedulerLookupObservation:
     request_id: str
     physical_object_id: str
     binding_generation: int
+    locally_cached_tokens: int
     lookup_hit_tokens: int
     native_request_id: str
 
@@ -47,21 +50,25 @@ class KVCoreConnectorCallbacks:
     def __init__(self, *, mode: RuntimeMode, capability: TierCapabilitySnapshot) -> None:
         self.mode = mode
         self.capability = capability
+        self._lock = threading.RLock()
         self.tickets = PrefetchTicketStore()
         self._intents: dict[str, RequestKVIntent] = {}
         self._lookups: dict[str, SchedulerLookupObservation] = {}
         self._admissions: dict[str, SchedulerAdmission] = {}
         self._receipts: dict[str, NativeKVLoadReceipt] = {}
+        self._scheduled_prefill_tokens: dict[str, int] = {}
+        self._final_accounting: dict[str, RequestKVAccounting] = {}
 
     def submit_intent(self, intent: RequestKVIntent) -> SchedulerAdmission:
+        with self._lock:
+            if intent.request_id in self._intents:
+                raise ValueError("request already has a KV-Core intent")
+            self._intents[intent.request_id] = intent
         if self.mode is RuntimeMode.OFF:
             return SchedulerAdmission(
                 intent.request_id, intent.physical_object.physical_object_id,
                 intent.physical_object.binding_generation, 0, "off", "kv_core_off",
             )
-        if intent.request_id in self._intents:
-            raise ValueError("request already has a KV-Core intent")
-        self._intents[intent.request_id] = intent
         return SchedulerAdmission(
             intent.request_id, intent.physical_object.physical_object_id,
             intent.physical_object.binding_generation, 0, "advisory",
@@ -73,7 +80,7 @@ class KVCoreConnectorCallbacks:
             return "kv_core_not_active"
         if ticket.generation_key != physical.generation_key or ticket.prefix_hash != physical.compatibility_key.prefix_hash:
             return "physical_generation_mismatch"
-        if physical.source_tier != "ssd" or ticket.source_tier != "ssd":
+        if physical.source_tier not in {"ssd", "mixed"} or ticket.source_tier != "ssd":
             return "source_tier_not_ssd"
         reason = self.capability.prefetch_block_reason(
             size_bytes=ticket.requested_bytes, deadline_ns=ticket.deadline_ns, now_ns=now_ns,
@@ -87,16 +94,19 @@ class KVCoreConnectorCallbacks:
         return self.tickets.complete(prefetch_id, completed_bytes=completed_bytes, now_ns=now_ns)
 
     def record_scheduler_lookup(
-        self, *, request_id: str, physical: PhysicalKVObject, lookup_hit_tokens: int, native_request_id: str,
+        self, *, request_id: str, physical: PhysicalKVObject, lookup_hit_tokens: int,
+        locally_cached_tokens: int = 0, native_request_id: str,
     ) -> SchedulerLookupObservation:
         intent = self._intent(request_id, physical)
         if lookup_hit_tokens < 0 or lookup_hit_tokens > intent.requested_prefix_tokens:
             raise ValueError("lookup_hit_tokens must be within the requested prefix")
+        if locally_cached_tokens < 0 or locally_cached_tokens > intent.requested_prefix_tokens:
+            raise ValueError("locally_cached_tokens must be within the requested prefix")
         if not native_request_id:
             raise ValueError("native_request_id is required")
         observed = SchedulerLookupObservation(
             request_id, physical.physical_object_id, physical.binding_generation,
-            int(lookup_hit_tokens), native_request_id,
+            int(locally_cached_tokens), int(lookup_hit_tokens), native_request_id,
         )
         self._lookups[request_id] = observed
         return observed
@@ -108,7 +118,7 @@ class KVCoreConnectorCallbacks:
             raise ValueError("scheduler allocation must not exceed lookup hit tokens")
         if allocated_external_tokens > intent.max_external_tokens:
             raise ValueError("scheduler allocation exceeds intent external-token upper bound")
-        if allocated_external_tokens > self.capability.external_token_cap:
+        if self.capability.external_token_cap > 0 and allocated_external_tokens > self.capability.external_token_cap:
             raise ValueError("scheduler allocation exceeds external token cap")
         status = "accepted" if allocated_external_tokens else "recompute"
         admission = SchedulerAdmission(
@@ -129,6 +139,7 @@ class KVCoreConnectorCallbacks:
         load_latency_ns: int,
         native_request_id: str,
         status: str,
+        native_retrieved_tokens: int | None = None,
         prefetch_id: str = "",
         now_ns: int | None = None,
     ) -> NativeKVLoadReceipt:
@@ -140,28 +151,195 @@ class KVCoreConnectorCallbacks:
             request_id=request_id,
             physical_object_id=physical.physical_object_id,
             binding_generation=physical.binding_generation,
+            native_key=physical.native_key,
+            compatibility_identity=physical.compatibility_key.identity,
+            prefix_hash=physical.compatibility_key.prefix_hash,
             requested_prefix_tokens=intent.requested_prefix_tokens,
+            locally_cached_tokens=lookup.locally_cached_tokens,
             lookup_hit_tokens=lookup.lookup_hit_tokens,
             allocated_external_tokens=allocated,
             actual_loaded_tokens=int(actual_loaded_tokens),
-            recomputed_tokens=max(0, intent.requested_prefix_tokens - int(actual_loaded_tokens)),
+            native_retrieved_tokens=(
+                int(actual_loaded_tokens)
+                if native_retrieved_tokens is None
+                else int(native_retrieved_tokens)
+            ),
+            missing_tokens=max(
+                0,
+                intent.requested_prefix_tokens
+                - lookup.locally_cached_tokens
+                - int(actual_loaded_tokens),
+            ),
+            unallocated_recompute_tokens=max(
+                0,
+                intent.requested_prefix_tokens
+                - lookup.locally_cached_tokens
+                - allocated,
+            ),
+            load_shortfall_tokens=allocated - int(actual_loaded_tokens),
             bytes_loaded=int(bytes_loaded),
             load_latency_ns=int(load_latency_ns),
             status=status,
             native_request_id=native_request_id,
             prefetch_id=prefetch_id,
         )
-        if prefetch_id:
-            self.tickets.consume(
-                prefetch_id,
-                request_id=request_id,
-                physical_object_id=physical.physical_object_id,
-                binding_generation=physical.binding_generation,
-                prefix_hash=physical.compatibility_key.prefix_hash,
-                now_ns=now_ns,
-            )
         self._receipts[request_id] = receipt
         return receipt
+
+    def record_scheduler_compute(self, *, request_id: str, scheduled_tokens: int) -> None:
+        if request_id not in self._intents:
+            return
+        if scheduled_tokens < 0:
+            raise ValueError("scheduled_tokens must be non-negative")
+        self._scheduled_prefill_tokens[request_id] = (
+            self._scheduled_prefill_tokens.get(request_id, 0) + int(scheduled_tokens)
+        )
+
+    def consume_cpu_prefetch(
+        self,
+        prefetch_id: str,
+        *,
+        request_id: str,
+        physical: PhysicalKVObject,
+        now_ns: int | None = None,
+    ) -> PrefetchTicket:
+        return self.tickets.consume(
+            prefetch_id,
+            request_id=request_id,
+            physical_object_id=physical.physical_object_id,
+            binding_generation=physical.binding_generation,
+            prefix_hash=physical.compatibility_key.prefix_hash,
+            native_key=physical.native_key,
+            compatibility_identity=physical.compatibility_key.identity,
+            now_ns=now_ns,
+        )
+
+    def update_capability(self, capability: TierCapabilitySnapshot) -> None:
+        with self._lock:
+            self.capability = capability
+
+    def intent_for(self, request_id: str) -> RequestKVIntent | None:
+        with self._lock:
+            return self._intents.get(request_id)
+
+    def lookup_for(self, request_id: str) -> SchedulerLookupObservation | None:
+        with self._lock:
+            return self._lookups.get(request_id)
+
+    def admission_for(self, request_id: str) -> SchedulerAdmission | None:
+        with self._lock:
+            return self._admissions.get(request_id)
+
+    def scheduled_prefill_for(self, request_id: str) -> int:
+        with self._lock:
+            return self._scheduled_prefill_tokens.get(request_id, 0)
+
+    def import_native_load_receipt(
+        self,
+        receipt: NativeKVLoadReceipt,
+        *,
+        physical: PhysicalKVObject,
+    ) -> None:
+        """Import a worker receipt after validating scheduler-owned identity."""
+        intent = self._intent(receipt.request_id, physical)
+        lookup = self._lookup(receipt.request_id, physical)
+        admission = self._admissions.get(receipt.request_id)
+        allocated = 0 if admission is None else admission.allocated_external_tokens
+        if (
+            receipt.generation_key != physical.generation_key
+            or receipt.native_key != physical.native_key
+            or receipt.compatibility_identity != physical.compatibility_key.identity
+            or receipt.prefix_hash != physical.compatibility_key.prefix_hash
+        ):
+            raise ValueError("worker receipt compatibility identity mismatch")
+        if receipt.requested_prefix_tokens != intent.requested_prefix_tokens:
+            raise ValueError("worker receipt requested prefix mismatch")
+        if receipt.locally_cached_tokens != lookup.locally_cached_tokens:
+            raise ValueError("worker receipt local KV count mismatch")
+        if receipt.lookup_hit_tokens != lookup.lookup_hit_tokens:
+            raise ValueError("worker receipt lookup count mismatch")
+        if receipt.allocated_external_tokens != allocated:
+            raise ValueError("worker receipt scheduler allocation mismatch")
+        with self._lock:
+            self._receipts[receipt.request_id] = receipt
+
+    def finalize_request(
+        self,
+        *,
+        request_id: str,
+        physical: PhysicalKVObject,
+        finish_status: str,
+        completed: bool,
+        native_num_computed_tokens: int | None = None,
+    ) -> RequestKVAccounting:
+        intent = self._intent(request_id, physical)
+        lookup = self._lookup(request_id, physical)
+        admission = self._admissions.get(request_id)
+        receipt = self._receipts.get(request_id)
+        allocated = 0 if admission is None else admission.allocated_external_tokens
+        loaded = 0 if receipt is None else receipt.actual_loaded_tokens
+        load_shortfall = max(0, allocated - loaded)
+        unallocated_recompute = max(
+            0,
+            intent.requested_prefix_tokens
+            - lookup.locally_cached_tokens
+            - allocated,
+        )
+        missing = max(
+            0,
+            intent.requested_prefix_tokens - lookup.locally_cached_tokens - loaded,
+        )
+        native_receipt_complete = allocated == 0 or receipt is not None
+        native_compute_closes_prefix = (
+            native_num_computed_tokens is not None
+            and int(native_num_computed_tokens) >= intent.requested_prefix_tokens
+        )
+        recompute_confirmed = bool(
+            completed
+            and native_receipt_complete
+            and native_compute_closes_prefix
+            and load_shortfall == 0
+        )
+        if not completed:
+            terminal_reason = "native_request_cancelled_or_failed"
+        elif allocated > 0 and receipt is None:
+            terminal_reason = "native_load_receipt_missing"
+        elif load_shortfall > 0:
+            terminal_reason = "native_load_shortfall_unsafe"
+        elif not native_compute_closes_prefix:
+            terminal_reason = "native_recompute_evidence_missing"
+        elif allocated == 0:
+            terminal_reason = "scheduler_declined_recompute"
+        elif unallocated_recompute > 0:
+            terminal_reason = "native_partial_prefix_load_recompute"
+        else:
+            terminal_reason = "native_load_completed"
+        accounting = RequestKVAccounting(
+            request_id=request_id,
+            physical_object_id=physical.physical_object_id,
+            binding_generation=physical.binding_generation,
+            native_key=physical.native_key,
+            compatibility_identity=physical.compatibility_key.identity,
+            prefix_hash=physical.compatibility_key.prefix_hash,
+            requested_prefix_tokens=intent.requested_prefix_tokens,
+            locally_cached_tokens=lookup.locally_cached_tokens,
+            lookup_hit_tokens=lookup.lookup_hit_tokens,
+            allocated_external_tokens=allocated,
+            actual_loaded_tokens=loaded,
+            missing_tokens=missing,
+            unallocated_recompute_tokens=unallocated_recompute,
+            load_shortfall_tokens=load_shortfall,
+            scheduled_prefill_tokens=self._scheduled_prefill_tokens.get(request_id, 0),
+            recomputed_tokens=unallocated_recompute if recompute_confirmed else 0,
+            recompute_confirmed=recompute_confirmed,
+            finish_status=finish_status,
+            terminal_reason=terminal_reason,
+        )
+        self._final_accounting[request_id] = accounting
+        return accounting
+
+    def final_accounting_for(self, request_id: str) -> RequestKVAccounting | None:
+        return self._final_accounting.get(request_id)
 
     def receipt_for(self, request_id: str) -> NativeKVLoadReceipt | None:
         return self._receipts.get(request_id)

@@ -75,6 +75,7 @@ def install_from_environment(
     *,
     installer: Callable[..., Any] | None = None,
     vendor_engine_child: bool = False,
+    start_runtime_host: bool = True,
 ) -> bool:
     global _HOST, _INSTALLED, _KV_CORE_CALLBACKS
     vendor_patch = os.environ.get("ASTRAKV_KV_CORE_VENDOR_PATCH", "false") == "true"
@@ -105,6 +106,17 @@ def install_from_environment(
     if run_id and os.environ.get("ASTRAKV_RUNTIME_CONTROL_PROCESS_SCOPE", "") == "engine_child":
         if not vendor_engine_child and not _is_vllm_engine_child():
             return False
+    if vendor_patch and run_id and not start_runtime_host:
+        # A vLLM worker owns the LMCache storage engine but not the scheduler
+        # control-plane port.  It still needs process-local callback state for
+        # native load receipts, while the EngineCore scheduler remains the
+        # sole RuntimeControlHost owner.
+        _KV_CORE_CALLBACKS = KVCoreConnectorCallbacks(
+            mode=mode, capability=_environment_capability(),
+        )
+        _INSTALLED = True
+        print("AstraKV KV-Core worker callbacks installed", flush=True)
+        return True
     if run_id:
         try:
             secret = bytes.fromhex(os.environ["ASTRAKV_RUNTIME_CONTROL_SECRET_HEX"])
@@ -144,7 +156,7 @@ def install_from_environment(
             raise RuntimeError("invalid ASTRAKV_RUNTIME_CONTROL_* configuration") from exc
         try:
             host.start()
-            if vendor_patch and mode in {RuntimeMode.ACTIVE, RuntimeMode.SHADOW}:
+            if vendor_patch:
                 # The vendor patch consumes these callbacks.  Do not install the
                 # legacy monkey patch, which can issue lifecycle-external I/O.
                 _KV_CORE_CALLBACKS = KVCoreConnectorCallbacks(mode=mode, capability=_environment_capability())
@@ -159,7 +171,7 @@ def install_from_environment(
     _INSTALLED = True
     print(
         "AstraKV KV-Core vendor callbacks installed"
-        if vendor_patch and mode in {RuntimeMode.ACTIVE, RuntimeMode.SHADOW}
+        if vendor_patch
         else "AstraKV LMCache 0.4.7 legacy hooks installed",
         flush=True,
     )

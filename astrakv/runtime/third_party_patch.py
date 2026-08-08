@@ -10,15 +10,18 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-PATCH_SCHEMA = "astrakv-kv-core-connector-patch-v1"
-PATCH_ID = "astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7"
+PATCH_SCHEMA = "astrakv-kv-core-connector-patch-v2"
+PATCH_ID = "astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7-v2"
 SUPPORTED_VLLM = "0.23.0"
 SUPPORTED_LMCACHE = "0.4.7"
 REQUIRED_CALLBACKS = (
     "scheduler_exact_lookup",
     "scheduler_external_admission",
     "connector_metadata",
+    "native_load_start",
     "native_load_completion",
+    "scheduler_compute_progress",
+    "request_finished",
 )
 
 

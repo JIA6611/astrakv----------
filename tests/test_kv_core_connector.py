@@ -33,13 +33,25 @@ class KVCoreConnectorCallbackTests(unittest.TestCase):
             request_id="request", physical=self.physical, actual_loaded_tokens=32, bytes_loaded=128,
             load_latency_ns=100, native_request_id="native-request", status="completed",
         )
-        self.assertEqual(receipt.recomputed_tokens, 32)
+        self.assertEqual(receipt.missing_tokens, 32)
+        self.assertEqual(receipt.unallocated_recompute_tokens, 16)
+        self.assertEqual(receipt.load_shortfall_tokens, 16)
+
+        accounting = callbacks.finalize_request(
+            request_id="request", physical=self.physical,
+            finish_status="FINISHED_STOPPED", completed=True,
+            native_num_computed_tokens=64,
+        )
+        self.assertFalse(accounting.recompute_confirmed)
+        self.assertEqual(accounting.recomputed_tokens, 0)
+        self.assertEqual(accounting.terminal_reason, "native_load_shortfall_unsafe")
 
     def test_cpu_prefetch_never_implies_gpu_load(self) -> None:
         callbacks = KVCoreConnectorCallbacks(mode=RuntimeMode.ACTIVE, capability=self.capability)
         ticket = PrefetchTicket(
             "ticket", "physical", 1, self.key.prefix_hash, "ssd", "cpu", 128,
             deadline_ns=2_000_000_000, expires_at_ns=3_000_000_000,
+            native_key=self.physical.native_key, compatibility_identity=self.key.identity,
         )
         self.assertIsNone(callbacks.begin_cpu_prefetch(ticket, self.physical, now_ns=1_000_000_000))
         callbacks.complete_cpu_prefetch("ticket", completed_bytes=128, now_ns=1_100_000_000)
@@ -61,6 +73,7 @@ class KVCoreConnectorCallbackTests(unittest.TestCase):
         ticket = PrefetchTicket(
             "ticket", "physical", 1, self.key.prefix_hash, "ssd", "cpu", 128,
             deadline_ns=2_000_000_000, expires_at_ns=3_000_000_000,
+            native_key=self.physical.native_key, compatibility_identity=self.key.identity,
         )
         self.assertEqual(callbacks.begin_cpu_prefetch(ticket, self.physical, now_ns=1_000_000_000), "kv_core_not_active")
 

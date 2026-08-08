@@ -75,6 +75,15 @@ def exact_token_prefix_hash(token_ids: Iterable[int]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def normalize_kv_dtype(value: Any) -> str:
+    """Normalize torch/vLLM dtype spellings used in compatibility records."""
+    text = str(value or "").strip().lower()
+    if text.startswith("torch."):
+        text = text[6:]
+    aliases = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}
+    return aliases.get(text, text)
+
+
 @dataclass(frozen=True, slots=True)
 class KVCompatibilityKey:
     """All immutable inputs that make an exact KV prefix reusable."""
@@ -91,13 +100,16 @@ class KVCompatibilityKey:
     chunk_size_tokens: int
     layer_group: str
     prefix_hash: str
-    engine_id: str
-    worker_id: str
+    # Deprecated request-local fields.  They remain readable for old artifact
+    # consumers but are deliberately excluded from compatibility identity.
+    engine_id: str = ""
+    worker_id: str = ""
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "dtype", normalize_kv_dtype(self.dtype))
         for name in (
             "model_id", "model_revision", "tokenizer_revision", "chat_template_revision", "dtype",
-            "rope_config", "adapter_namespace", "kv_layout", "layer_group", "prefix_hash", "engine_id", "worker_id",
+            "rope_config", "adapter_namespace", "kv_layout", "layer_group", "prefix_hash",
         ):
             _required(getattr(self, name), name)
         if self.block_size_tokens <= 0 or self.chunk_size_tokens <= 0:
@@ -124,9 +136,33 @@ class KVCompatibilityKey:
             "chunk_size_tokens": self.chunk_size_tokens,
             "layer_group": self.layer_group,
             "prefix_hash": self.prefix_hash,
-            "engine_id": self.engine_id,
-            "worker_id": self.worker_id,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class RequestKVBinding:
+    """Request-local ownership for one immutable physical KV generation."""
+
+    request_id: str
+    physical_object_id: str
+    binding_generation: int
+    engine_id: str
+    worker_id: str
+    native_request_id: str
+    cancellation_token: str = ""
+
+    def __post_init__(self) -> None:
+        for name in (
+            "request_id", "physical_object_id", "engine_id", "worker_id",
+            "native_request_id",
+        ):
+            _required(getattr(self, name), name)
+        if self.binding_generation <= 0:
+            raise ValueError("binding_generation must be positive")
+
+    @property
+    def generation_key(self) -> tuple[str, int]:
+        return self.physical_object_id, self.binding_generation
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +275,8 @@ class PrefetchTicket:
     deadline_ns: int
     expires_at_ns: int
     target_request_id: str = ""
+    native_key: str = ""
+    compatibility_identity: str = ""
     status: PrefetchStatus = PrefetchStatus.SUBMITTED
     completed_bytes: int = 0
     consumer_request_id: str = ""
@@ -257,6 +295,8 @@ class PrefetchTicket:
             raise ValueError("ticket expiry must not precede its deadline")
         if self.target_tier != "cpu":
             raise ValueError("KV-Core prefetch tickets may only target the CPU tier")
+        _required(self.native_key, "native_key")
+        _required(self.compatibility_identity, "compatibility_identity")
 
     @property
     def generation_key(self) -> tuple[str, int]:
@@ -292,6 +332,24 @@ class PrefetchTicketStore:
             ticket = self._require_open(prefetch_id, now_ns=now_ns)
             return self._replace(ticket, PrefetchStatus.CANCELLED, failure_reason=_required(reason, "reason"))
 
+    def mark_wasted(self, prefetch_id: str, *, reason: str, now_ns: int | None = None) -> PrefetchTicket:
+        with self._lock:
+            ticket = self._require_open(prefetch_id, now_ns=now_ns, allow_completed=True)
+            return self._replace(
+                ticket,
+                PrefetchStatus.WASTED,
+                failure_reason=_required(reason, "reason"),
+            )
+
+    def mark_wasted(self, prefetch_id: str, *, reason: str, now_ns: int | None = None) -> PrefetchTicket:
+        with self._lock:
+            ticket = self._require_open(prefetch_id, now_ns=now_ns, allow_completed=True)
+            return self._replace(
+                ticket,
+                PrefetchStatus.WASTED,
+                failure_reason=_required(reason, "reason"),
+            )
+
     def consume(
         self,
         prefetch_id: str,
@@ -300,6 +358,8 @@ class PrefetchTicketStore:
         physical_object_id: str,
         binding_generation: int,
         prefix_hash: str,
+        native_key: str,
+        compatibility_identity: str,
         now_ns: int | None = None,
     ) -> PrefetchTicket:
         with self._lock:
@@ -308,6 +368,8 @@ class PrefetchTicketStore:
                 raise ValueError("prefetch ticket is not completed")
             if ticket.generation_key != (physical_object_id, binding_generation) or ticket.prefix_hash != prefix_hash:
                 raise ValueError("prefetch ticket does not match physical object generation")
+            if ticket.native_key != native_key or ticket.compatibility_identity != compatibility_identity:
+                raise ValueError("prefetch ticket compatibility identity mismatch")
             if ticket.target_request_id and ticket.target_request_id != request_id:
                 raise ValueError("prefetch ticket target request mismatch")
             return self._replace(ticket, PrefetchStatus.CONSUMED, consumer_request_id=_required(request_id, "request_id"))
@@ -325,6 +387,15 @@ class PrefetchTicketStore:
     def get(self, prefetch_id: str) -> PrefetchTicket | None:
         with self._lock:
             return self._tickets.get(prefetch_id)
+
+    def snapshot(self, *, statuses: Iterable[PrefetchStatus] | None = None) -> tuple[PrefetchTicket, ...]:
+        """Return an immutable ticket snapshot without exposing store internals."""
+        allowed = None if statuses is None else frozenset(statuses)
+        with self._lock:
+            return tuple(
+                ticket for ticket in self._tickets.values()
+                if allowed is None or ticket.status in allowed
+            )
 
     def _require_open(self, prefetch_id: str, *, now_ns: int | None, allow_completed: bool = False) -> PrefetchTicket:
         ticket = self._tickets.get(prefetch_id)
@@ -353,34 +424,158 @@ class NativeKVLoadReceipt:
     request_id: str
     physical_object_id: str
     binding_generation: int
+    native_key: str
+    compatibility_identity: str
+    prefix_hash: str
     requested_prefix_tokens: int
+    locally_cached_tokens: int
     lookup_hit_tokens: int
     allocated_external_tokens: int
     actual_loaded_tokens: int
-    recomputed_tokens: int
+    native_retrieved_tokens: int
+    missing_tokens: int
+    unallocated_recompute_tokens: int
+    load_shortfall_tokens: int
     bytes_loaded: int
     load_latency_ns: int
     status: str
     native_request_id: str
     prefetch_id: str = ""
 
+    @property
+    def generation_key(self) -> tuple[str, int]:
+        return self.physical_object_id, self.binding_generation
+
     def __post_init__(self) -> None:
-        for name in ("request_id", "physical_object_id", "status", "native_request_id"):
+        for name in (
+            "request_id", "physical_object_id", "native_key", "compatibility_identity",
+            "prefix_hash", "status", "native_request_id",
+        ):
             _required(getattr(self, name), name)
         if self.binding_generation <= 0:
             raise ValueError("binding_generation must be positive")
         for name in (
-            "requested_prefix_tokens", "lookup_hit_tokens", "allocated_external_tokens", "actual_loaded_tokens",
-            "recomputed_tokens", "bytes_loaded", "load_latency_ns",
+            "requested_prefix_tokens", "locally_cached_tokens", "lookup_hit_tokens", "allocated_external_tokens", "actual_loaded_tokens",
+            "missing_tokens", "unallocated_recompute_tokens", "load_shortfall_tokens",
+            "native_retrieved_tokens", "bytes_loaded", "load_latency_ns",
         ):
             _non_negative(getattr(self, name), name)
         if not self.lookup_hit_tokens >= self.allocated_external_tokens >= self.actual_loaded_tokens:
             raise ValueError("lookup_hit_tokens >= allocated_external_tokens >= actual_loaded_tokens is required")
-        expected_recompute = max(0, self.requested_prefix_tokens - self.actual_loaded_tokens)
-        if self.recomputed_tokens != expected_recompute:
-            raise ValueError("recomputed_tokens must cover every requested token not actually loaded")
+        if self.locally_cached_tokens + self.actual_loaded_tokens > self.requested_prefix_tokens:
+            raise ValueError("local and external KV tokens exceed requested prefix")
+        expected_missing = max(
+            0,
+            self.requested_prefix_tokens - self.locally_cached_tokens - self.actual_loaded_tokens,
+        )
+        if self.missing_tokens != expected_missing:
+            raise ValueError("missing_tokens must cover every requested token not actually loaded")
+        if self.unallocated_recompute_tokens != max(
+            0,
+            self.requested_prefix_tokens
+            - self.locally_cached_tokens
+            - self.allocated_external_tokens,
+        ):
+            raise ValueError("unallocated_recompute_tokens must cover the scheduler-declined suffix")
+        if self.load_shortfall_tokens != self.allocated_external_tokens - self.actual_loaded_tokens:
+            raise ValueError("load_shortfall_tokens must cover scheduler-credited KV not retrieved")
+        if self.missing_tokens != self.unallocated_recompute_tokens + self.load_shortfall_tokens:
+            raise ValueError("missing token classes must close exactly")
         if self.actual_loaded_tokens == 0 and self.bytes_loaded != 0:
             raise ValueError("bytes_loaded requires actual_loaded_tokens")
+        if self.native_retrieved_tokens < self.actual_loaded_tokens:
+            raise ValueError("native_retrieved_tokens cannot be less than actual_loaded_tokens")
+
+
+@dataclass(frozen=True, slots=True)
+class RequestKVAccounting:
+    """Terminal request evidence closed only by the native request lifecycle."""
+
+    request_id: str
+    physical_object_id: str
+    binding_generation: int
+    native_key: str
+    compatibility_identity: str
+    prefix_hash: str
+    requested_prefix_tokens: int
+    locally_cached_tokens: int
+    lookup_hit_tokens: int
+    allocated_external_tokens: int
+    actual_loaded_tokens: int
+    missing_tokens: int
+    unallocated_recompute_tokens: int
+    load_shortfall_tokens: int
+    scheduled_prefill_tokens: int
+    recomputed_tokens: int
+    recompute_confirmed: bool
+    finish_status: str
+    terminal_reason: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "request_id", "physical_object_id", "native_key", "compatibility_identity",
+            "prefix_hash", "finish_status", "terminal_reason",
+        ):
+            _required(getattr(self, name), name)
+        if self.binding_generation <= 0:
+            raise ValueError("binding_generation must be positive")
+        for name in (
+            "requested_prefix_tokens", "locally_cached_tokens", "lookup_hit_tokens", "allocated_external_tokens",
+            "actual_loaded_tokens", "missing_tokens", "unallocated_recompute_tokens",
+            "load_shortfall_tokens", "scheduled_prefill_tokens",
+            "recomputed_tokens",
+        ):
+            _non_negative(getattr(self, name), name)
+        if not self.lookup_hit_tokens >= self.allocated_external_tokens >= self.actual_loaded_tokens:
+            raise ValueError("lookup_hit_tokens >= allocated_external_tokens >= actual_loaded_tokens is required")
+        if self.locally_cached_tokens + self.actual_loaded_tokens > self.requested_prefix_tokens:
+            raise ValueError("local and external KV tokens exceed requested prefix")
+        if self.missing_tokens != max(
+            0,
+            self.requested_prefix_tokens - self.locally_cached_tokens - self.actual_loaded_tokens,
+        ):
+            raise ValueError("missing_tokens does not close the requested prefix")
+        if self.unallocated_recompute_tokens != max(
+            0,
+            self.requested_prefix_tokens
+            - self.locally_cached_tokens
+            - self.allocated_external_tokens,
+        ):
+            raise ValueError("unallocated recompute suffix does not close")
+        if self.load_shortfall_tokens != self.allocated_external_tokens - self.actual_loaded_tokens:
+            raise ValueError("load shortfall does not close")
+        if self.missing_tokens != self.unallocated_recompute_tokens + self.load_shortfall_tokens:
+            raise ValueError("missing token classes must close exactly")
+        if self.recompute_confirmed and self.load_shortfall_tokens:
+            raise ValueError("native load shortfall cannot be reported as recomputed")
+        if self.recompute_confirmed and self.recomputed_tokens != self.unallocated_recompute_tokens:
+            raise ValueError("confirmed recompute must cover the scheduler-declined suffix")
+        if not self.recompute_confirmed and self.recomputed_tokens != 0:
+            raise ValueError("unconfirmed recompute cannot report recomputed tokens")
+
+
+class NativeKVObjectRegistry:
+    """Process-owned generation authority for native LMCache objects."""
+
+    def __init__(self) -> None:
+        self._generations: dict[str, int] = {}
+        self._lock = threading.RLock()
+
+    def generation(self, physical_object_id: str) -> int:
+        object_id = _required(physical_object_id, "physical_object_id")
+        with self._lock:
+            return self._generations.setdefault(object_id, 1)
+
+    def invalidate(self, physical_object_id: str) -> int:
+        object_id = _required(physical_object_id, "physical_object_id")
+        with self._lock:
+            generation = self._generations.get(object_id, 1) + 1
+            self._generations[object_id] = generation
+            return generation
+
+    def is_current(self, physical_object_id: str, binding_generation: int) -> bool:
+        with self._lock:
+            return self._generations.get(physical_object_id, 1) == binding_generation
 
 
 @dataclass(frozen=True, slots=True)
@@ -412,7 +607,9 @@ def choose_load_vs_recompute(
     if capability.memory_pressure >= 0.90:
         return LoadVsRecomputeDecision("recompute", 0.0, 0.0, "uma_memory_pressure")
     load_cost = max(0.0, queue_delay_ms) + max(0.0, tier_read_ms) + max(0.0, transfer_ms) + max(0.0, materialization_ms) + max(0.0, contention_ms)
-    recompute_cost = max(0.0, prefill_ms_per_token) * intent.requested_prefix_tokens + max(0.0, contention_ms)
+    # Only the candidate external prefix differs between the two actions; the
+    # suffix is recomputed in both cases and must not bias admission toward I/O.
+    recompute_cost = max(0.0, prefill_ms_per_token) * intent.max_external_tokens + max(0.0, contention_ms)
     deadline_ms = (intent.deadline_ns - current) / 1_000_000.0
     if load_cost > deadline_ms:
         return LoadVsRecomputeDecision("recompute", load_cost, recompute_cost, "load_deadline_miss")
@@ -423,6 +620,8 @@ def choose_load_vs_recompute(
 
 __all__ = [
     "KV_CORE_SCHEMA", "KVCompatibilityKey", "LoadVsRecomputeDecision", "NativeKVLoadReceipt",
-    "PhysicalKVObject", "PrefetchStatus", "PrefetchTicket", "PrefetchTicketStore", "RequestKVIntent",
+    "NativeKVObjectRegistry", "PhysicalKVObject", "PrefetchStatus", "PrefetchTicket",
+    "PrefetchTicketStore", "RequestKVAccounting", "RequestKVBinding", "RequestKVIntent",
     "RuntimeMode", "TierCapabilitySnapshot", "TierTopology", "choose_load_vs_recompute", "exact_token_prefix_hash",
+    "normalize_kv_dtype",
 ]

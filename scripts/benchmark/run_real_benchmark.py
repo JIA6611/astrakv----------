@@ -28,6 +28,7 @@ from pathlib import Path
 from collections.abc import Iterator
 from typing import Any
 from uuid import UUID, uuid4, uuid5
+from functools import lru_cache
 
 try:
     import yaml  # type: ignore
@@ -239,6 +240,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random-seed", default=None)
     parser.add_argument("--cache-state", choices=("cold", "warm", "unknown"), default=None)
     parser.add_argument("--connector-version", default=None)
+    parser.add_argument("--tokenizer-path", default=None)
+    parser.add_argument("--chat-template-revision", default=None)
     parser.add_argument("--pair-id", default=None, help="Required identity shared by a baseline/variant pair.")
     parser.add_argument("--pair-role", choices=("baseline", "variant"), default=None)
     parser.add_argument("--claim-scope", choices=("benchmark", "online_control", "kv_core"), default=None)
@@ -376,6 +379,8 @@ def resolve_args(raw: argparse.Namespace, config: dict[str, Any]) -> argparse.Na
         random_seed=str(raw.random_seed or config.get("random_seed") or "unknown"),
         cache_state=str(raw.cache_state or config.get("cache_state") or "unknown"),
         connector_version=str(raw.connector_version or config.get("connector_version") or "unknown"),
+        tokenizer_path=str(raw.tokenizer_path or config.get("tokenizer_path") or os.environ.get("ASTRAKV_MODEL", model)),
+        chat_template_revision=str(raw.chat_template_revision or config.get("chat_template_revision") or os.environ.get("ASTRAKV_CHAT_TEMPLATE_REVISION", "qwen3-default")),
         pair_id=str(raw.pair_id or config.get("pair_id") or ""),
         pair_role=str(raw.pair_role or config.get("pair_role") or ""),
         claim_scope=str(raw.claim_scope or config.get("claim_scope") or "benchmark"),
@@ -503,6 +508,9 @@ def run_one_request(
     request_context_client: RequestContextClient | None = None,
     request_context_artifact: RequestContextArtifact | None = None,
     request_context_reserved: bool = False,
+    tokenizer_path: str = "",
+    tokenizer_revision: str = "",
+    chat_template_revision: str = "qwen3-default",
 ) -> RequestResult:
     request_metadata = request_metadata or {}
     cpu_before = cpu_rss_mb()
@@ -528,6 +536,29 @@ def run_one_request(
     request_context_error = ""
     run_id = str(request_metadata.get("run_id") or "")
     task_metadata = request_metadata.get("metadata") if isinstance(request_metadata.get("metadata"), dict) else {}
+    supplied_messages = task_metadata.get("messages")
+    messages = supplied_messages if isinstance(supplied_messages, list) and supplied_messages else [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt or build_prompt(context_length, request_id, prompt_seed, prompt_token_scale)},
+    ]
+    exact_ids = task_metadata.get("exact_token_ids") or request_metadata.get("exact_token_ids")
+    if exact_ids is None:
+        if backend == "vllm-lmcache-kv-core" and (
+            request_context_client is not None or request_context_artifact is not None
+        ):
+            try:
+                exact_ids = tokenize_chat_messages(
+                    messages, tokenizer_path=tokenizer_path or os.environ.get("ASTRAKV_MODEL", model),
+                    tokenizer_revision=tokenizer_revision,
+                )
+            except RuntimeError:
+                if os.environ.get("ASTRAKV_REQUIRE_EXACT_TOKEN_IDS", "false").lower() == "true":
+                    raise
+                exact_ids = ()
+        else:
+            exact_ids = ()
+    else:
+        exact_ids = normalize_exact_token_ids(exact_ids)
     if not request_context_reserved:
         _reserve_request_contexts(run_id, (str(request_id),), (nonce,))
     if request_context_client is not None or request_context_artifact is not None:
@@ -556,6 +587,9 @@ def run_one_request(
                         or request_metadata.get("workflow_id")
                         or request_id
                     ),
+                    "exact_token_ids": list(exact_ids),
+                    "tokenizer_revision": tokenizer_revision,
+                    "chat_template_revision": chat_template_revision,
                 },
             )
             if request_context_artifact is not None:
@@ -572,11 +606,6 @@ def run_one_request(
     request_scope = metrics_collector.request_scope(request_id) if metrics_collector is not None else nullcontext()
     with request_scope:
         try:
-            supplied_messages = task_metadata.get("messages")
-            messages = supplied_messages if isinstance(supplied_messages, list) and supplied_messages else [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt or build_prompt(context_length, request_id, prompt_seed, prompt_token_scale)},
-            ]
             payload = {
                 "model": model,
                 "messages": messages,
@@ -772,6 +801,42 @@ def extract_choice_token_ids(choice: dict[str, Any]) -> list[int]:
     ]
 
 
+@lru_cache(maxsize=2)
+def _load_benchmark_tokenizer(tokenizer_path: str, tokenizer_revision: str) -> Any:
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError("transformers is required for exact KV-Core token identity") from exc
+    kwargs: dict[str, Any] = {"trust_remote_code": True}
+    if tokenizer_revision and not Path(tokenizer_path).is_dir():
+        kwargs["revision"] = tokenizer_revision
+    return AutoTokenizer.from_pretrained(tokenizer_path, **kwargs)
+
+
+def normalize_exact_token_ids(value: Any) -> tuple[int, ...]:
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError("exact_token_ids must be a non-empty integer sequence")
+    result: list[int] = []
+    for token_id in value:
+        if isinstance(token_id, bool) or not isinstance(token_id, int):
+            raise ValueError("exact_token_ids must contain only integers")
+        result.append(int(token_id))
+    return tuple(result)
+
+
+def tokenize_chat_messages(
+    messages: list[dict[str, Any]], *, tokenizer_path: str, tokenizer_revision: str,
+) -> tuple[int, ...]:
+    tokenizer = _load_benchmark_tokenizer(tokenizer_path, tokenizer_revision)
+    try:
+        token_ids = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True,
+        )
+    except AttributeError as exc:
+        raise RuntimeError("Qwen3 tokenizer must provide apply_chat_template") from exc
+    return normalize_exact_token_ids(token_ids)
+
+
 def finalize_request_status(
     *,
     observed_tokens: int,
@@ -852,6 +917,9 @@ def run_workload_rows(
             attribution_mode="exclusive_request",
             request_context_client=request_context_client,
             request_context_artifact=request_context_artifact,
+            tokenizer_path=args.tokenizer_path,
+            tokenizer_revision=args.tokenizer_revision,
+            chat_template_revision=args.chat_template_revision,
         )
         results.append(result)
         if collector is not None:
@@ -1494,6 +1562,10 @@ def write_effective_config(path: Path, args: argparse.Namespace, config: dict[st
         "disk_device": args.disk_device,
         "process_name_filters": list(args.process_name_filters),
         "workload_jsonl": args.workload_jsonl,
+        "model_revision": args.model_revision,
+        "tokenizer_revision": args.tokenizer_revision,
+        "tokenizer_path": getattr(args, "tokenizer_path", ""),
+        "chat_template_revision": getattr(args, "chat_template_revision", "qwen3-default"),
         "run_id": args.run_id,
         "request_context_url": args.request_context_url,
         "request_context_artifact": "request_context.jsonl",

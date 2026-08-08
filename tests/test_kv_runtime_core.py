@@ -68,6 +68,7 @@ class KVRuntimeCoreTests(unittest.TestCase):
         ticket = store.submit(PrefetchTicket(
             "prefetch-0", "physical-0", 2, self.key.prefix_hash, "ssd", "cpu", 128,
             deadline_ns=2_000_000_000, expires_at_ns=3_000_000_000, target_request_id="request-0",
+            native_key=self.object.native_key, compatibility_identity=self.key.identity,
         ))
         self.assertEqual(ticket.status, PrefetchStatus.SUBMITTED)
         store.complete("prefetch-0", completed_bytes=128, now_ns=1_000_000_000)
@@ -75,26 +76,36 @@ class KVRuntimeCoreTests(unittest.TestCase):
             store.consume(
                 "prefetch-0", request_id="request-0", physical_object_id="physical-0",
                 binding_generation=3, prefix_hash=self.key.prefix_hash, now_ns=1_100_000_000,
+                native_key=self.object.native_key, compatibility_identity=self.key.identity,
             )
         consumed = store.consume(
             "prefetch-0", request_id="request-0", physical_object_id="physical-0",
             binding_generation=2, prefix_hash=self.key.prefix_hash, now_ns=1_100_000_000,
+            native_key=self.object.native_key, compatibility_identity=self.key.identity,
         )
         self.assertEqual(consumed.status, PrefetchStatus.CONSUMED)
 
     def test_load_receipt_requires_recompute_for_every_unloaded_token(self) -> None:
         receipt = NativeKVLoadReceipt(
             request_id="request-0", physical_object_id="physical-0", binding_generation=2,
+            native_key=self.object.native_key, compatibility_identity=self.key.identity,
+            prefix_hash=self.key.prefix_hash,
             requested_prefix_tokens=64, lookup_hit_tokens=64, allocated_external_tokens=48,
-            actual_loaded_tokens=32, recomputed_tokens=32, bytes_loaded=128, load_latency_ns=100,
+            locally_cached_tokens=0, actual_loaded_tokens=32, native_retrieved_tokens=32,
+            missing_tokens=32, unallocated_recompute_tokens=16,
+            load_shortfall_tokens=16, bytes_loaded=128, load_latency_ns=100,
             status="completed", native_request_id="native-request-0",
         )
         self.assertEqual(receipt.actual_loaded_tokens, 32)
-        with self.assertRaisesRegex(ValueError, "recomputed_tokens"):
+        with self.assertRaisesRegex(ValueError, "missing_tokens"):
             NativeKVLoadReceipt(
                 request_id="request-0", physical_object_id="physical-0", binding_generation=2,
+                native_key=self.object.native_key, compatibility_identity=self.key.identity,
+                prefix_hash=self.key.prefix_hash,
                 requested_prefix_tokens=64, lookup_hit_tokens=64, allocated_external_tokens=48,
-                actual_loaded_tokens=32, recomputed_tokens=31, bytes_loaded=128, load_latency_ns=100,
+                locally_cached_tokens=0, actual_loaded_tokens=32, native_retrieved_tokens=32,
+                missing_tokens=31, unallocated_recompute_tokens=16,
+                load_shortfall_tokens=16, bytes_loaded=128, load_latency_ns=100,
                 status="completed", native_request_id="native-request-0",
             )
 

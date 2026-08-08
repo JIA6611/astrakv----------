@@ -130,6 +130,7 @@ class RuntimeControlHost:
         self.action_server: UnixDomainSocketActionServer | None = None
         self.execution_gate: RuntimeExecutionGate | None = None
         self._runtime_identities: dict[str, RuntimeRequestIdentity] = {}
+        self._kv_runtime_bridge: Any | None = None
         self._identity_lock = threading.RLock()
         self._http_server: ThreadingHTTPServer | None = None
         self._http_thread: threading.Thread | None = None
@@ -182,6 +183,9 @@ class RuntimeControlHost:
                             context.request_id,
                             RuntimeRequestIdentity(context.run_id, context.request_id, context.request_nonce),
                         )
+                        bridge = host._kv_runtime_bridge
+                        if bridge is not None:
+                            bridge.ingress_request(context)
                     else:
                         service = host.action_service
                         if service is None:
@@ -358,6 +362,15 @@ class RuntimeControlHost:
                 )
             ]
             return matches[0] if len(matches) == 1 else None
+
+    def register_kv_runtime_bridge(self, bridge: Any) -> None:
+        """Attach the process-local vendor bridge to authenticated ingress."""
+        if bridge is None:
+            raise ValueError("KV runtime bridge is required")
+        with self._identity_lock:
+            if self._kv_runtime_bridge is not None and self._kv_runtime_bridge is not bridge:
+                raise RuntimeError("KV runtime bridge is already registered")
+            self._kv_runtime_bridge = bridge
 
     def install_hooks(self, installer: Callable[..., LMCache047ActionEndpoint]) -> LMCache047ActionEndpoint:
         if self.context_consumer is None:

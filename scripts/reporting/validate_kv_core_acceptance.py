@@ -22,10 +22,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from astrakv.benchmarks.paired_run import PairedRunInput, validate_paired_runs
+from astrakv.runtime.third_party_patch import PATCH_ID, REQUIRED_CALLBACKS
 
 
-SCHEMA = "astrakv-kv-core-acceptance-v1"
+SCHEMA = "astrakv-kv-core-acceptance-v2"
 PHASES = {"E1", "E2", "E3", "E4"}
+PREFETCH_BENEFIT_WORKLOADS = {"repeated_long_prefix", "queued_concurrency"}
+PARTIAL_LOAD_WORKLOADS = {"repeated_long_prefix", "constrained_kv_churn"}
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -122,19 +125,51 @@ def validate_request_accounting(rows: list[dict[str, Any]], expected_request_ids
             allocated = int(row["allocated_external_tokens"])
             loaded = int(row["actual_loaded_tokens"])
             requested = int(row["requested_prefix_tokens"])
+            local = int(row["locally_cached_tokens"])
+            missing = int(row["missing_tokens"])
+            unallocated = int(row["unallocated_recompute_tokens"])
+            shortfall = int(row["load_shortfall_tokens"])
             recomputed = int(row["recomputed_tokens"])
             generation = int(row["binding_generation"])
         except (KeyError, TypeError, ValueError):
             errors.append(f"invalid_request_accounting:{request_id}")
             continue
-        if not (lookup >= allocated >= loaded >= 0) or recomputed != max(0, requested - loaded) or generation <= 0:
+        identity = tuple(str(row.get(field) or "") for field in (
+            "physical_object_id", "native_key", "compatibility_identity", "prefix_hash",
+        ))
+        expected_missing = max(0, requested - local - loaded)
+        expected_unallocated = max(0, requested - local - allocated)
+        expected_shortfall = allocated - loaded
+        if (
+            not (lookup >= allocated >= loaded >= 0)
+            or missing != expected_missing
+            or unallocated != expected_unallocated
+            or shortfall != expected_shortfall
+            or missing != unallocated + shortfall
+            or generation <= 0
+            or not all(identity)
+        ):
             errors.append(f"accounting_invariant_failed:{request_id}")
+        confirmed = row.get("recompute_confirmed") is True
+        if confirmed and (shortfall != 0 or recomputed != unallocated):
+            errors.append(f"accounting_recompute_closure_failed:{request_id}")
+        if not confirmed and recomputed != 0:
+            errors.append(f"accounting_unconfirmed_recompute:{request_id}")
+        finish_status = str(row.get("finish_status") or "").upper()
+        cancelled_or_failed = "ABORT" in finish_status or "ERROR" in finish_status
+        if not cancelled_or_failed and unallocated > 0 and not confirmed:
+            errors.append(f"accounting_recompute_not_confirmed:{request_id}")
+        if shortfall > 0:
+            errors.append(f"accounting_native_load_shortfall:{request_id}")
         if row.get("terminal") is not True:
             errors.append(f"accounting_not_terminal:{request_id}")
         reason = str(row.get("terminal_reason") or "")
-        if allocated == 0 and reason != "scheduler_declined_recompute":
+        if allocated == 0 and reason not in {"scheduler_declined_recompute", "native_recompute_evidence_missing"}:
             errors.append(f"accounting_invalid_recompute_reason:{request_id}")
-        if allocated > 0 and reason != "native_load_completed":
+        if allocated > 0 and reason not in {
+            "native_load_completed", "native_partial_prefix_load_recompute",
+            "native_load_shortfall_unsafe",
+        }:
             errors.append(f"accounting_missing_native_completion:{request_id}")
     return list(latest.values())
 
@@ -142,8 +177,9 @@ def validate_request_accounting(rows: list[dict[str, Any]], expected_request_ids
 def validate_receipts(rows: list[dict[str, Any]], accounting: list[dict[str, Any]], errors: list[str]) -> None:
     expected_loaded = {
         str(row.get("request_id")) for row in accounting
-        if int(row.get("actual_loaded_tokens") or 0) > 0
+        if int(row.get("allocated_external_tokens") or 0) > 0
     }
+    accounting_by_request = {str(row.get("request_id")): row for row in accounting}
     seen: set[str] = set()
     for row in rows:
         request_id = str(row.get("request_id") or "")
@@ -156,41 +192,69 @@ def validate_receipts(rows: list[dict[str, Any]], accounting: list[dict[str, Any
             allocated = int(row["allocated_external_tokens"])
             loaded = int(row["actual_loaded_tokens"])
             requested = int(row["requested_prefix_tokens"])
-            recomputed = int(row["recomputed_tokens"])
+            local = int(row["locally_cached_tokens"])
+            missing = int(row["missing_tokens"])
+            unallocated = int(row["unallocated_recompute_tokens"])
+            shortfall = int(row["load_shortfall_tokens"])
             generation = int(row["binding_generation"])
         except (KeyError, TypeError, ValueError):
             errors.append(f"invalid_native_receipt:{request_id}")
             continue
-        if not (lookup >= allocated >= loaded >= 0) or recomputed != max(0, requested - loaded) or generation <= 0:
+        if (
+            not (lookup >= allocated >= loaded >= 0)
+            or missing != max(0, requested - local - loaded)
+            or unallocated != max(0, requested - local - allocated)
+            or shortfall != allocated - loaded
+            or missing != unallocated + shortfall
+            or generation <= 0
+        ):
             errors.append(f"receipt_invariant_failed:{request_id}")
+        if shortfall > 0:
+            errors.append(f"receipt_native_load_shortfall:{request_id}")
+        accounting_row = accounting_by_request.get(request_id)
+        if accounting_row is None:
+            errors.append(f"receipt_without_accounting:{request_id}")
+            continue
+        for field in (
+            "physical_object_id", "binding_generation", "native_key",
+            "compatibility_identity", "prefix_hash", "allocated_external_tokens",
+        ):
+            if row.get(field) != accounting_row.get(field):
+                errors.append(f"receipt_identity_mismatch:{field}:{request_id}")
     if not expected_loaded.issubset(seen):
         errors.append("receipt_request_coverage_mismatch")
 
 
-def uma_peak(rows: list[dict[str, Any]]) -> int | None:
-    values: list[int] = []
-    for row in rows:
-        for field in ("cgroup_memory_current_bytes", "process_rss_bytes"):
+def resource_peaks(rows: list[dict[str, Any]]) -> dict[str, int | None]:
+    result: dict[str, int | None] = {}
+    for field in ("cgroup_memory_current_bytes", "process_rss_bytes", "lmcache_cpu_occupancy_bytes", "lmcache_ssd_occupancy_bytes"):
+        values: list[int] = []
+        for row in rows:
             try:
                 values.append(int(row[field]))
             except (KeyError, TypeError, ValueError):
                 pass
-    return max(values) if values else None
+        result[field] = max(values) if values else None
+    return result
 
 
 def aggregate_throughput(rows: list[dict[str, Any]]) -> float | None:
     total_tokens = 0.0
-    total_seconds = 0.0
+    starts: list[float] = []
+    ends: list[float] = []
     for row in rows:
         try:
             tokens = float(row["output_tokens_observed"])
-            latency_ms = float(row["latency_ms"])
+            started = float(row["request_started_s"])
+            ended = float(row["request_ended_s"])
         except (KeyError, TypeError, ValueError):
             continue
-        if tokens >= 0 and latency_ms > 0:
+        if tokens >= 0 and ended > started > 0:
             total_tokens += tokens
-            total_seconds += latency_ms / 1000.0
-    return total_tokens / total_seconds if total_seconds else None
+            starts.append(started)
+            ends.append(ended)
+    makespan = max(ends) - min(starts) if starts and ends else 0.0
+    return total_tokens / makespan if makespan > 0 else None
 
 
 def kv_block_budget(run: Path) -> int | None:
@@ -210,13 +274,91 @@ def runtime_metadata(run: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def experiment_workload_id(run: Path) -> str:
+    try:
+        payload = json.loads((run / "experiment_manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    return str(payload.get("workload_id") or "") if isinstance(payload, dict) else ""
+
+
+def validate_capacity_sweep(path: Path, phase: str) -> tuple[bool, list[str], dict[str, Any]]:
+    errors: list[str] = []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False, ["capacity_sweep_manifest_unreadable"], {}
+    if payload.get("schema") != "astrakv-kv-core-capacity-sweep-v1":
+        errors.append("capacity_sweep_schema_mismatch")
+    if payload.get("phase") != phase:
+        errors.append("capacity_sweep_phase_mismatch")
+    if payload.get("eligible") is not True:
+        errors.append("capacity_sweep_not_eligible")
+    try:
+        baseline = int(payload["accepted_vllm_kv_block_budget"]["baseline"])
+        variant = int(payload["accepted_vllm_kv_block_budget"]["variant"])
+    except (KeyError, TypeError, ValueError):
+        errors.append("capacity_sweep_block_budget_missing")
+    else:
+        if baseline <= 0 or variant <= 0 or variant > baseline * 0.90:
+            errors.append("kv_capacity_saving_not_proven")
+    controls = payload.get("controls")
+    required_controls = {
+        "model", "dtype", "workload_sha256", "request_order", "seed",
+        "sampling", "output_length", "cache_state", "slo",
+    }
+    if not isinstance(controls, dict) or not required_controls.issubset(controls):
+        errors.append("capacity_sweep_controls_incomplete")
+    return not errors, errors, payload
+
+
+def validate_current_callback_smoke(
+    run: Path,
+    errors: list[str],
+    *,
+    require_native_load: bool,
+) -> None:
+    try:
+        payload = json.loads((run / "callback-smoke.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        errors.append("callback_smoke_missing_for_current_run")
+        return
+    if payload.get("patch_id") != PATCH_ID or tuple(payload.get("callbacks") or ()) != REQUIRED_CALLBACKS:
+        errors.append("callback_smoke_patch_identity_mismatch")
+    required_for_request = {
+        "scheduler_exact_lookup", "scheduler_external_admission",
+        "connector_metadata", "scheduler_compute_progress", "request_finished",
+    }
+    if require_native_load:
+        required_for_request.update({"native_load_start", "native_load_completion"})
+    if not required_for_request.issubset(set(payload.get("observed_callbacks") or ())):
+        errors.append("callback_smoke_incomplete_for_current_run")
+
+
 def validate_prefetch(rows: list[dict[str, Any]], errors: list[str]) -> None:
     consumed = 0
+    completed_by_id: dict[str, dict[str, Any]] = {}
     for row in rows:
         if str(row.get("source_tier")) != "ssd" or str(row.get("target_tier")) != "cpu":
             continue
-        if row.get("status") == "consumed" and int(row.get("completed_bytes") or 0) > 0:
-            consumed += 1
+        prefetch_id = str(row.get("prefetch_id") or "")
+        if not prefetch_id:
+            errors.append("e3_prefetch_identity_missing")
+            continue
+        completed_by_id[prefetch_id] = row
+    for prefetch_id, row in completed_by_id.items():
+        if row.get("status") != "consumed" or int(row.get("completed_bytes") or 0) <= 0:
+            continue
+        target = str(row.get("target_request_id") or "")
+        consumer = str(row.get("consumer_request_id") or "")
+        identity = tuple(str(row.get(field) or "") for field in (
+            "physical_object_id", "binding_generation", "prefix_hash",
+            "native_key", "compatibility_identity",
+        ))
+        if not target or consumer != target or not all(identity):
+            errors.append(f"e3_prefetch_consumer_identity_failed:{prefetch_id}")
+            continue
+        consumed += 1
     if not consumed:
         errors.append("e3_prefetch_consumption_evidence_missing")
 
@@ -231,12 +373,26 @@ def main() -> int:
     parser.add_argument("--variant", required=True)
     parser.add_argument("--phase", required=True, choices=sorted(PHASES))
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--capacity-sweep-manifest",
+        help="Optional independent fixed-SLO KV block capacity sweep for E2/E4.",
+    )
     args = parser.parse_args()
     baseline_path, variant_path = Path(args.baseline), Path(args.variant)
     paired = validate_paired_runs(PairedRunInput("baseline", baseline_path), PairedRunInput("variant", variant_path))
     errors = list(paired.errors)
     baseline_requests = load_run_artifact(baseline_path, "request_results.jsonl")
     variant_requests = load_run_artifact(variant_path, "request_results.jsonl")
+    workload_types = {
+        str(row.get("workload_type") or row.get("workload_id") or "")
+        for row in variant_requests
+    }
+    workload_types.discard("")
+    manifest_workload = experiment_workload_id(variant_path)
+    if manifest_workload:
+        workload_types.add(manifest_workload)
+    prefetch_benefit_eligible = bool(workload_types & PREFETCH_BENEFIT_WORKLOADS)
+    partial_benefit_eligible = bool(workload_types & PARTIAL_LOAD_WORKLOADS)
     validate_quality(baseline_requests, variant_requests, errors)
     request_ids = {str(row.get("request_id") or "") for row in variant_requests}
     if "" in request_ids:
@@ -245,11 +401,21 @@ def main() -> int:
     if args.phase != "E1":
         accounting = load_run_artifact(variant_path, "kv_core_request_accounting.jsonl")
         accounting = validate_request_accounting(accounting, request_ids, errors)
+        validate_current_callback_smoke(
+            variant_path,
+            errors,
+            require_native_load=any(
+                int(row.get("allocated_external_tokens") or 0) > 0
+                for row in accounting
+            ),
+        )
         receipts = load_run_artifact(variant_path, "kv_core_native_receipts.jsonl")
         validate_receipts(receipts, accounting, errors)
     baseline_uma = load_run_artifact(baseline_path, "uma_resource_samples.jsonl")
     variant_uma = load_run_artifact(variant_path, "uma_resource_samples.jsonl")
-    base_peak, variant_peak = uma_peak(baseline_uma), uma_peak(variant_uma)
+    baseline_resources, variant_resources = resource_peaks(baseline_uma), resource_peaks(variant_uma)
+    base_peak = baseline_resources["cgroup_memory_current_bytes"]
+    variant_peak = variant_resources["cgroup_memory_current_bytes"]
     if args.phase != "E1" and (base_peak is None or variant_peak is None):
         errors.append("uma_evidence_missing")
     elif args.phase != "E1" and variant_peak is not None and base_peak is not None and variant_peak > base_peak * 1.02:
@@ -257,7 +423,9 @@ def main() -> int:
     point, interval = paired_ttft_bootstrap(baseline_requests, variant_requests)
     if point is None:
         errors.append("ttft_evidence_missing")
-    if args.phase == "E3" and (point is None or point > -5.0 or interval[1] is None or interval[1] >= 0.0):
+    if args.phase == "E3" and prefetch_benefit_eligible and (
+        point is None or point > -5.0 or interval[1] is None or interval[1] >= 0.0
+    ):
         errors.append("e3_ttft_acceptance_failed")
     baseline_throughput = aggregate_throughput(baseline_requests)
     variant_throughput = aggregate_throughput(variant_requests)
@@ -273,17 +441,21 @@ def main() -> int:
             errors.append("no_reuse_ttft_regression")
     baseline_budget = kv_block_budget(baseline_path)
     variant_budget = kv_block_budget(variant_path)
-    if args.phase in {"E2", "E4"}:
-        if baseline_budget is None or variant_budget is None:
-            errors.append("kv_block_budget_evidence_missing")
-        elif variant_budget > baseline_budget * 0.90:
-            errors.append("kv_capacity_saving_not_proven")
+    capacity_record: dict[str, Any] = {}
+    capacity_status = "not_evaluated"
+    if args.capacity_sweep_manifest:
+        capacity_ok, capacity_errors, capacity_record = validate_capacity_sweep(
+            Path(args.capacity_sweep_manifest), args.phase,
+        )
+        errors.extend(capacity_errors)
+        capacity_status = "passed" if capacity_ok else "failed"
     if args.phase in {"E3", "E4"}:
         metadata = runtime_metadata(variant_path)
         if metadata.get("topology") != "gpu_cpu_ssd" or metadata.get("lmcache_local_cpu_enabled") is not True:
             errors.append("e3_local_cpu_topology_not_proven")
-        validate_prefetch(load_run_artifact(variant_path, "kv_core_prefetch_tickets.jsonl"), errors)
-    if args.phase == "E4":
+        if prefetch_benefit_eligible:
+            validate_prefetch(load_run_artifact(variant_path, "kv_core_prefetch_tickets.jsonl"), errors)
+    if args.phase == "E4" and partial_benefit_eligible:
         # Upper-bound partial load must retain receipt accounting, enforced above.
         partial_rows = [row for row in accounting if int(row.get("allocated_external_tokens") or 0) < int(row.get("lookup_hit_tokens") or 0)]
         if not partial_rows:
@@ -297,8 +469,12 @@ def main() -> int:
         "ttft_p95_delta_percent": point,
         "ttft_p95_bootstrap_ci_percent": list(interval),
         "uma_peak_bytes": {"baseline": base_peak, "variant": variant_peak},
+        "resource_peaks_bytes": {"baseline": baseline_resources, "variant": variant_resources},
         "throughput_tokens_s": {"baseline": baseline_throughput, "variant": variant_throughput},
         "vllm_kv_block_budget": {"baseline": baseline_budget, "variant": variant_budget},
+        "capacity_claim": {"status": capacity_status, "manifest": capacity_record},
+        "prefetch_benefit_eligible": prefetch_benefit_eligible,
+        "partial_load_benefit_eligible": partial_benefit_eligible,
         "request_accounting_count": len(accounting),
         "uma_measurement": "not_measured" if args.phase == "E1" and (base_peak is None or variant_peak is None) else "observed",
     }

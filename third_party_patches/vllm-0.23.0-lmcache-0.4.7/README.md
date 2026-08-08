@@ -12,7 +12,10 @@ request lifecycle:
 1. exact-token scheduler lookup;
 2. scheduler external-token/block admission;
 3. request metadata construction;
-4. post-`start_load_kv` completion.
+4. request-owned native load start, used only to attribute CPU-hot prefetch;
+5. post-`start_load_kv` completion;
+6. scheduler compute progress;
+7. native request finish.
 
 The patch must never call `engine.retrieve`, construct slot mappings, or write
 paged GPU KV outside native `start_load_kv`.  SSD-to-CPU prefetch must use a
@@ -23,6 +26,13 @@ Before `ASTRAKV_KV_CORE_MODE=active` is used, copy `manifest.json` to an
 immutable deployment location and replace the marker and `source_files` with
 absolute paths plus SHA-256 values from the installed sources.  The marker
 must be written by the applied vendor patch and the service must emit a
-callback smoke record that contains all four lifecycle callbacks.  Run
+callback smoke record that contains all seven lifecycle callbacks.  Run
 `scripts/runtime/verify_kv_core_connector_patch.py` with both artifacts; a
 failure means shadow/off only.
+
+Deployment order is intentionally two-stage: run
+`scripts/runtime/prepare_kv_core_v2_deployment.sh`, then exercise a repeated
+exact-prefix request in `E1` shadow mode to produce all seven callback events.
+Use that shadow smoke artifact with `verify_kv_core_connector_patch.py` before
+starting E2-E4 active mode. A no-reuse request is not a valid full callback
+smoke because it correctly has no native load start/completion.

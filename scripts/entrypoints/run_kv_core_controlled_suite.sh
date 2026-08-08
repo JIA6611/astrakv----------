@@ -21,8 +21,10 @@ PORT="18000"
 CONTEXT_PORT="17900"
 TIMEOUT="900"
 GPU_MEMORY_UTILIZATION="0.72"
-WORKLOADS="repeated_long_prefix,random_no_reuse,constrained_kv_churn,queued_concurrency"
-CACHE_STATES="cold,warm"
+# E1 is a lifecycle gate, not a performance sweep. Its default is deliberately
+# one cold repeated-prefix workload that exercises all seven native callbacks.
+WORKLOADS="repeated_long_prefix"
+CACHE_STATES="cold"
 ALLOW_INELIGIBLE=false
 OFFLINE_PROFILE=""
 
@@ -183,7 +185,14 @@ run_one() {
   SERVER_PID="$!"
   wait_for_server "$log_path"
   assert_lmcache_healthy "$log_path"
-  if ! "$PYTHON" scripts/benchmark/run_real_benchmark.py \
+  # The benchmark process is separate from the server child. Repeat only
+  # immutable, non-secret controls here so the paired manifest fingerprints
+  # the configuration actually used by the server rather than blank values.
+  if ! ASTRAKV_GPU_MEMORY_UTILIZATION="$GPU_MEMORY_UTILIZATION" \
+    ASTRAKV_MAX_MODEL_LEN="32768" ASTRAKV_PREFIX_CACHING=false \
+    ASTRAKV_KV_TRANSFER_CONFIG='{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}' \
+    LMCACHE_CONFIG_FILE="${LMCACHE_CONFIG_FILE:?pair-scoped LMCache config is required}" \
+    "$PYTHON" scripts/benchmark/run_real_benchmark.py \
     --base-url "http://${HOST}:${PORT}/v1" --model "$MODEL" --backend "vllm-lmcache-kv-core" \
     --output-dir "$run_dir" --workload-jsonl "$WORKLOAD_DIR/$workload.jsonl" \
     --run-id "$run_id" --workload-id "$workload" --model-revision local-qwen3-8b \
@@ -200,7 +209,7 @@ run_one() {
   assert_lmcache_runtime_healthy "$log_path"
   # These artifacts are emitted by the version-locked connector patch after
   # native events.  Do not synthesize estimated receipts or block capacity.
-  for artifact in callback-smoke.json kv_core_native_callbacks.jsonl kv_core_native_receipts.jsonl kv_core_request_accounting.jsonl kv_core_prefetch_tickets.jsonl kv_core_policy_decisions.jsonl uma_resource_samples.jsonl kv_core_run_metadata.json; do
+  for artifact in callback-smoke.json kv_core_native_callbacks.jsonl kv_core_native_receipts.jsonl kv_core_request_accounting.jsonl request_context_associations.jsonl kv_core_prefetch_tickets.jsonl kv_core_policy_decisions.jsonl uma_resource_samples.jsonl kv_core_run_metadata.json; do
     if [[ -f "$state_dir/$artifact" ]]; then
       cp "$state_dir/$artifact" "$run_dir/$artifact"
     elif [[ "$phase" =~ ^E[2-4]$ && "$artifact" == kv_core_request_accounting.jsonl ]]; then

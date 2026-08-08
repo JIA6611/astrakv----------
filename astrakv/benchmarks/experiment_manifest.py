@@ -13,7 +13,12 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
+
+try:
+    import yaml  # type: ignore
+except Exception:  # pragma: no cover - the benchmark runtime declares PyYAML.
+    yaml = None
 
 
 _SENSITIVE_COMMAND_OPTION = re.compile(
@@ -100,6 +105,36 @@ def file_sha256(path: str | Path | None) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def normalized_lmcache_config_sha256(path: str | Path | None) -> str:
+    """Hash LMCache control settings while excluding pair-local disk paths.
+
+    Controlled baseline/variant runs intentionally use different
+    LocalDiskBackend directories. The directory is storage identity, not a
+    control variable; backend mode, budgets, and all other LMCache settings
+    remain in the digest. Parsing is structured so formatting cannot hide a
+    changed setting. Missing or unparsable configs fail closed with an empty
+    hash.
+    """
+    if not path or yaml is None:
+        return ""
+    config_path = Path(path)
+    if not config_path.is_file():
+        return ""
+    try:
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError, yaml.YAMLError):
+        return ""
+    if not isinstance(data, Mapping):
+        return ""
+    normalized = dict(data)
+    if "local_disk" in normalized:
+        normalized["local_disk"] = "<pair-scoped-local-disk>"
+    encoded = json.dumps(
+        normalized, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def input_hashes(paths: Iterable[str | Path]) -> dict[str, str]:

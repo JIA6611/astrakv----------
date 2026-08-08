@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from astrakv.runtime.kv_core_connector import KVCoreConnectorCallbacks
 from astrakv.runtime.kv_runtime_core import RuntimeMode, TierCapabilitySnapshot, TierTopology
+from astrakv.runtime.request_context import RequestContextReceipt
 from astrakv.runtime.vendor_callback_bridge import VendorCallbackBridge, _owns_runtime_control_host
 
 
@@ -79,6 +80,41 @@ def _scheduler_connector() -> SimpleNamespace:
 
 
 class VendorCallbackBridgeTests(unittest.TestCase):
+    def test_connector_metadata_associates_real_native_request_through_host(self) -> None:
+        callbacks = KVCoreConnectorCallbacks(
+            mode=RuntimeMode.SHADOW,
+            capability=TierCapabilitySnapshot(
+                topology=TierTopology.GPU_SSD, local_cpu_enabled=False, local_disk_enabled=True,
+            ),
+        )
+        receipt = RequestContextReceipt(
+            run_id="run", request_id="logical-request", request_nonce="nonce",
+            runtime_request_id="chatcmpl-logical-request-native",
+            runtime_event_id="runtime-context:chatcmpl-logical-request-native",
+            status="associated", session_id="session", expires_at_ns=10, mac="authenticated",
+        )
+        host = SimpleNamespace(
+            associate_runtime_request=lambda native_id: receipt if native_id == receipt.runtime_request_id else None,
+            runtime_identity_for=lambda native_id: SimpleNamespace(request_id="logical-request") if native_id == receipt.runtime_request_id else None,
+        )
+        with tempfile.TemporaryDirectory() as raw_tmp, patch.dict(os.environ, {
+            "ASTRAKV_RUNTIME_CONTROL_STATE_DIR": raw_tmp,
+        }, clear=False), patch(
+            "astrakv.runtime.vendor_callback_bridge.installed_kv_core_callbacks",
+            return_value=callbacks,
+        ), patch(
+            "astrakv.runtime.vendor_callback_bridge.installed_runtime_control_host",
+            return_value=host,
+        ), patch.object(VendorCallbackBridge, "_start_prefetch_watcher_if_worker"):
+            bridge = VendorCallbackBridge(_connector())
+            bridge.connector_metadata(
+                request_id=receipt.runtime_request_id, metadata_present=True, can_load=True,
+            )
+            record = json.loads((Path(raw_tmp) / "kv_core_native_callbacks.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(record["native_request_id"], receipt.runtime_request_id)
+            self.assertEqual(record["logical_request_id"], "logical-request")
+            self.assertEqual(record["association_receipt_reference"], receipt.runtime_event_id)
+
     def test_single_worker_kv_both_worker_owns_control_host(self) -> None:
         self.assertTrue(_owns_runtime_control_host(_connector()))
 
@@ -132,6 +168,39 @@ class VendorCallbackBridgeTests(unittest.TestCase):
             ledger = json.loads(intent_files[0].read_text(encoding="utf-8"))
             self.assertEqual(ledger["max_external_tokens"], 2)
             self.assertEqual(ledger["logical_request_id"], "native-request")
+
+    def test_scheduler_lookup_does_not_associate_before_reqmeta_metadata(self) -> None:
+        callbacks = KVCoreConnectorCallbacks(
+            mode=RuntimeMode.SHADOW,
+            capability=TierCapabilitySnapshot(
+                topology=TierTopology.GPU_SSD,
+                local_cpu_enabled=False,
+                local_disk_enabled=True,
+            ),
+        )
+        host = SimpleNamespace(
+            associate_runtime_request=lambda native_id: self.fail(
+                f"association started before ReqMeta metadata: {native_id}"
+            ),
+            runtime_identity_for=lambda native_id: None,
+        )
+        with tempfile.TemporaryDirectory() as raw_tmp, patch.dict(os.environ, {
+            "ASTRAKV_RUNTIME_CONTROL_STATE_DIR": raw_tmp,
+        }, clear=False), patch(
+            "astrakv.runtime.vendor_callback_bridge.installed_kv_core_callbacks",
+            return_value=callbacks,
+        ), patch(
+            "astrakv.runtime.vendor_callback_bridge.installed_runtime_control_host",
+            return_value=host,
+        ), patch.object(VendorCallbackBridge, "_start_prefetch_watcher_if_worker"):
+            bridge = VendorCallbackBridge(_connector())
+            bridge.scheduler_exact_lookup(
+                bridge._connector,
+                request_id="native-request",
+                token_ids=(1, 2, 3, 4),
+                request_configs=None,
+                lookup_hit_tokens=4,
+            )
 
     def test_scheduler_lookup_uses_lmcache_lookup_client_token_database(self) -> None:
         callbacks = KVCoreConnectorCallbacks(

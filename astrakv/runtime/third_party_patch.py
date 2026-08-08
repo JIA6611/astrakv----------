@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 
 PATCH_SCHEMA = "astrakv-kv-core-connector-patch-v2"
-PATCH_ID = "astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7-v2"
+PATCH_ID = "astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7-v3"
 SUPPORTED_VLLM = "0.23.0"
 SUPPORTED_LMCACHE = "0.4.7"
 REQUIRED_CALLBACKS = (

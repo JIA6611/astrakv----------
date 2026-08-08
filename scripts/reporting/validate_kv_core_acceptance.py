@@ -103,7 +103,144 @@ def validate_quality(baseline: list[dict[str, Any]], variant: list[dict[str, Any
             errors.append(f"quality_logprob_missing:{sample_id}")
 
 
-def validate_request_accounting(rows: list[dict[str, Any]], expected_request_ids: set[str], errors: list[str]) -> list[dict[str, Any]]:
+def _association_index(
+    rows: list[dict[str, Any]], expected_request_ids: set[str], errors: list[str],
+    *, expected_run_id: str = "",
+) -> dict[str, dict[str, str]]:
+    """Build native->logical bindings from runtime-owned association receipts."""
+    index: dict[str, dict[str, str]] = {}
+    logical_ids: set[str] = set()
+    for row in rows:
+        if str(row.get("status") or "") != "associated":
+            errors.append("association_receipt_not_associated")
+            continue
+        if expected_run_id and str(row.get("run_id") or "") != expected_run_id:
+            errors.append("association_receipt_run_id_mismatch")
+            continue
+        native = str(row.get("runtime_request_id") or "")
+        logical = str(row.get("request_id") or "")
+        event_id = str(row.get("runtime_event_id") or "")
+        nonce = str(row.get("request_nonce") or "")
+        try:
+            expires_at_ns = int(row.get("expires_at_ns") or 0)
+        except (TypeError, ValueError):
+            expires_at_ns = 0
+        if (
+            not native or not logical or not event_id or not nonce
+            or not str(row.get("session_id") or "")
+            or expires_at_ns <= 0
+            or not str(row.get("mac") or "")
+        ):
+            errors.append("association_receipt_identity_missing")
+            continue
+        current = {
+            "logical_request_id": logical,
+            "runtime_event_id": event_id,
+            "association_receipt_reference": event_id,
+            "request_nonce": nonce,
+        }
+        prior = index.get(native)
+        if prior is not None and prior != current:
+            errors.append(f"association_receipt_conflict:{native}")
+            continue
+        index[native] = current
+        logical_ids.add(logical)
+    if expected_request_ids and not expected_request_ids.issubset(logical_ids):
+        errors.append("association_request_coverage_mismatch")
+    return index
+
+
+def validate_variant_request_associations(
+    request_rows: list[dict[str, Any]],
+    association_rows: list[dict[str, Any]],
+    errors: list[str],
+    *,
+    expected_run_id: str = "",
+) -> dict[str, dict[str, str]]:
+    """Require benchmark rows to match runtime-emitted ReqMeta receipts.
+
+    The benchmark client verifies the HMAC before writing ``linked``. This
+    validator deliberately does not infer identities from ``chatcmpl-*``
+    strings: it only accepts the exact native ID/event ID emitted by the
+    runtime-owned association artifact.
+    """
+    expected_by_logical: dict[str, dict[str, Any]] = {}
+    for row in request_rows:
+        logical = str(row.get("request_id") or "")
+        if not logical:
+            errors.append("request_identity_missing")
+            continue
+        if logical in expected_by_logical:
+            errors.append(f"request_result_identity_duplicate:{logical}")
+            continue
+        expected_by_logical[logical] = row
+    expected_request_ids = set(expected_by_logical)
+    if not association_rows:
+        errors.append("request_association_artifact_missing")
+        association_index: dict[str, dict[str, str]] = {}
+    else:
+        association_index = _association_index(
+            association_rows,
+            expected_request_ids,
+            errors,
+            expected_run_id=expected_run_id,
+        )
+        associated_logical = {
+            binding["logical_request_id"] for binding in association_index.values()
+        }
+        if associated_logical != expected_request_ids:
+            errors.append("association_request_exact_coverage_mismatch")
+    for logical, row in expected_by_logical.items():
+        if str(row.get("runtime_association_status") or "") != "linked":
+            errors.append(f"request_result_association_not_linked:{logical}")
+            continue
+        native = str(row.get("runtime_request_id") or "")
+        event_id = str(row.get("runtime_event_id") or "")
+        if not native or not event_id:
+            errors.append(f"request_result_association_identity_missing:{logical}")
+            continue
+        binding = association_index.get(native)
+        if binding is None:
+            errors.append(f"request_result_association_missing:{logical}")
+            continue
+        if binding["logical_request_id"] != logical:
+            errors.append(f"request_result_logical_identity_mismatch:{logical}")
+        if binding["runtime_event_id"] != event_id:
+            errors.append(f"request_result_association_event_mismatch:{logical}")
+    return association_index
+
+
+def _normalize_native_identity(
+    row: dict[str, Any], association_index: dict[str, dict[str, str]], errors: list[str],
+    *, artifact: str,
+) -> dict[str, Any] | None:
+    """Attach audited native/logical identity without guessing from text."""
+    if not association_index:
+        return dict(row)
+    native = str(row.get("native_request_id") or row.get("request_id") or "")
+    binding = association_index.get(native)
+    if binding is None:
+        errors.append(f"{artifact}_association_missing:{native}")
+        return None
+    explicit_logical = str(row.get("logical_request_id") or "")
+    if explicit_logical and explicit_logical != binding["logical_request_id"]:
+        errors.append(f"{artifact}_logical_identity_mismatch:{native}")
+        return None
+    explicit_reference = str(row.get("association_receipt_reference") or "")
+    if explicit_reference and explicit_reference != binding["association_receipt_reference"]:
+        errors.append(f"{artifact}_association_reference_mismatch:{native}")
+        return None
+    normalized = dict(row)
+    normalized.update(binding)
+    normalized["native_request_id"] = native
+    normalized["request_id"] = binding["logical_request_id"]
+    return normalized
+
+
+def validate_request_accounting(
+    rows: list[dict[str, Any]], expected_request_ids: set[str], errors: list[str],
+    *, association_index: dict[str, dict[str, str]] | None = None,
+) -> list[dict[str, Any]]:
     """Validate the last native observation for every request.
 
     These records are not synthetic load receipts: a zero-allocation terminal
@@ -112,6 +249,10 @@ def validate_request_accounting(rows: list[dict[str, Any]], expected_request_ids
     """
     latest: dict[str, dict[str, Any]] = {}
     for row in rows:
+        normalized = _normalize_native_identity(row, association_index or {}, errors, artifact="accounting")
+        if normalized is None:
+            continue
+        row = normalized
         request_id = str(row.get("request_id") or "")
         if not request_id:
             errors.append("accounting_request_identity_missing")
@@ -174,7 +315,10 @@ def validate_request_accounting(rows: list[dict[str, Any]], expected_request_ids
     return list(latest.values())
 
 
-def validate_receipts(rows: list[dict[str, Any]], accounting: list[dict[str, Any]], errors: list[str]) -> None:
+def validate_receipts(
+    rows: list[dict[str, Any]], accounting: list[dict[str, Any]], errors: list[str],
+    *, association_index: dict[str, dict[str, str]] | None = None,
+) -> None:
     expected_loaded = {
         str(row.get("request_id")) for row in accounting
         if int(row.get("allocated_external_tokens") or 0) > 0
@@ -182,6 +326,10 @@ def validate_receipts(rows: list[dict[str, Any]], accounting: list[dict[str, Any
     accounting_by_request = {str(row.get("request_id")): row for row in accounting}
     seen: set[str] = set()
     for row in rows:
+        normalized = _normalize_native_identity(row, association_index or {}, errors, artifact="receipt")
+        if normalized is None:
+            continue
+        row = normalized
         request_id = str(row.get("request_id") or "")
         if not request_id or request_id in seen:
             errors.append("receipt_request_identity_mismatch")
@@ -397,10 +545,34 @@ def main() -> int:
     request_ids = {str(row.get("request_id") or "") for row in variant_requests}
     if "" in request_ids:
         errors.append("request_identity_missing")
+    try:
+        variant_manifest_payload = json.loads(
+            (variant_path / "experiment_manifest.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        variant_manifest_payload = {}
+    if not isinstance(variant_manifest_payload, dict):
+        variant_manifest_payload = {}
+    association_rows = load_run_artifact(variant_path, "request_context_associations.jsonl")
+    association_index = validate_variant_request_associations(
+        variant_requests,
+        association_rows,
+        errors,
+        expected_run_id=str(variant_manifest_payload.get("run_id") or ""),
+    )
     accounting: list[dict[str, Any]] = []
-    if args.phase != "E1":
+    if args.phase == "E1":
+        # E1 is deliberately run with the repeated exact-prefix smoke. It is
+        # not eligible unless the current vendor patch emitted every callback,
+        # including the request-owned native load pair.
+        validate_current_callback_smoke(
+            variant_path, errors, require_native_load=True,
+        )
+    else:
         accounting = load_run_artifact(variant_path, "kv_core_request_accounting.jsonl")
-        accounting = validate_request_accounting(accounting, request_ids, errors)
+        accounting = validate_request_accounting(
+            accounting, request_ids, errors, association_index=association_index,
+        )
         validate_current_callback_smoke(
             variant_path,
             errors,
@@ -410,7 +582,7 @@ def main() -> int:
             ),
         )
         receipts = load_run_artifact(variant_path, "kv_core_native_receipts.jsonl")
-        validate_receipts(receipts, accounting, errors)
+        validate_receipts(receipts, accounting, errors, association_index=association_index)
     baseline_uma = load_run_artifact(baseline_path, "uma_resource_samples.jsonl")
     variant_uma = load_run_artifact(variant_path, "uma_resource_samples.jsonl")
     baseline_resources, variant_resources = resource_peaks(baseline_uma), resource_peaks(variant_uma)

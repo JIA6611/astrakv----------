@@ -1,6 +1,6 @@
 {
   "schema": "astrakv-kv-core-connector-patch-v2",
-  "patch_id": "astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7-v2",
+  "patch_id": "astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7-v3",
   "vllm_version": "0.23.0",
   "lmcache_version": "0.4.7",
   "callbacks": [
@@ -13,7 +13,7 @@
     "request_finished"
   ],
   "patch_marker": {
-    "id": "astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7-v2",
+    "id": "astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7-v3",
     "path": "REPLACE_WITH_DEPLOYED_PATCH_MARKER"
   },
   "source_files": []

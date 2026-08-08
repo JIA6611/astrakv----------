@@ -3,9 +3,9 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON="${ASTRAKV_PYTHON:-python3}"
-DEPLOYMENT_DIR="${1:-$ROOT/deployments/kv-core-v2-$(date -u +%Y%m%dT%H%M%SZ)}"
+DEPLOYMENT_DIR="${1:-$ROOT/deployments/kv-core-v3-$(date -u +%Y%m%dT%H%M%SZ)}"
 PATCH_FILE="$ROOT/third_party_patches/vllm-0.23.0-lmcache-0.4.7/lmcache-vllm_v1_adapter.patch"
-PATCH_ID="astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7-v2"
+PATCH_ID="astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7-v3"
 
 readarray -t paths < <("$PYTHON" - <<'PY'
 from importlib import metadata, util
@@ -32,9 +32,12 @@ if ! grep -q 'astrakv_allocated_external_tokens' "$ADAPTER"; then
   (cd "$SITE_ROOT" && patch --dry-run -p0 < "$PATCH_FILE")
   (cd "$SITE_ROOT" && patch --forward --backup --suffix=.astrakv-v1.bak -p0 < "$PATCH_FILE")
 fi
-for marker in 'VendorCallbackBridge.from_environment(self)' 'native_load_start(' 'load_shortfall_unsafe' 'scheduler_compute_progress' 'request_finished(' 'astrakv_allocated_external_tokens'; do
+for marker in 'from astrakv.runtime.vendor_callback_bridge import VendorCallbackBridge' 'import time' 'VendorCallbackBridge.from_environment(self)' 'connector_metadata(' 'native_load_start(' 'load_shortfall_unsafe' 'scheduler_compute_progress' 'request_finished(' 'astrakv_allocated_external_tokens'; do
   grep -Fq "$marker" "$ADAPTER" || {
-    echo "partial KV-Core patch detected; missing marker: $marker" >&2
+    echo "partial or legacy KV-Core patch detected; missing marker: $marker" >&2
+    echo "Refusing to layer v2 onto modified vendor source. Restore the managed" >&2
+    echo "${ADAPTER}.astrakv-v1.bak after verifying it is clean LMCache 0.4.7," >&2
+    echo "or reinstall lmcache==0.4.7, then rerun this deployment script." >&2
     exit 2
   }
 done
@@ -44,18 +47,21 @@ printf '%s\n' "$PATCH_ID" > "$DEPLOYMENT_DIR/PATCH_MARKER"
 
 ADAPTER_SHA="$(sha256sum "$ADAPTER" | awk '{print $1}')"
 CONNECTOR_SHA="$(sha256sum "$VLLM_CONNECTOR" | awk '{print $1}')"
+PATCH_SHA="$(sha256sum "$PATCH_FILE" | awk '{print $1}')"
 export ASTRAKV_DEPLOYMENT_DIR="$DEPLOYMENT_DIR"
 export ASTRAKV_ADAPTER_PATH="$ADAPTER"
 export ASTRAKV_ADAPTER_SHA="$ADAPTER_SHA"
 export ASTRAKV_VLLM_CONNECTOR_PATH="$VLLM_CONNECTOR"
 export ASTRAKV_VLLM_CONNECTOR_SHA="$CONNECTOR_SHA"
+export ASTRAKV_PATCH_FILE="$PATCH_FILE"
+export ASTRAKV_PATCH_SHA="$PATCH_SHA"
 "$PYTHON" - <<'PY'
 import json
 import os
 from pathlib import Path
 
 deployment = Path(os.environ["ASTRAKV_DEPLOYMENT_DIR"]).resolve()
-patch_id = "astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7-v2"
+patch_id = "astrakv-kv-core-vllm-0.23.0-lmcache-0.4.7-v3"
 payload = {
     "schema": "astrakv-kv-core-connector-patch-v2",
     "patch_id": patch_id,
@@ -71,6 +77,10 @@ payload = {
         "request_finished",
     ],
     "patch_marker": {"id": patch_id, "path": str(deployment / "PATCH_MARKER")},
+    "patch_file": {
+        "path": os.environ["ASTRAKV_PATCH_FILE"],
+        "sha256": os.environ["ASTRAKV_PATCH_SHA"],
+    },
     "source_files": [
         {"path": os.environ["ASTRAKV_ADAPTER_PATH"], "sha256": os.environ["ASTRAKV_ADAPTER_SHA"]},
         {"path": os.environ["ASTRAKV_VLLM_CONNECTOR_PATH"], "sha256": os.environ["ASTRAKV_VLLM_CONNECTOR_SHA"]},

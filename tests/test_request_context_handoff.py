@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from astrakv.runtime.request_context import (
     InMemoryLoopbackRequestContextClient,
+    RequestContextAssociationJsonlArtifact,
     RequestContextJsonlArtifact,
     RequestContextReceipt,
     RuntimeRequestContext,
@@ -14,10 +15,74 @@ from astrakv.runtime.request_context import (
     RuntimeRequestContextReceiver,
     RuntimeRequestIdentity,
 )
-from scripts.benchmark.run_real_benchmark import build_runtime_request_context_client, run_one_request
+from astrakv.runtime.lmcache047_runtime_patch import LMCache047RequestContextConsumer
+from scripts.benchmark.run_real_benchmark import (
+    _wait_for_associated_receipt,
+    build_runtime_request_context_client,
+    run_one_request,
+)
 
 
 class RequestContextHandoffTests(unittest.TestCase):
+    def test_consumer_exports_only_authenticated_association_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            authority = RuntimeRequestContextAuthority.install(
+                run_id="run-association", session_id="session-association", secret=b"a" * 32, ttl_s=30,
+            )
+            receiver = RuntimeRequestContextReceiver(
+                "http://127.0.0.1:9988/request-context", authority,
+            )
+            artifact = RequestContextAssociationJsonlArtifact(Path(raw_tmp) / "associations.jsonl")
+            consumer = LMCache047RequestContextConsumer(receiver, association_sink=artifact.append)
+            context = RuntimeRequestContext(
+                "run-association", "logical-request", "case-a", "nonce-association", 1.0,
+            )
+            headers = authority.context_headers(context, receiver.endpoint_identity)
+            receiver.receive(context.to_record(), headers)
+
+            associated = consumer.associate(
+                "chatcmpl-logical-request-abc",
+                RuntimeRequestIdentity("run-association", "logical-request", "nonce-association"),
+            )
+
+            self.assertIsNotNone(associated)
+            self.assertEqual(
+                consumer.receipt_for("chatcmpl-logical-request-abc").runtime_request_id,
+                "chatcmpl-logical-request-abc",
+            )
+            record = json.loads((Path(raw_tmp) / "associations.jsonl").read_text(encoding="utf-8").strip())
+            receipt = RequestContextReceipt.from_record(record)
+            self.assertEqual(receipt.status, "associated")
+            self.assertEqual(receipt.runtime_request_id, "chatcmpl-logical-request-abc")
+            self.assertTrue(authority.verify_receipt(receipt, receiver.endpoint_identity))
+
+    def test_benchmark_accepts_only_matching_association_artifact_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            context = RuntimeRequestContext("run-poll", "logical-request", "case-a", "nonce-poll", 1.0)
+            path = Path(raw_tmp) / "associations.jsonl"
+            path.write_text(
+                json.dumps(
+                    RequestContextReceipt(
+                        run_id=context.run_id,
+                        request_id=context.request_id,
+                        request_nonce=context.request_nonce,
+                        runtime_request_id="chatcmpl-logical-request-abc",
+                        runtime_event_id="runtime-context:chatcmpl-logical-request-abc",
+                        status="associated",
+                    ).to_record()
+                ) + "\n",
+                encoding="utf-8",
+            )
+            client = InMemoryLoopbackRequestContextClient(
+                "http://127.0.0.1:9988/request-context", lambda _context: RequestContextReceipt(
+                    run_id=context.run_id, request_id=context.request_id,
+                    request_nonce=context.request_nonce, status="recorded",
+                ),
+            )
+            receipt = _wait_for_associated_receipt(path, context, client, timeout_s=0.05)
+            self.assertIsNotNone(receipt)
+            self.assertEqual(receipt.runtime_request_id, "chatcmpl-logical-request-abc")
+
     def test_runner_selects_authenticated_client_only_with_complete_runtime_secret(self) -> None:
         client = build_runtime_request_context_client(
             "http://127.0.0.1:9988/request-context", run_id="run-7", session_id="session-7", secret_hex="ab" * 32,

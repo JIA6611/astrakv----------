@@ -1,175 +1,291 @@
---- lmcache/integration/vllm/vllm_v1_adapter.py
-+++ lmcache/integration/vllm/vllm_v1_adapter.py
-@@ -75,1 +75,4 @@ class LoadSpec:
+index 1bd3a67..a80b733 100644
+--- a/lmcache/integration/vllm/vllm_v1_adapter.py
++++ b/lmcache/integration/vllm/vllm_v1_adapter.py
+@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
+ from typing import TYPE_CHECKING, Any, Generator, Optional, Union
+ import math
+ import os
++import time
+ import sys
+ 
+ # Third Party
+@@ -46,6 +47,8 @@ from lmcache.v1.config import LMCacheEngineConfig
+ from lmcache.v1.config_base import validate_and_set_config_value
+ from lmcache.v1.manager import LMCacheManager
+ 
++from astrakv.runtime.vendor_callback_bridge import VendorCallbackBridge
++
+ if TYPE_CHECKING:
+     # Third Party
+     from vllm.attention.backends.abstract import AttentionMetadata
+@@ -69,6 +72,10 @@ class LoadSpec:
+     lmcache_cached_tokens: int
+     # Whether the scheduler allow us to load the tokens
      can_load: bool
++    # AstraKV-W only provides an upper bound; native LMCache/vLLM own loading.
 +    astrakv_lookup_hit_tokens: int = 0
 +    astrakv_compatibility_prefix_tokens: int = 0
 +    astrakv_allocated_external_tokens: int = 0
-@@ -470,7 +473,6 @@ class LMCacheConnectorV1Impl:
-         self._parent = parent
-         self._vllm_config = vllm_config
-         self._role = role
--        self._astrakv_bridge = VendorCallbackBridge.from_environment()
-         self.device = vllm_config.device_config.device
-         self.kv_role = vllm_config.kv_transfer_config.kv_role
-         self.worker_count = vllm_config.parallel_config.tensor_parallel_size
-@@ -495,1 +495,2 @@ class LMCacheConnectorV1Impl:
+ 
+ 
+ @dataclass
+@@ -488,6 +495,7 @@ class LMCacheConnectorV1Impl:
+ 
+         # Setup metrics for monitoring data structures
          self._setup_metrics()
 +        self._astrakv_bridge = VendorCallbackBridge.from_environment(self)
-@@ -853,32 +853,57 @@ class LMCacheConnectorV1Impl:
+ 
+         logger.info(
+             "LMCache initialized for role %s with version %s, "
+@@ -853,6 +861,28 @@ class LMCacheConnectorV1Impl:
+                     next(layerwise_retriever)
+                     self.layerwise_retrievers.append(layerwise_retriever)
              else:
 +                if self._astrakv_bridge is not None:
 +                    self._astrakv_bridge.native_load_start(
-+                        request_id=request.req_id, connector=self,
-+                        token_ids=tokens, request_configs=request.request_configs,
++                        request_id=request.req_id,
++                        connector=self,
++                        token_ids=tokens,
++                        request_configs=request.request_configs,
 +                        compatibility_prefix_tokens=int(
-+                            getattr(request.load_spec, "astrakv_compatibility_prefix_tokens", lmcache_cached_tokens)
++                            getattr(
++                                request.load_spec,
++                                "astrakv_compatibility_prefix_tokens",
++                                lmcache_cached_tokens,
++                            )
 +                        ),
 +                        allocated_external_tokens=int(
-+                            getattr(request.load_spec, "astrakv_allocated_external_tokens", 0)
++                            getattr(
++                                request.load_spec,
++                                "astrakv_allocated_external_tokens",
++                                0,
++                            )
 +                        ),
 +                    )
-                 retrieve_started_ns = time.perf_counter_ns()
++                retrieve_started_ns = time.perf_counter_ns()
                  ret_token_mask = self.lmcache_engine.retrieve(
                      tokens[:lmcache_cached_tokens],
                      token_mask[:lmcache_cached_tokens],
-                     kvcaches=kvcaches,
-                     slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                     vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                     request_configs=request.request_configs,
-                     req_id=request.req_id,
-                 )
--                if self._astrakv_bridge is not None:
--                    native_tokens = int(ret_token_mask.sum().item())
--                    self._astrakv_bridge.native_load_completion(
--                        request_id=request.req_id,
--                        native_retrieved_tokens=native_tokens,
--                        native_bytes=(
--                            native_tokens
--                            * self._astrakv_bridge.native_bytes_per_token(
--                                kvcaches, self._block_size
--                            )
--                        ),
--                        load_latency_ns=time.perf_counter_ns() - retrieve_started_ns,
--                        status="completed",
--                    )
--
-                 # Check the result
-                 num_retrieved_tokens = ret_token_mask.sum().item()
+@@ -868,6 +898,60 @@ class LMCacheConnectorV1Impl:
                  num_expected_tokens = (
                      lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
                  )
 +                recalc_last = int(lmcache_cached_tokens == len(tokens))
 +                allocated_external_tokens = int(
-+                    getattr(request.load_spec, "astrakv_allocated_external_tokens", 0)
++                    getattr(
++                        request.load_spec, "astrakv_allocated_external_tokens", 0
++                    )
 +                    or max(0, int(num_expected_tokens) - recalc_last)
 +                )
 +                if self._astrakv_bridge is not None:
 +                    native_tokens = int(num_retrieved_tokens)
 +                    receipt_status = (
-+                        "completed" if native_tokens >= allocated_external_tokens
-+                        else "partial" if native_tokens > 0 else "failed"
++                        "completed"
++                        if native_tokens >= allocated_external_tokens
++                        else "partial"
++                        if native_tokens > 0
++                        else "failed"
 +                    )
 +                    load_shortfall_unsafe = self._astrakv_bridge.native_load_completion(
-+                        request_id=request.req_id, connector=self, token_ids=tokens,
++                        request_id=request.req_id,
++                        connector=self,
++                        token_ids=tokens,
 +                        request_configs=request.request_configs,
-+                        compatibility_prefix_tokens=int(getattr(request.load_spec, "astrakv_compatibility_prefix_tokens", lmcache_cached_tokens)),
++                        compatibility_prefix_tokens=int(
++                            getattr(
++                                request.load_spec,
++                                "astrakv_compatibility_prefix_tokens",
++                                lmcache_cached_tokens,
++                            )
++                        ),
 +                        requested_prefix_tokens=len(tokens),
 +                        locally_cached_tokens=request.load_spec.vllm_cached_tokens,
-+                        lookup_hit_tokens=int(getattr(request.load_spec, "astrakv_lookup_hit_tokens", allocated_external_tokens)),
++                        lookup_hit_tokens=int(
++                            getattr(
++                                request.load_spec,
++                                "astrakv_lookup_hit_tokens",
++                                allocated_external_tokens,
++                            )
++                        ),
 +                        allocated_external_tokens=allocated_external_tokens,
 +                        native_retrieved_tokens=native_tokens,
-+                        native_bytes=native_tokens * self._astrakv_bridge.native_bytes_per_token(kvcaches, self._block_size),
++                        native_bytes=(
++                            native_tokens
++                            * self._astrakv_bridge.native_bytes_per_token(
++                                kvcaches, self._block_size
++                            )
++                        ),
 +                        load_latency_ns=time.perf_counter_ns() - retrieve_started_ns,
 +                        status=receipt_status,
 +                    )
 +                    if load_shortfall_unsafe:
 +                        raise RuntimeError(
-+                            "LMCache native load shortfall cannot be treated as recompute "
-+                            f"for request {request.req_id}: {native_tokens} < {allocated_external_tokens}"
++                            "LMCache native load shortfall cannot be treated as "
++                            f"recompute for request {request.req_id}: "
++                            f"{native_tokens} < {allocated_external_tokens}"
 +                        )
                  if num_retrieved_tokens < num_expected_tokens:
-@@ -1449,1 +1469,2 @@ class LMCacheConnectorV1Impl:
--                    lookup_hit_tokens=0, priority=getattr(request, "priority", 0),
-+                    lookup_hit_tokens=0, num_computed_tokens=num_computed_tokens,
-+                    priority=getattr(request, "priority", 0),
-@@ -1457,12 +1450,1 @@ class LMCacheConnectorV1Impl:
--        if self._astrakv_bridge is not None:
--            callback_tokens = request.all_token_ids
--            if self.skip_last_n_tokens > 0:
--                callback_tokens = callback_tokens[: -self.skip_last_n_tokens]
--            self._astrakv_bridge.scheduler_exact_lookup(
--                self, request_id=req_id, token_ids=callback_tokens,
--                request_configs=extract_request_configs(request.sampling_params),
--                lookup_hit_tokens=int(num_external_hit_tokens),
--                priority=getattr(request, "priority", 0),
--            )
--
-         # When prompt length is divisible by the block size and all
-@@ -1547,1 +1529,32 @@ class LMCacheConnectorV1Impl:
+                     logger.error(
+                         "Request %s"
+@@ -1429,6 +1513,18 @@ class LMCacheConnectorV1Impl:
+             )
+             return None
+ 
++        astra_cap = None
 +        if self._astrakv_bridge is not None:
-+            callback_tokens = request.all_token_ids
-+            if self.skip_last_n_tokens > 0:
-+                callback_tokens = callback_tokens[: -self.skip_last_n_tokens]
 +            astra_cap = self._astrakv_bridge.scheduler_exact_lookup(
-+                self, request_id=req_id, token_ids=callback_tokens,
-+                request_configs=extract_request_configs(request.sampling_params),
++                self,
++                request_id=req_id,
++                token_ids=token_ids,
++                request_configs=request_configs,
 +                lookup_hit_tokens=int(num_external_hit_tokens),
 +                num_computed_tokens=num_computed_tokens,
 +                priority=getattr(request, "priority", 0),
 +            )
-+            if astra_cap is not None and astra_cap < need_to_allocate:
-+                # The cap is chunk-aligned, but vLLM's existing prefix may
-+                # only be block-aligned.  LMCache requires the combined end
-+                # offset to be chunk-aligned, so the actual scheduler-visible
-+                # suffix can be smaller than AstraKV's upper bound.
-+                capped_total = max(
-+                    num_computed_tokens,
-+                    ((num_computed_tokens + int(astra_cap)) // self._lmcache_chunk_size)
-+                    * self._lmcache_chunk_size,
-+                )
-+                capped_lmcache_tokens = min(capped_lmcache_tokens, capped_total)
-+                need_to_allocate = max(0, capped_lmcache_tokens - num_computed_tokens)
-+        self.load_specs[req_id] = LoadSpec(
-+            vllm_cached_tokens=num_computed_tokens,
-+            lmcache_cached_tokens=capped_lmcache_tokens,
-+            can_load=False,
-+        )
++
+         # When prompt length is divisible by the block size and all
+         # blocks are cached, we need to recompute the last token.
+         # This will be removed in the future if vLLM's scheduler provides
+@@ -1503,11 +1599,32 @@ class LMCacheConnectorV1Impl:
+                 self._max_tokens_per_load,
+             )
+ 
++        if astra_cap is not None and astra_cap < need_to_allocate:
++            # The policy can only lower a native external-prefix upper bound.
++            # LMCache/vLLM retain alignment, allocation, and recompute control.
++            capped_total = max(
++                num_computed_tokens,
++                ((num_computed_tokens + int(astra_cap)) // self._lmcache_chunk_size)
++                * self._lmcache_chunk_size,
++            )
++            capped_lmcache_tokens = min(capped_lmcache_tokens, capped_total)
++            need_to_allocate = max(0, capped_lmcache_tokens - num_computed_tokens)
++
+         self.load_specs[req_id] = LoadSpec(
+             vllm_cached_tokens=num_computed_tokens,
+             lmcache_cached_tokens=capped_lmcache_tokens,
+             can_load=False,
+         )
 +        if self._astrakv_bridge is not None:
-+            self.load_specs[req_id].astrakv_lookup_hit_tokens = max(0, int(num_external_hit_tokens) - num_computed_tokens - int(num_external_hit_tokens == request.num_tokens))
-+            self.load_specs[req_id].astrakv_compatibility_prefix_tokens = int(num_external_hit_tokens)
++            self.load_specs[req_id].astrakv_lookup_hit_tokens = max(
++                0,
++                int(num_external_hit_tokens)
++                - num_computed_tokens
++                - int(num_external_hit_tokens == request.num_tokens),
++            )
++            self.load_specs[req_id].astrakv_compatibility_prefix_tokens = int(
++                num_external_hit_tokens
++            )
+ 
          if below_min_retrieve or need_to_allocate <= 0:
-@@ -1638,8 +1643,9 @@ class LMCacheConnectorV1Impl:
+             return 0
+@@ -1559,11 +1676,19 @@ class LMCacheConnectorV1Impl:
+ 
+         if request.request_id not in self.load_specs:
+             # No KV tokens from external KV cache, return
++            if self._astrakv_bridge is not None:
++                self._astrakv_bridge.scheduler_external_admission(
++                    request_id=request.request_id, allocated_external_tokens=0,
++                )
+             return
+ 
+         if num_external_tokens == 0:
+             # No need to load anything
+             self.load_specs[request.request_id].can_load = False
++            if self._astrakv_bridge is not None:
++                self._astrakv_bridge.scheduler_external_admission(
++                    request_id=request.request_id, allocated_external_tokens=0,
++                )
+             return
+ 
+         recalc_last = (
+@@ -1591,6 +1716,14 @@ class LMCacheConnectorV1Impl:
          )
  
          self.load_specs[request.request_id].can_load = True
-+        self.load_specs[request.request_id].astrakv_allocated_external_tokens = int(num_external_tokens)
-         if self._astrakv_bridge is not None:
-             self._astrakv_bridge.scheduler_external_admission(
-                 request_id=request.request_id, allocated_external_tokens=num_external_tokens,
-             )
++        self.load_specs[request.request_id].astrakv_allocated_external_tokens = int(
++            num_external_tokens
++        )
++        if self._astrakv_bridge is not None:
++            self._astrakv_bridge.scheduler_external_admission(
++                request_id=request.request_id,
++                allocated_external_tokens=num_external_tokens,
++            )
  
-@@ -1660,6 +1666,11 @@ class LMCacheConnectorV1Impl:
+     @_lmcache_nvtx_annotate
+     def build_connector_meta(
+@@ -1609,6 +1742,11 @@ class LMCacheConnectorV1Impl:
          force_skip_save = self.kv_role == "kv_consumer" or self.force_skip_save
  
          meta = LMCacheConnectorMetadata()
 +        if self._astrakv_bridge is not None:
 +            for request_id, scheduled_tokens in scheduler_output.num_scheduled_tokens.items():
 +                self._astrakv_bridge.scheduler_compute_progress(
-+                    request_id=request_id, scheduled_tokens=int(scheduled_tokens),
++                    request_id=request_id, scheduled_tokens=int(scheduled_tokens)
 +                )
  
          for finished_req_id in scheduler_output.finished_req_ids:
              self._request_trackers.pop(finished_req_id, None)
-@@ -1971,5 +1983,11 @@ class LMCacheConnectorV1Impl:
-                 return_params["num_lmcache_cached_tokens"] = (
+@@ -1657,6 +1795,14 @@ class LMCacheConnectorV1Impl:
+             )
+             if req_meta is not None:
+                 meta.add_request(req_meta)
++                if self._astrakv_bridge is not None:
++                    self._astrakv_bridge.connector_metadata(
++                        request_id=req_meta.req_id,
++                        metadata_present=True,
++                        can_load=bool(
++                            req_meta.load_spec is not None and req_meta.load_spec.can_load
++                        ),
++                    )
+ 
+         cached_reqs = scheduler_output.scheduled_cached_reqs
+ 
+@@ -1703,6 +1849,15 @@ class LMCacheConnectorV1Impl:
+                 )
+                 if req_meta is not None:
+                     meta.add_request(req_meta)
++                    if self._astrakv_bridge is not None:
++                        self._astrakv_bridge.connector_metadata(
++                            request_id=req_meta.req_id,
++                            metadata_present=True,
++                            can_load=bool(
++                                req_meta.load_spec is not None
++                                and req_meta.load_spec.can_load
++                            ),
++                        )
+             return meta
+ 
+         for i, req_id in enumerate(cached_reqs.req_ids):
+@@ -1826,6 +1981,14 @@ class LMCacheConnectorV1Impl:
+             )
+             if req_meta is not None:
+                 meta.add_request(req_meta)
++                if self._astrakv_bridge is not None:
++                    self._astrakv_bridge.connector_metadata(
++                        request_id=req_meta.req_id,
++                        metadata_present=True,
++                        can_load=bool(
++                            req_meta.load_spec is not None and req_meta.load_spec.can_load
++                        ),
++                    )
+ 
+         return meta
+ 
+@@ -1881,6 +2044,16 @@ class LMCacheConnectorV1Impl:
                      request_tracker.num_lmcache_cached_tokens
                  )
+ 
 +        if self._astrakv_bridge is not None:
 +            self._astrakv_bridge.request_finished(
-+                request_id=request.request_id, finish_status=str(request.status),
++                request_id=request.request_id,
++                finish_status=str(request.status),
 +                num_computed_tokens=int(getattr(request, "num_computed_tokens", 0)),
-+                num_tokens=int(getattr(request, "num_tokens", len(getattr(request, "all_token_ids", ())))),
++                num_tokens=int(
++                    getattr(request, "num_tokens", len(getattr(request, "all_token_ids", ())))
++                ),
 +            )
- 
++
          return False, return_params
+ 
+     @_lmcache_nvtx_annotate

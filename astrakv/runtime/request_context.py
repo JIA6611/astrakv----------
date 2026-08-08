@@ -366,6 +366,22 @@ class RequestContextReceipt:
         return record
 
 
+@dataclass(slots=True)
+class RequestContextAssociationJsonlArtifact:
+    """Runtime-owned append-only evidence of authenticated ReqMeta binding."""
+
+    path: Path
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def append(self, receipt: RequestContextReceipt) -> None:
+        if receipt.status != "associated" or not receipt.runtime_request_id:
+            raise ValueError("association artifact requires an associated receipt")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(receipt.to_record(), sort_keys=True) + "\n")
+
+
 class RequestContextClient(Protocol):
     @property
     def endpoint_identity(self) -> str:
@@ -373,6 +389,9 @@ class RequestContextClient(Protocol):
 
     def publish(self, context: RuntimeRequestContext) -> RequestContextReceipt:
         """Send a request context to a runtime Hook-compatible consumer."""
+
+    def verify_receipt(self, receipt: RequestContextReceipt) -> bool:
+        """Verify a runtime-owned receipt before using it for attribution."""
 
 
 class RequestContextArtifact(Protocol):
@@ -422,6 +441,9 @@ class JsonHttpRequestContextClient:
             raise ValueError("request context response must be a JSON object")
         return RequestContextReceipt.from_record(payload)
 
+    def verify_receipt(self, receipt: RequestContextReceipt) -> bool:
+        return False
+
 
 @dataclass(frozen=True, slots=True)
 class AuthenticatedJsonHttpRequestContextClient:
@@ -465,6 +487,10 @@ class AuthenticatedJsonHttpRequestContextClient:
             raise ValueError("request context response must be a JSON object")
         return RequestContextReceipt.from_record(payload)
 
+    def verify_receipt(self, receipt: RequestContextReceipt) -> bool:
+        authority = self._authority
+        return bool(authority is not None and authority.verify_receipt(receipt, self.endpoint_identity))
+
 
 @dataclass(frozen=True, slots=True)
 class InMemoryLoopbackRequestContextClient:
@@ -480,6 +506,11 @@ class InMemoryLoopbackRequestContextClient:
 
     def publish(self, context: RuntimeRequestContext) -> RequestContextReceipt:
         return self.responder(context)
+
+    def verify_receipt(self, receipt: RequestContextReceipt) -> bool:
+        # In-memory clients are test doubles; production HTTP clients verify
+        # the runtime-owned HMAC before accepting an association.
+        return receipt.status == "associated" and bool(receipt.runtime_request_id and receipt.runtime_event_id)
 
 
 class _RejectRedirects(HTTPRedirectHandler):

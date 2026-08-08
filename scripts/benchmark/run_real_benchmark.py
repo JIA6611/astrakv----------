@@ -45,13 +45,21 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from dgx_metrics_collector import DgxMetricsCollector, DgxSummary
 from astrakv.benchmarks.runtime_workload import WorkloadContractError, load_runtime_workload_jsonl
-from astrakv.benchmarks.experiment_manifest import ExperimentManifest, file_sha256, input_hashes, redact_command_text, write_experiment_manifest
+from astrakv.benchmarks.experiment_manifest import (
+    ExperimentManifest,
+    file_sha256,
+    input_hashes,
+    normalized_lmcache_config_sha256,
+    redact_command_text,
+    write_experiment_manifest,
+)
 from astrakv.benchmarks.runtime_artifacts import export_online_control_artifacts
 from astrakv.runtime.request_context import (
     AuthenticatedJsonHttpRequestContextClient,
     JsonHttpRequestContextClient,
     RequestContextArtifact,
     RequestContextClient,
+    RequestContextReceipt,
     RequestContextJsonlArtifact,
     RuntimeRequestContext,
 )
@@ -146,6 +154,11 @@ def main() -> int:
     request_context_artifact: RequestContextArtifact = RequestContextJsonlArtifact(
         output_dir / "request_context.jsonl"
     )
+    request_context_association_path = (
+        Path(args.runtime_state_dir) / "request_context_associations.jsonl"
+        if getattr(args, "runtime_state_dir", "")
+        else None
+    )
     request_context_client = build_runtime_request_context_client(
         args.request_context_url, run_id=args.run_id,
         session_id=args.request_context_session_id, secret_hex=args.request_context_secret_hex,
@@ -159,6 +172,7 @@ def main() -> int:
             workload_rows,
             request_context_client=request_context_client,
             request_context_artifact=request_context_artifact,
+            request_context_association_path=request_context_association_path,
         )
         failures.extend(item.error for item in request_results if item.status != "ok")
     else:
@@ -187,6 +201,7 @@ def main() -> int:
                     metrics_collector=collector,
                     request_context_client=request_context_client,
                     request_context_artifact=request_context_artifact,
+                    request_context_association_path=request_context_association_path,
                 )
                     request_results.extend(batch_results)
                     failures.extend(item.error for item in batch_results if item.status != "ok")
@@ -432,6 +447,7 @@ def run_batch(
     metrics_collector: DgxMetricsCollector | None = None,
     request_context_client: RequestContextClient | None = None,
     request_context_artifact: RequestContextArtifact | None = None,
+    request_context_association_path: Path | None = None,
     batch_nonce: str | None = None,
 ) -> list[RequestResult]:
     invocation_nonce = _reserve_batch_nonce(batch_nonce)
@@ -476,6 +492,7 @@ def run_batch(
                     request_nonce=request_nonces[request_index],
                     request_context_client=request_context_client,
                     request_context_artifact=request_context_artifact,
+                    request_context_association_path=request_context_association_path,
                     request_context_reserved=True,
                 )
                 for request_index, request_id in enumerate(request_ids)
@@ -507,6 +524,7 @@ def run_one_request(
     request_nonce: str | None = None,
     request_context_client: RequestContextClient | None = None,
     request_context_artifact: RequestContextArtifact | None = None,
+    request_context_association_path: Path | None = None,
     request_context_reserved: bool = False,
     tokenizer_path: str = "",
     tokenizer_revision: str = "",
@@ -534,6 +552,7 @@ def run_one_request(
     runtime_request_id = ""
     runtime_event_id = ""
     request_context_error = ""
+    published_context: RuntimeRequestContext | None = None
     run_id = str(request_metadata.get("run_id") or "")
     task_metadata = request_metadata.get("metadata") if isinstance(request_metadata.get("metadata"), dict) else {}
     supplied_messages = task_metadata.get("messages")
@@ -592,6 +611,7 @@ def run_one_request(
                     "chat_template_revision": chat_template_revision,
                 },
             )
+            published_context = context
             if request_context_artifact is not None:
                 request_context_artifact.append(context)
             if request_context_client is not None:
@@ -672,6 +692,22 @@ def run_one_request(
             error = classify_error(exc)
 
     ended = time.perf_counter()
+    if (
+        runtime_association_status != "linked"
+        and published_context is not None
+        and request_context_client is not None
+        and request_context_association_path is not None
+    ):
+        associated = _wait_for_associated_receipt(
+            request_context_association_path,
+            published_context,
+            request_context_client,
+            timeout_s=min(2.0, max(0.1, timeout)),
+        )
+        if associated is not None:
+            runtime_association_status = "linked"
+            runtime_request_id = associated.runtime_request_id
+            runtime_event_id = associated.runtime_event_id
     request_ended_s = time.time()
     latency_ms = (ended - started) * 1000.0
     output_tokens_observed = max(observed_tokens, usage_tokens or 0)
@@ -756,6 +792,43 @@ def run_one_request(
         finish_reason=finish_reason,
         deterministic_logprob=deterministic_logprob if logprob_observed else None,
     )
+
+
+def _wait_for_associated_receipt(
+    path: Path,
+    context: RuntimeRequestContext,
+    client: RequestContextClient,
+    *,
+    timeout_s: float,
+) -> RequestContextReceipt | None:
+    """Read only a runtime-emitted, authenticated ReqMeta association receipt."""
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else ()
+        except OSError:
+            lines = ()
+        for line in reversed(lines):
+            try:
+                receipt = RequestContextReceipt.from_record(json.loads(line))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if (
+                receipt.status == "associated"
+                and receipt.run_id == context.run_id
+                and receipt.request_id == context.request_id
+                and receipt.request_nonce == context.request_nonce
+                and receipt.runtime_request_id
+                and receipt.runtime_event_id
+            ):
+                try:
+                    if client.verify_receipt(receipt):
+                        return receipt
+                except Exception:
+                    continue
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.01)
 
 
 def extract_choice_token_ids(choice: dict[str, Any]) -> list[int]:
@@ -880,6 +953,7 @@ def run_workload_rows(
     *,
     request_context_client: RequestContextClient | None = None,
     request_context_artifact: RequestContextArtifact | None = None,
+    request_context_association_path: Path | None = None,
 ) -> tuple[list[RequestResult], dict[str, DgxSummary]]:
     results: list[RequestResult] = []
     summaries: dict[str, DgxSummary] = {}
@@ -923,6 +997,7 @@ def run_workload_rows(
             attribution_mode="exclusive_request",
             request_context_client=request_context_client,
             request_context_artifact=request_context_artifact,
+            request_context_association_path=request_context_association_path,
             tokenizer_path=args.tokenizer_path,
             tokenizer_revision=args.tokenizer_revision,
             chat_template_revision=args.chat_template_revision,
@@ -1125,7 +1200,9 @@ def finalize_experiment_manifest(output_dir: Path, args: argparse.Namespace, con
         "gpu_memory_utilization": os.environ.get("ASTRAKV_GPU_MEMORY_UTILIZATION", ""),
         "prefix_caching": os.environ.get("ASTRAKV_PREFIX_CACHING", ""),
         "kv_transfer_config": os.environ.get("ASTRAKV_KV_TRANSFER_CONFIG", ""),
-        "lmcache_config_sha256": file_sha256(os.environ.get("LMCACHE_CONFIG_FILE", "")),
+        "lmcache_config_sha256": normalized_lmcache_config_sha256(
+            os.environ.get("LMCACHE_CONFIG_FILE", "")
+        ),
         "software": ExperimentManifest(run_id="control-environment").to_record()["software"],
         "gpu": ExperimentManifest(run_id="control-environment").to_record()["gpu"],
         "config_sha256": file_sha256(args.config),
@@ -1144,6 +1221,11 @@ def finalize_experiment_manifest(output_dir: Path, args: argparse.Namespace, con
     if runtime_state_dir:
         for role, target in export_online_control_artifacts(runtime_state_dir, output_dir).items():
             artifact_paths[role] = target.name
+        association_source = Path(runtime_state_dir) / "request_context_associations.jsonl"
+        if association_source.is_file():
+            association_target = output_dir / association_source.name
+            shutil.copyfile(association_source, association_target)
+            artifact_paths["request_context_associations"] = association_target.name
     else:
         for role, source in _parse_online_artifacts(online_artifacts).items():
             target = output_dir / _canonical_online_filename(role, source)
@@ -1575,6 +1657,7 @@ def write_effective_config(path: Path, args: argparse.Namespace, config: dict[st
         "run_id": args.run_id,
         "request_context_url": args.request_context_url,
         "request_context_artifact": "request_context.jsonl",
+        "request_context_association_artifact": "request_context_associations.jsonl",
         "samples_dir": "samples" if args.enable_samples else "",
         "samples_file_pattern": "samples/<case>_samples.csv" if args.enable_samples else "",
         "raw_config": redact_config({key: value for key, value in config.items() if key != "_config_path"}),

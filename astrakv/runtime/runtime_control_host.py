@@ -34,6 +34,8 @@ from astrakv.runtime.lmcache047_runtime_patch import (
     LMCache047RequestContextConsumer,
 )
 from astrakv.runtime.request_context import (
+    RequestContextAssociationJsonlArtifact,
+    RequestContextReceipt,
     RuntimeRequestContext,
     RuntimeRequestContextAuthority,
     RuntimeRequestContextReceiver,
@@ -125,6 +127,7 @@ class RuntimeControlHost:
         )
         self.context_receiver: RuntimeRequestContextReceiver | None = None
         self.context_consumer: LMCache047RequestContextConsumer | None = None
+        self._association_artifact: RequestContextAssociationJsonlArtifact | None = None
         self.action_endpoint = LMCache047ActionEndpoint(binding_registry=self.binding_registry)
         self.action_service: ProtectedRuntimeActionService | None = None
         self.action_server: UnixDomainSocketActionServer | None = None
@@ -221,7 +224,13 @@ class RuntimeControlHost:
 
         self._http_server = ThreadingHTTPServer(("127.0.0.1", self.config.context_port), ContextHandler)
         self.context_receiver = RuntimeRequestContextReceiver(self.context_url, self.authority)
-        self.context_consumer = LMCache047RequestContextConsumer(self.context_receiver)
+        self._association_artifact = RequestContextAssociationJsonlArtifact(
+            self.state_dir / "request_context_associations.jsonl"
+        )
+        self.context_consumer = LMCache047RequestContextConsumer(
+            self.context_receiver,
+            association_sink=self._association_artifact.append,
+        )
         self._http_thread = threading.Thread(target=self._http_server.serve_forever, name="astrakv-request-context", daemon=True)
         self._http_thread.start()
 
@@ -344,6 +353,24 @@ class RuntimeControlHost:
             if prior is not None and prior != identity:
                 raise ValueError("runtime request identity conflict")
             self._runtime_identities[runtime_request_id] = identity
+
+    def associate_runtime_request(self, runtime_request_id: str) -> RequestContextReceipt | None:
+        """Associate a concrete native ReqMeta ID through the host-owned consumer.
+
+        The vendor connector is the only component allowed to supply the native
+        ID.  A missing or ambiguous identity is deliberately a no-op so a
+        connector cannot manufacture a logical binding from benchmark data.
+        """
+        runtime_request_id = str(runtime_request_id or "")
+        consumer = self.context_consumer
+        if not runtime_request_id or consumer is None:
+            return None
+        identity = self.runtime_identity_for(runtime_request_id)
+        if identity is None:
+            return None
+        if consumer.associate(runtime_request_id, identity) is None:
+            return None
+        return consumer.receipt_for(runtime_request_id)
 
     def runtime_identity_for(self, runtime_request_id: str) -> RuntimeRequestIdentity | None:
         with self._identity_lock:

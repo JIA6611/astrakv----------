@@ -21,6 +21,7 @@ from astrakv.runtime.backend_hook import HookAction
 from astrakv.runtime.eviction import ObjectLevel
 from astrakv.runtime.runtime_action_executor import RuntimeActionExecutor
 from astrakv.runtime.request_context import (
+    RequestContextReceipt,
     RuntimeRequestContextReceiver,
     RuntimeRequestIdentity,
 )
@@ -1791,15 +1792,31 @@ class LMCache047RequestContextConsumer:
     the matching logical identity.
     """
 
-    def __init__(self, receiver: RuntimeRequestContextReceiver) -> None:
+    def __init__(
+        self,
+        receiver: RuntimeRequestContextReceiver,
+        association_sink: Callable[[RequestContextReceipt], None] | None = None,
+    ) -> None:
         self._receiver = receiver
+        self._association_sink = association_sink
         self._contexts: dict[str, RequestContext] = {}
+        self._receipts: dict[str, RequestContextReceipt] = {}
+        self._emitted_runtime_ids: set[str] = set()
 
     def associate(self, runtime_reqmeta_id: str, identity: RuntimeRequestIdentity) -> RequestContext | None:
         try:
-            self._receiver.associate_runtime_request(runtime_reqmeta_id, identity)
+            receipt = self._receiver.associate_runtime_request(runtime_reqmeta_id, identity)
         except ValueError:
             return None
+        self._receipts[runtime_reqmeta_id] = receipt
+        if self._association_sink is not None and runtime_reqmeta_id not in self._emitted_runtime_ids:
+            self._emitted_runtime_ids.add(runtime_reqmeta_id)
+            try:
+                self._association_sink(receipt)
+            except Exception:
+                # Association is already authenticated and stored in the
+                # receiver; evidence export must not change runtime behavior.
+                self._emitted_runtime_ids.discard(runtime_reqmeta_id)
         context = self._receiver.associated_context(runtime_reqmeta_id)
         if context is None:
             return None
@@ -1812,6 +1829,10 @@ class LMCache047RequestContextConsumer:
         )
         self._contexts[runtime_reqmeta_id] = binding_context
         return binding_context
+
+    def receipt_for(self, runtime_reqmeta_id: str) -> RequestContextReceipt | None:
+        """Return the authenticated receipt for a concrete native request."""
+        return self._receipts.get(runtime_reqmeta_id)
 
     def context_for(self, runtime_reqmeta_id: str) -> RequestContext | None:
         return self._contexts.get(runtime_reqmeta_id)

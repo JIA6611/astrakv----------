@@ -17,6 +17,14 @@ request lifecycle:
 6. scheduler compute progress;
 7. native request finish.
 
+`lmcache-vllm_v1_adapter.patch` is self-contained against the clean upstream
+LMCache 0.4.7 adapter; it is not an incremental patch over an earlier
+AstraKV-W modification. The deployment script refuses a partial or legacy
+adapter rather than layering patches onto unknown vendor state. Restore the
+managed `.astrakv-v1.bak` only after verifying it is clean, or reinstall the
+version-locked package, then apply this patch and retain the generated
+deployment manifest with its source and patch hashes.
+
 The patch must never call `engine.retrieve`, construct slot mappings, or write
 paged GPU KV outside native `start_load_kv`.  SSD-to-CPU prefetch must use a
 real `LocalCPUBackend`, have a `PrefetchTicket`, and must not construct a GPU
@@ -31,7 +39,8 @@ callback smoke record that contains all seven lifecycle callbacks.  Run
 failure means shadow/off only.
 
 Deployment order is intentionally two-stage: run
-`scripts/runtime/prepare_kv_core_v2_deployment.sh`, then exercise a repeated
+`scripts/runtime/prepare_kv_core_v2_deployment.sh` (which now emits a v3
+deployment manifest), then exercise a repeated
 exact-prefix request in `E1` shadow mode to produce all seven callback events.
 Use that shadow smoke artifact with `verify_kv_core_connector_patch.py` before
 starting E2-E4 active mode. A no-reuse request is not a valid full callback

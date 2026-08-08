@@ -94,6 +94,7 @@ class VendorCallbackBridge:
         self._seen_callbacks: set[str] = set()
         self._prefetch_request_seen: set[str] = set()
         self._terminal_request_seen: set[str] = set()
+        self._association_receipts: dict[str, Any] = {}
         self._prefetch_keys: dict[str, tuple[Any, ...]] = {}
         self._prefetch_futures: dict[str, Any] = {}
         self._prefetch_watcher: threading.Thread | None = None
@@ -312,8 +313,14 @@ class VendorCallbackBridge:
             })
 
     def connector_metadata(self, *, request_id: str, metadata_present: bool, can_load: bool) -> None:
+        receipt = self._associate_runtime_request(request_id)
+        logical_request_id = self._logical_request_id(request_id)
         self._record("connector_metadata", {
             "request_id": request_id,
+            "native_request_id": request_id,
+            "logical_request_id": logical_request_id,
+            "runtime_event_id": "" if receipt is None else str(getattr(receipt, "runtime_event_id", "") or ""),
+            "association_receipt_reference": "" if receipt is None else str(getattr(receipt, "runtime_event_id", "") or ""),
             "metadata_present": bool(metadata_present),
             "can_load": bool(can_load),
         })
@@ -335,6 +342,7 @@ class VendorCallbackBridge:
         load_latency_ns: int,
         status: str,
     ) -> bool:
+        receipt_identity = self._associate_runtime_request(request_id)
         callback_tokens = tuple(int(token) for token in token_ids)
         physical = self._physical_by_request.get(request_id)
         compatibility_count = min(
@@ -433,12 +441,15 @@ class VendorCallbackBridge:
                 observed = receipt.bytes_loaded / (receipt.load_latency_ns / 1_000_000.0)
                 self._ssd_bytes_per_ms_ema = observed if self._ssd_bytes_per_ms_ema <= 0 else 0.8 * self._ssd_bytes_per_ms_ema + 0.2 * observed
             record = asdict(receipt)
+            record.update(self._association_evidence(request_id, receipt_identity))
             self._append("kv_core_native_receipts.jsonl", record)
             self._record("native_load_completion", record)
             return self._active_admission() and receipt.load_shortfall_tokens > 0
         except (TypeError, ValueError) as exc:
             self._record("native_load_completion", {
-                "request_id": request_id, "status": "rejected", "reason": str(exc),
+                "request_id": request_id,
+                **self._association_evidence(request_id, receipt_identity),
+                "status": "rejected", "reason": str(exc),
                 "native_retrieved_tokens": max(0, int(native_retrieved_tokens)),
             })
             return self._active_admission()
@@ -462,6 +473,7 @@ class VendorCallbackBridge:
         """
         tokens = tuple(int(token) for token in token_ids)
         prefix_tokens = min(len(tokens), max(0, int(compatibility_prefix_tokens)))
+        association_receipt = self._associate_runtime_request(request_id)
         intent_record = self._read_native_intent(request_id)
         physical = self._physical_by_request.get(request_id)
         native_keys: tuple[Any, ...] = ()
@@ -474,6 +486,7 @@ class VendorCallbackBridge:
         if physical is None:
             self._record("native_load_start", {
                 "request_id": request_id,
+                **self._association_evidence(request_id, association_receipt),
                 "status": "unbound",
                 "allocated_external_tokens": max(0, int(allocated_external_tokens)),
             })
@@ -494,6 +507,7 @@ class VendorCallbackBridge:
             if expected != observed:
                 self._record("native_load_start", {
                     "request_id": request_id,
+                    **self._association_evidence(request_id, association_receipt),
                     "status": "rejected",
                     "reason": "native_intent_identity_mismatch",
                 })
@@ -510,6 +524,7 @@ class VendorCallbackBridge:
         )
         self._record("native_load_start", {
             "request_id": request_id,
+            **self._association_evidence(request_id, association_receipt),
             "logical_request_id": logical_request_id,
             "physical_object_id": physical.physical_object_id,
             "binding_generation": physical.binding_generation,
@@ -527,6 +542,7 @@ class VendorCallbackBridge:
         num_computed_tokens: int,
         num_tokens: int,
     ) -> None:
+        association_receipt = self._associate_runtime_request(request_id)
         callbacks, physical = self._callbacks(), self._physical_by_request.get(request_id)
         if callbacks is None or physical is None:
             return
@@ -544,6 +560,7 @@ class VendorCallbackBridge:
             )
             record = asdict(accounting)
             record.update({
+                **self._association_evidence(request_id, association_receipt),
                 "native_num_computed_tokens": max(0, int(num_computed_tokens)),
                 "native_num_tokens": max(0, int(num_tokens)),
                 "native_key": physical.native_key,
@@ -559,7 +576,9 @@ class VendorCallbackBridge:
             )
         except (TypeError, ValueError) as exc:
             self._record("request_finished", {
-                "request_id": request_id, "status": "rejected", "reason": str(exc),
+                "request_id": request_id, "native_request_id": request_id,
+                "logical_request_id": self._logical_request_id(request_id),
+                "status": "rejected", "reason": str(exc),
             })
 
     def _active_admission(self) -> bool:
@@ -1266,6 +1285,39 @@ class VendorCallbackBridge:
         identity = None if host is None else host.runtime_identity_for(native_request_id)
         return native_request_id if identity is None else identity.request_id
 
+    def _associate_runtime_request(self, native_request_id: str) -> Any | None:
+        """Bind a real LMCache ReqMeta ID through the runtime-owned host."""
+        native_request_id = str(native_request_id or "")
+        if not native_request_id:
+            return None
+        cached = self._association_receipts.get(native_request_id)
+        if cached is not None:
+            return cached
+        host = installed_runtime_control_host()
+        if host is None:
+            return None
+        associate = getattr(host, "associate_runtime_request", None)
+        if not callable(associate):
+            return None
+        try:
+            receipt = associate(native_request_id)
+        except (TypeError, ValueError):
+            return None
+        if receipt is not None and str(getattr(receipt, "status", "") or "") == "associated":
+            self._association_receipts[native_request_id] = receipt
+            return receipt
+        return None
+
+    def _association_evidence(self, native_request_id: str, receipt: Any | None = None) -> dict[str, str]:
+        receipt = receipt or self._association_receipts.get(str(native_request_id))
+        runtime_event_id = "" if receipt is None else str(getattr(receipt, "runtime_event_id", "") or "")
+        return {
+            "native_request_id": str(native_request_id),
+            "logical_request_id": self._logical_request_id(native_request_id),
+            "runtime_event_id": runtime_event_id,
+            "association_receipt_reference": runtime_event_id,
+        }
+
     @staticmethod
     def native_bytes_per_token(kvcaches: Iterable[Any], block_size: int) -> int:
         total = 0
@@ -1322,6 +1374,7 @@ class VendorCallbackBridge:
         callbacks = self._callbacks()
         if callbacks is None:
             return
+        identity = self._association_evidence(request_id)
         final = callbacks.final_accounting_for(request_id)
         if final is not None:
             record = asdict(final)
@@ -1337,6 +1390,7 @@ class VendorCallbackBridge:
             loaded = 0 if receipt is None else receipt.actual_loaded_tokens
             record = {
                 "request_id": request_id,
+                **identity,
                 "physical_object_id": physical.physical_object_id,
                 "binding_generation": physical.binding_generation,
                 "native_key": physical.native_key,
@@ -1366,6 +1420,7 @@ class VendorCallbackBridge:
             }
             terminal = False
         record.update({
+            **identity,
             "native_key": physical.native_key,
             "compatibility_identity": physical.compatibility_key.identity,
             "prefix_hash": physical.compatibility_key.prefix_hash,

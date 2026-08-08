@@ -565,6 +565,9 @@ class VendorCallbackBridge:
                 "native_num_tokens": max(0, int(num_tokens)),
                 "native_key": physical.native_key,
                 "compatibility_identity": physical.compatibility_key.identity,
+                # This is the final native request lifecycle callback. The
+                # accounting value is no longer provisional once it returns.
+                "terminal": True,
                 "timestamp_ns": time.time_ns(),
             })
             self._append("kv_core_request_accounting.jsonl", record)

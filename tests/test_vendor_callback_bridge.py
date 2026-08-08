@@ -202,6 +202,49 @@ class VendorCallbackBridgeTests(unittest.TestCase):
                 lookup_hit_tokens=4,
             )
 
+    def test_request_finished_writes_terminal_accounting_record(self) -> None:
+        callbacks = KVCoreConnectorCallbacks(
+            mode=RuntimeMode.ACTIVE,
+            capability=TierCapabilitySnapshot(
+                topology=TierTopology.GPU_SSD,
+                local_cpu_enabled=False,
+                local_disk_enabled=True,
+                available_kv_blocks=1024,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as raw_tmp, patch.dict(os.environ, {
+            "ASTRAKV_RUNTIME_CONTROL_STATE_DIR": raw_tmp,
+            "ASTRAKV_KV_CORE_ADMISSION_ENABLED": "true",
+        }, clear=False), patch(
+            "astrakv.runtime.vendor_callback_bridge.installed_kv_core_callbacks",
+            return_value=callbacks,
+        ), patch.object(VendorCallbackBridge, "_start_prefetch_watcher_if_worker"):
+            bridge = VendorCallbackBridge(_connector())
+            bridge.scheduler_exact_lookup(
+                bridge._connector,
+                request_id="native-request",
+                token_ids=(1, 2, 3, 4),
+                request_configs=None,
+                lookup_hit_tokens=0,
+            )
+            bridge.scheduler_external_admission(
+                request_id="native-request", allocated_external_tokens=0,
+            )
+            bridge.request_finished(
+                request_id="native-request",
+                finish_status="FINISHED_LENGTH_CAPPED",
+                num_computed_tokens=4,
+                num_tokens=5,
+            )
+            rows = [
+                json.loads(line)
+                for line in (Path(raw_tmp) / "kv_core_request_accounting.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            self.assertTrue(rows[-1]["terminal"])
+            self.assertEqual(rows[-1]["terminal_reason"], "scheduler_declined_recompute")
+
     def test_scheduler_lookup_uses_lmcache_lookup_client_token_database(self) -> None:
         callbacks = KVCoreConnectorCallbacks(
             mode=RuntimeMode.SHADOW,

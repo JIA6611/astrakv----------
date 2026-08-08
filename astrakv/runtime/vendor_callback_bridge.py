@@ -1171,8 +1171,16 @@ class VendorCallbackBridge:
 
     @staticmethod
     def _token_chunks(connector: Any, tokens: tuple[int, ...], request_configs: dict[str, Any] | None) -> tuple[tuple[int, int, Any], ...]:
+        # LMCache 0.4.7 keeps the scheduler connector's lookup-side
+        # TokenDatabase on ``lookup_client``; its ``lmcache_engine`` is
+        # intentionally absent (the engine is worker-owned).  Use that
+        # native database as the scheduler-side identity source so callback
+        # records and admission decisions use the same keys as the worker.
         engine = getattr(connector, "lmcache_engine", None)
         database = getattr(engine, "token_database", None)
+        if database is None:
+            lookup_client = getattr(connector, "lookup_client", None)
+            database = getattr(lookup_client, "token_database", None)
         if database is None:
             return ()
         return tuple(database.process_tokens(tokens=list(tokens), request_configs=request_configs))

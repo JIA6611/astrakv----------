@@ -70,6 +70,14 @@ def _connector() -> SimpleNamespace:
     )
 
 
+def _scheduler_connector() -> SimpleNamespace:
+    connector = _connector()
+    connector.lmcache_engine = None
+    connector.lookup_client = SimpleNamespace(token_database=_TokenDatabase())
+    connector._role = SimpleNamespace(name="SCHEDULER")
+    return connector
+
+
 class VendorCallbackBridgeTests(unittest.TestCase):
     def test_single_worker_kv_both_worker_owns_control_host(self) -> None:
         self.assertTrue(_owns_runtime_control_host(_connector()))
@@ -124,6 +132,34 @@ class VendorCallbackBridgeTests(unittest.TestCase):
             ledger = json.loads(intent_files[0].read_text(encoding="utf-8"))
             self.assertEqual(ledger["max_external_tokens"], 2)
             self.assertEqual(ledger["logical_request_id"], "native-request")
+
+    def test_scheduler_lookup_uses_lmcache_lookup_client_token_database(self) -> None:
+        callbacks = KVCoreConnectorCallbacks(
+            mode=RuntimeMode.SHADOW,
+            capability=TierCapabilitySnapshot(
+                topology=TierTopology.GPU_SSD,
+                local_cpu_enabled=False,
+                local_disk_enabled=True,
+                available_kv_blocks=1024,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as raw_tmp, patch.dict(os.environ, {
+            "ASTRAKV_RUNTIME_CONTROL_STATE_DIR": raw_tmp,
+            "ASTRAKV_KV_CORE_ADMISSION_ENABLED": "false",
+        }, clear=False), patch(
+            "astrakv.runtime.vendor_callback_bridge.installed_kv_core_callbacks",
+            return_value=callbacks,
+        ), patch.object(VendorCallbackBridge, "_start_prefetch_watcher_if_worker"):
+            bridge = VendorCallbackBridge(_scheduler_connector())
+            bridge.scheduler_exact_lookup(
+                bridge._connector,
+                request_id="native-request",
+                token_ids=(1, 2, 3, 4),
+                request_configs=None,
+                lookup_hit_tokens=4,
+                num_computed_tokens=0,
+            )
+            self.assertIsNotNone(callbacks.lookup_for("native-request"))
 
 
 if __name__ == "__main__":

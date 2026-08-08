@@ -4,6 +4,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.request import Request, build_opener, ProxyHandler
 
 from astrakv.runtime.request_context import AuthenticatedJsonHttpRequestContextClient, RuntimeRequestContext
@@ -16,6 +17,18 @@ from astrakv.runtime.kv_runtime_core import RuntimeMode
 
 
 class RuntimeControlHostTests(unittest.TestCase):
+    def test_duplicate_single_process_bridge_registration_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host = RuntimeControlHost(RuntimeControlHostConfig(
+                run_id="run-a", state_dir=Path(directory), secret=b"a" * 32,
+                engine_instance_id="engine", worker_id="worker",
+            ))
+            first = SimpleNamespace()
+            second = SimpleNamespace()
+            host.register_kv_runtime_bridge(first)
+            host.register_kv_runtime_bridge(second)
+            self.assertIs(host._kv_runtime_bridge, first)
+
     def test_should_attempt_online_dispatch_respects_release_toggle(self):
         release = BackendHookEvent(
             run_id="run-a",

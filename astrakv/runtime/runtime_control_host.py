@@ -364,13 +364,19 @@ class RuntimeControlHost:
             return matches[0] if len(matches) == 1 else None
 
     def register_kv_runtime_bridge(self, bridge: Any) -> None:
-        """Attach the process-local vendor bridge to authenticated ingress."""
+        """Attach the process-local vendor bridge to authenticated ingress.
+
+        vLLM 0.23 may construct scheduler-side and worker-side LMCache
+        connectors in one single-worker EngineCore.  They share this host;
+        only the first bridge owns ingress, while each connector keeps its own
+        native callback state.  This is idempotent within one process and does
+        not permit sharing a host across processes.
+        """
         if bridge is None:
             raise ValueError("KV runtime bridge is required")
         with self._identity_lock:
-            if self._kv_runtime_bridge is not None and self._kv_runtime_bridge is not bridge:
-                raise RuntimeError("KV runtime bridge is already registered")
-            self._kv_runtime_bridge = bridge
+            if self._kv_runtime_bridge is None:
+                self._kv_runtime_bridge = bridge
 
     def install_hooks(self, installer: Callable[..., LMCache047ActionEndpoint]) -> LMCache047ActionEndpoint:
         if self.context_consumer is None:

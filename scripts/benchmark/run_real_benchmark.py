@@ -545,6 +545,8 @@ def run_one_request(
                     "reuse_bucket": str(request_metadata.get("reuse_bucket") or ""),
                     "reuse_ratio": request_metadata.get("reuse_ratio"),
                     "arrival_index": request_metadata.get("arrival_index"),
+                    "context_length": request_metadata.get("context_length"),
+                    "context_length_source": request_metadata.get("context_length_source", ""),
                     "scenario": str(task_metadata.get("scenario") or request_metadata.get("scenario") or ""),
                     "workload_case": str(request_metadata.get("case") or ""),
                     "cache_state": str(request_metadata.get("cache_state") or ""),
@@ -615,14 +617,9 @@ def run_one_request(
                         continue
                     if choice.get("finish_reason") is not None:
                         finish_reason = str(choice["finish_reason"])
-                    token_ids = choice.get("token_ids")
-                    if not isinstance(token_ids, list):
-                        delta_value = choice.get("delta")
-                        token_ids = delta_value.get("token_ids") if isinstance(delta_value, dict) else None
-                    if isinstance(token_ids, list):
-                        for token_id in token_ids:
-                            if isinstance(token_id, int) and not isinstance(token_id, bool):
-                                output_token_ids.append(token_id)
+                    token_ids = extract_choice_token_ids(choice)
+                    if token_ids:
+                        output_token_ids.extend(token_ids)
                     logprobs = choice.get("logprobs")
                     content_logprobs = logprobs.get("content") if isinstance(logprobs, dict) else None
                     if isinstance(content_logprobs, list):
@@ -649,6 +646,12 @@ def run_one_request(
     request_ended_s = time.time()
     latency_ms = (ended - started) * 1000.0
     output_tokens_observed = max(observed_tokens, usage_tokens or 0)
+    if status == "ok" and backend == "vllm-lmcache-kv-core" and not output_token_ids:
+        status = "error"
+        error = (
+            "KV-Core benchmark requires real output token IDs from the vLLM response; "
+            "the endpoint returned no token-id evidence."
+        )
     if status == "ok":
         status, error = finalize_request_status(
             observed_tokens=observed_tokens,
@@ -726,6 +729,49 @@ def run_one_request(
     )
 
 
+def extract_choice_token_ids(choice: dict[str, Any]) -> list[int]:
+    """Extract token IDs from a vLLM/OpenAI streamed choice.
+
+    vLLM 0.23 may expose IDs through its compatibility ``token_ids`` field,
+    while its OpenAI logprobs response carries the same evidence as
+    ``logprobs.content[].token_id``.  Prefer the explicit extension and use
+    logprobs only as a structured fallback; never reconstruct IDs from text.
+    """
+    explicit = choice.get("token_ids")
+    if isinstance(explicit, list):
+        normalized = [
+            token_id
+            for token_id in explicit
+            if isinstance(token_id, int) and not isinstance(token_id, bool)
+        ]
+        if normalized:
+            return normalized
+
+    delta = choice.get("delta")
+    if isinstance(delta, dict):
+        delta_ids = delta.get("token_ids")
+        if isinstance(delta_ids, list):
+            normalized = [
+                token_id
+                for token_id in delta_ids
+                if isinstance(token_id, int) and not isinstance(token_id, bool)
+            ]
+            if normalized:
+                return normalized
+
+    logprobs = choice.get("logprobs")
+    content = logprobs.get("content") if isinstance(logprobs, dict) else None
+    if not isinstance(content, list):
+        return []
+    return [
+        token_id
+        for token in content
+        if isinstance(token, dict)
+        for token_id in [token.get("token_id")]
+        if isinstance(token_id, int) and not isinstance(token_id, bool)
+    ]
+
+
 def finalize_request_status(
     *,
     observed_tokens: int,
@@ -766,6 +812,15 @@ def run_workload_rows(
 ) -> tuple[list[RequestResult], dict[str, DgxSummary]]:
     results: list[RequestResult] = []
     summaries: dict[str, DgxSummary] = {}
+    if args.backend == "vllm-lmcache-kv-core":
+        for row in rows:
+            context_length, _ = resolve_workload_context_length(row)
+            if context_length <= 0:
+                request_id = str(row.get("request_id") or "<unknown>")
+                raise SystemExit(
+                    f"KV-Core workload row {request_id} is missing a positive context_length; "
+                    "provide tokenizer-derived context_length in the workload or metadata."
+                )
     for index, row in enumerate(rows):
         sleep_before_s = as_float_or_none(row.get("sleep_before_s"))
         if sleep_before_s is not None and sleep_before_s > 0.0:
@@ -777,10 +832,11 @@ def run_workload_rows(
         case = f"{original_case}_{index:05d}"
         collector = start_metrics_collector(args, output_dir, case)
         prompt = str(row["prompt"])
+        context_length, context_length_source = resolve_workload_context_length(row)
         result = run_one_request(
             base_url=args.base_url, api_key=args.api_key, model=args.model, backend=args.backend,
             case=case, request_id=request_id, batch_size=max(1, as_int_or_none(row.get("batch_size")) or 1),
-            context_length=max(0, as_int_or_none(row.get("context_length")) or 0),
+            context_length=context_length,
             output_tokens=max(1, as_int_or_none(row.get("expected_output_tokens")) or args.output_tokens),
             timeout=args.timeout, temperature=args.temperature, top_p=args.top_p, system_prompt=args.system_prompt,
             prompt_seed=args.prompt_seed, prompt_token_scale=args.prompt_token_scale, prompt=prompt,
@@ -788,6 +844,8 @@ def run_workload_rows(
                 **row,
                 "run_id": args.run_id,
                 "cache_state": args.cache_state,
+                "context_length": context_length,
+                "context_length_source": context_length_source,
                 "prompt_hash": row.get("prompt_hash") or stable_hash(prompt),
             },
             metrics_collector=collector,
@@ -819,6 +877,19 @@ def build_prompt(
         f"{context}\n\n"
         "Summarize the context in exactly three short bullet points."
     )
+
+
+def resolve_workload_context_length(row: dict[str, Any]) -> tuple[int, str]:
+    """Resolve a workload's declared prompt-token count without text guessing."""
+    direct = as_int_or_none(row.get("context_length"))
+    if direct is not None and direct > 0:
+        return direct, "workload.context_length"
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    for field in ("context_length", "context_token_estimate", "estimated_prompt_tokens", "estimated_context_tokens"):
+        value = as_int_or_none(metadata.get(field))
+        if value is not None and value > 0:
+            return value, f"workload.metadata.{field}"
+    return 0, "missing"
 
 
 def stream_chat_completion(
@@ -1248,7 +1319,7 @@ def write_report(
             "- Process RSS, GPU utilization, and disk IO are the stable case-level resource metrics.",
             "- `gpu_memory_peak_mb` remains a compatibility field only. On DGX Spark unified-memory systems, `nvidia-smi`/NVML may not expose per-GPU memory counters.",
             "- Continuous samples are real host/GPU/disk probes. KV hit, prefetch hit, and offload events remain blank until a real LMCache/vLLM event adapter is added.",
-            "- Prompt context length is an approximation built from stable synthetic words because no tokenizer dependency is required.",
+            "- Canonical workload runs use the positive context_length declared by the workload or its tokenizer profile metadata; synthetic matrix runs use the generated prompt target.",
             "",
             "## Failures",
             "",

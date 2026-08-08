@@ -151,7 +151,7 @@ run_one() {
   for artifact in kv_core_native_receipts.jsonl kv_core_request_accounting.jsonl kv_core_prefetch_tickets.jsonl uma_resource_samples.jsonl kv_core_run_metadata.json; do
     if [[ -f "$state_dir/$artifact" ]]; then
       cp "$state_dir/$artifact" "$run_dir/$artifact"
-    elif [[ "$phase" != E1 && "$artifact" == kv_core_request_accounting.jsonl ]]; then
+    elif [[ "$phase" =~ ^E[2-4]$ && "$artifact" == kv_core_request_accounting.jsonl ]]; then
       echo "Missing required active-phase accounting artifact: $state_dir/$artifact" >&2
       return 1
     fi

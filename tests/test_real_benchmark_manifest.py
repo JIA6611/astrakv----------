@@ -23,6 +23,12 @@ class RealBenchmarkManifestTests(unittest.TestCase):
         self.assertIn('ASTRAKV_KV_TRANSFER_CONFIG=', static_controls)
         self.assertIn('LMCACHE_CONFIG_FILE=', static_controls)
 
+    def test_deployment_requires_exact_reverse_patch_for_existing_adapter(self) -> None:
+        deployment = Path(__file__).resolve().parents[1] / "scripts" / "runtime" / "prepare_kv_core_v2_deployment.sh"
+        text = deployment.read_text(encoding="utf-8")
+        self.assertIn('patch --batch --dry-run --reverse -p0 < "$PATCH_FILE"', text)
+        self.assertIn("installed adapter is not an exact v3 patch result", text)
+
     def test_lmcache_control_hash_ignores_only_pair_scoped_disk_path(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)

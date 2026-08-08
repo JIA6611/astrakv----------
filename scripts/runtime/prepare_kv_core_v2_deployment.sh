@@ -28,7 +28,17 @@ SITE_ROOT="$(cd "$(dirname "$ADAPTER")/../../.." && pwd)"
 mkdir -p "$DEPLOYMENT_DIR"
 cp -a "$ADAPTER" "$DEPLOYMENT_DIR/vllm_v1_adapter.before-v2.py"
 
-if ! grep -q 'astrakv_allocated_external_tokens' "$ADAPTER"; then
+if grep -q 'astrakv_allocated_external_tokens' "$ADAPTER"; then
+  # An existing AstraKV marker is not proof that it is this exact contract.
+  # The reverse dry-run proves the installed source is precisely the result
+  # of applying this self-contained v3 patch to clean LMCache 0.4.7.
+  if ! (cd "$SITE_ROOT" && patch --batch --dry-run --reverse -p0 < "$PATCH_FILE"); then
+    echo "installed adapter is not an exact v3 patch result; refusing to certify it" >&2
+    echo "Preserve the current source as evidence, then reinstall clean lmcache==0.4.7" >&2
+    echo "or restore a verified clean adapter before rerunning this script." >&2
+    exit 2
+  fi
+else
   (cd "$SITE_ROOT" && patch --dry-run -p0 < "$PATCH_FILE")
   (cd "$SITE_ROOT" && patch --forward --backup --suffix=.astrakv-v1.bak -p0 < "$PATCH_FILE")
 fi

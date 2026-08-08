@@ -1,0 +1,32 @@
+{
+  "schema": "astra-workload-prompt-manifest-v1",
+  "workload_name": "grouped",
+  "workload_path": "datasets_full\\workloads\\qasper\\grouped.jsonl",
+  "workload_sha256": "sha256:c31b4b78332f2338dda89c09e07a8813bea14381a7d2c75f2f0016217882b715",
+  "prompts_path": "results_full\\workload_prompts\\qasper\\grouped_prompts.jsonl",
+  "prompts_sha256": "sha256:a1deae89572a4ccc1b5cbff544027c391023d5d72fe60e0597ab40370361bc76",
+  "system_prompt": "You are a deterministic benchmark assistant. Answer directly and concisely.",
+  "prompt_template": "qa_context_v1",
+  "max_tokens": 128,
+  "temperature": 0.0,
+  "top_p": 1.0,
+  "statistics": {
+    "schema": "astra-workload-prompt-statistics-v1",
+    "prompt_count": 200,
+    "shared_context_prompt_count": 95,
+    "shared_context_prompt_ratio": 0.475,
+    "reuse_group_count": 148,
+    "average_prompt_tokens": 4541.315,
+    "max_prompt_tokens": 18917,
+    "average_context_tokens": 4500.28,
+    "max_context_tokens": 18878,
+    "total_prompt_tokens": 908263,
+    "total_context_tokens": 900056
+  },
+  "immutability_policy": {
+    "question_modified": false,
+    "answer_modified": false,
+    "ground_truth_modified": false,
+    "context_modified": false
+  }
+}

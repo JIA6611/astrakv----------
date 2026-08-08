@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any
 from uuid import UUID, uuid4, uuid5
 from functools import lru_cache
@@ -814,6 +814,12 @@ def _load_benchmark_tokenizer(tokenizer_path: str, tokenizer_revision: str) -> A
 
 
 def normalize_exact_token_ids(value: Any) -> tuple[int, ...]:
+    # Transformers 5.12 returns a BatchEncoding for Qwen3 chat templates even
+    # without ``return_tensors``.  Its ``input_ids`` are the authoritative
+    # token sequence; accepting only this named field keeps the identity path
+    # structural and fail-closed for all other tokenizer return values.
+    if isinstance(value, Mapping):
+        value = value.get("input_ids")
     if not isinstance(value, (list, tuple)) or not value:
         raise ValueError("exact_token_ids must be a non-empty integer sequence")
     result: list[int] = []

@@ -1,0 +1,15 @@
+{
+  "schema": "astra-workload-prompt-validation-v1",
+  "workload_path": "datasets_full\\workloads\\multifieldqa_en\\random.jsonl",
+  "prompts_path": "results_full\\workload_prompts\\multifieldqa_en\\random_prompts.jsonl",
+  "passed": true,
+  "error_count": 0,
+  "errors": [],
+  "checks": {
+    "prompt_count": 150,
+    "json_roundtrip": true,
+    "request_ids_unique": true,
+    "sample_order_preserved": true,
+    "question_answer_ground_truth_immutable": true
+  }
+}

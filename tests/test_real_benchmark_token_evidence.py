@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from scripts.benchmark.run_real_benchmark import (
     extract_choice_token_ids,
+    normalize_exact_token_ids,
     resolve_workload_context_length,
     run_one_request,
 )
@@ -39,6 +40,18 @@ class RealBenchmarkTokenEvidenceTests(unittest.TestCase):
             "logprobs": {"content": [{"token_id": 10}]},
         }
         self.assertEqual(extract_choice_token_ids(choice), [7, 8])
+
+    def test_normalizes_qwen3_transformers_batch_encoding_input_ids(self) -> None:
+        # Transformers 5.12 Qwen3 ``apply_chat_template`` returns a
+        # BatchEncoding-like mapping instead of a bare integer list.
+        self.assertEqual(
+            normalize_exact_token_ids({"input_ids": [151644, 872, 198]}),
+            (151644, 872, 198),
+        )
+
+    def test_rejects_batch_encoding_without_a_valid_input_id_sequence(self) -> None:
+        with self.assertRaisesRegex(ValueError, "non-empty integer sequence"):
+            normalize_exact_token_ids({"input_ids": []})
 
     def test_kv_core_request_fails_closed_without_token_evidence(self) -> None:
         stream = iter([

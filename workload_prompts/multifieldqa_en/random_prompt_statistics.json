@@ -1,0 +1,13 @@
+{
+  "schema": "astra-workload-prompt-statistics-v1",
+  "prompt_count": 150,
+  "shared_context_prompt_count": 67,
+  "shared_context_prompt_ratio": 0.44666666666666666,
+  "reuse_group_count": 112,
+  "average_prompt_tokens": 6402.806666666666,
+  "max_prompt_tokens": 13911,
+  "average_context_tokens": 6358.4,
+  "max_context_tokens": 13866,
+  "total_prompt_tokens": 960421,
+  "total_context_tokens": 953760
+}

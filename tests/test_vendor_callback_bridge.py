@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from astrakv.runtime.kv_core_connector import KVCoreConnectorCallbacks
 from astrakv.runtime.kv_runtime_core import RuntimeMode, TierCapabilitySnapshot, TierTopology
-from astrakv.runtime.vendor_callback_bridge import VendorCallbackBridge
+from astrakv.runtime.vendor_callback_bridge import VendorCallbackBridge, _owns_runtime_control_host
 
 
 class _Key:
@@ -63,11 +63,29 @@ def _connector() -> SimpleNamespace:
         _vllm_config=config,
         _block_size=1,
         _lmcache_chunk_size=2,
+        _role=SimpleNamespace(name="WORKER"),
+        kv_role="kv_both",
+        worker_count=1,
         config=SimpleNamespace(local_cpu=False, local_disk=True, max_local_cpu_size=0.0),
     )
 
 
 class VendorCallbackBridgeTests(unittest.TestCase):
+    def test_single_worker_kv_both_worker_owns_control_host(self) -> None:
+        self.assertTrue(_owns_runtime_control_host(_connector()))
+
+    def test_distributed_worker_does_not_own_control_host(self) -> None:
+        connector = _connector()
+        connector.worker_count = 2
+        self.assertFalse(_owns_runtime_control_host(connector))
+
+    def test_scheduler_role_owns_control_host_independently_of_kv_role(self) -> None:
+        connector = _connector()
+        connector._role = SimpleNamespace(name="SCHEDULER")
+        connector.kv_role = "kv_producer"
+        connector.worker_count = 8
+        self.assertTrue(_owns_runtime_control_host(connector))
+
     def test_scheduler_lookup_publishes_intent_before_using_it(self) -> None:
         callbacks = KVCoreConnectorCallbacks(
             mode=RuntimeMode.ACTIVE,

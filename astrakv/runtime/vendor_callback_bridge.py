@@ -59,6 +59,26 @@ def _env_int(name: str, default: int = 0) -> int:
         return default
 
 
+def _owns_runtime_control_host(connector: Any) -> bool:
+    """Return whether this connector process may bind the control-plane port.
+
+    vLLM 0.23 creates the LMCache connector as ``WORKER`` even for a
+    single-process ``kv_both`` deployment.  That process invokes both the
+    scheduler and worker callback paths, so it must own the authenticated
+    context ingress.  A distributed worker never receives this exception:
+    it must not race another process for the control-plane port.
+    """
+    role = getattr(connector, "_role", None)
+    role_name = str(getattr(role, "name", role) or "").lower()
+    if "scheduler" in role_name:
+        return True
+    kv_role = str(getattr(connector, "kv_role", "") or "").lower()
+    worker_count = _env_int("ASTRAKV_TENSOR_PARALLEL_SIZE", 0)
+    if worker_count <= 0:
+        worker_count = int(getattr(connector, "worker_count", 0) or 0)
+    return "worker" in role_name and kv_role == "kv_both" and worker_count == 1
+
+
 class VendorCallbackBridge:
     """Control and record only version-locked native connector lifecycles."""
 
@@ -98,10 +118,11 @@ class VendorCallbackBridge:
     def from_environment(cls, connector: Any = None) -> "VendorCallbackBridge | None":
         if os.environ.get("ASTRAKV_KV_CORE_VENDOR_PATCH", "false") != "true":
             return None
-        role_name = str(getattr(connector, "_role", "")).lower()
         # ``connector is None`` is the legacy/bootstrap call made before the
-        # vendor connector exists; preserve its EngineCore ownership semantics.
-        scheduler_role = connector is None or "scheduler" in role_name
+        # vendor connector exists.  For vLLM 0.23 single-worker kv_both, the
+        # EngineCore exposes scheduler callbacks through a WORKER connector;
+        # _owns_runtime_control_host handles that version-specific topology.
+        scheduler_role = connector is None or _owns_runtime_control_host(connector)
         install_from_environment(
             vendor_engine_child=True,
             start_runtime_host=scheduler_role,

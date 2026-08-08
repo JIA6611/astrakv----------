@@ -60,6 +60,28 @@ class RealBenchmarkTokenEvidenceTests(unittest.TestCase):
         self.assertEqual(result.status, "error")
         self.assertIn("token IDs", result.error)
 
+    def test_kv_core_payload_enables_vllm_stream_token_ids(self) -> None:
+        stream = iter([
+            {"choices": [{"delta": {"content": "hello"}, "token_ids": [123]}]},
+            {"choices": [{"finish_reason": "length", "delta": {}}]},
+            {"usage": {"completion_tokens": 1}, "choices": []},
+        ])
+        with patch("scripts.benchmark.run_real_benchmark.stream_chat_completion", return_value=stream) as request:
+            result = run_one_request(
+                base_url="http://endpoint", api_key="empty", model="model",
+                backend="vllm-lmcache-kv-core", case="case", request_id="req-payload",
+                batch_size=1, context_length=32, output_tokens=1, timeout=1,
+                temperature=0, top_p=1, system_prompt="system", prompt_seed="seed",
+                prompt_token_scale=1, prompt="prompt",
+                request_metadata={"run_id": "run-payload"},
+                request_nonce="55555555-5555-4555-8555-555555555555",
+            )
+
+        self.assertEqual(result.status, "ok")
+        payload = request.call_args.args[1]
+        self.assertTrue(payload["return_token_ids"])
+        self.assertNotIn("return_tokens_as_token_ids", payload)
+
 
 if __name__ == "__main__":
     unittest.main()

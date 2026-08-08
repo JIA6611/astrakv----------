@@ -94,6 +94,15 @@ wait_for_server() {
   return 1
 }
 
+assert_lmcache_healthy() {
+  local log_path="$1"
+  if grep -q "LMCacheEngine marked as init failed" "$log_path"; then
+    echo "LMCache initialization failed; refusing to benchmark degraded recompute mode." >&2
+    tail -n 180 "$log_path" >&2 || true
+    return 1
+  fi
+}
+
 run_one() {
   local label="$1" phase="$2" role="$3" workload="$4" cache_state="$5" baseline_label="$6"
   local run_id="kv-core-${phase}-${workload}-${cache_state}-${role}-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -136,6 +145,7 @@ run_one() {
   nohup bash scripts/launch/launch_lmcache_vllm.sh "$backend" > "$log_path" 2>&1 < /dev/null &
   SERVER_PID="$!"
   wait_for_server "$log_path"
+  assert_lmcache_healthy "$log_path"
   "$PYTHON" scripts/benchmark/run_real_benchmark.py \
     --base-url "http://${HOST}:${PORT}/v1" --model "$MODEL" --backend "vllm-lmcache-kv-core" \
     --output-dir "$run_dir" --workload-jsonl "$WORKLOAD_DIR/$workload.jsonl" \
@@ -163,7 +173,9 @@ run_pair() {
   local label="$1" baseline_phase="$2" variant_phase="$3" workload="$4" cache_state="$5"
   local cache_dir="$OUTPUT_DIR/lmcache-store/$label/$workload/$cache_state"
   local cache_config="$OUTPUT_DIR/lmcache-config/$label/$workload/$cache_state.yaml"
-  local local_cpu="false" local_cpu_size="0.0" control_topology="gpu_ssd"
+  # LMCache 0.4.7 requires a LocalCPUBackend object whenever LocalDiskBackend
+  # is configured. Keep it non-hot for gpu_ssd: staging only, not prefetch.
+  local local_cpu="false" local_cpu_size="0.10" control_topology="gpu_ssd"
   if [[ "$variant_phase" == E3 || "$variant_phase" == E4 ]]; then
     local_cpu="true"
     control_topology="gpu_cpu_ssd"

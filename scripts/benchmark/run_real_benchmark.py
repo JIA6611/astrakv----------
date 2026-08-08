@@ -592,7 +592,7 @@ def run_one_request(
                 # vLLM's documented compatibility extension returns stable
                 # token identifiers in streamed choices.  Other benchmark
                 # backends retain their existing request shape.
-                payload.update({"return_tokens_as_token_ids": True, "logprobs": True, "top_logprobs": 1})
+                payload.update({"return_token_ids": True, "logprobs": True, "top_logprobs": 1})
             for event in stream_chat_completion(
                 f"{base_url}/v1/chat/completions",
                 payload,

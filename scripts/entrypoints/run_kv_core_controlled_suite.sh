@@ -114,6 +114,8 @@ run_one() {
     topology="$ASTRAKV_CONTROL_TOPOLOGY"
     [[ "$topology" == gpu_cpu_ssd ]] && backend="cpu"
   fi
+  local runtime_secret_hex
+  runtime_secret_hex="$("$PYTHON" -c 'import secrets; print(secrets.token_hex(32))')"
   cleanup
   # Disable vLLM's in-process prefix cache for this external-KV experiment.
   # Both pair members have the same setting; reuse comes only from the
@@ -125,7 +127,7 @@ run_one() {
   ASTRAKV_RUNTIME_CONTROL_PROCESS_SCOPE=engine_child ASTRAKV_RUNTIME_CONTROL_RUN_ID="$run_id" \
   ASTRAKV_RUNTIME_CONTROL_STATE_DIR="$state_dir" ASTRAKV_RUNTIME_CONTROL_ENGINE_ID="$run_id-engine" \
   ASTRAKV_RUNTIME_CONTROL_WORKER_ID=worker-0 ASTRAKV_RUNTIME_CONTROL_CONTEXT_PORT="$CONTEXT_PORT" \
-  ASTRAKV_RUNTIME_CONTROL_SESSION_ID="$run_id-session" ASTRAKV_RUNTIME_CONTROL_SECRET_HEX="$("$PYTHON" -c 'import secrets; print(secrets.token_hex(32))')" \
+  ASTRAKV_RUNTIME_CONTROL_SESSION_ID="$run_id-session" ASTRAKV_RUNTIME_CONTROL_SECRET_HEX="$runtime_secret_hex" \
   ASTRAKV_KV_CORE_MODE="$mode" ASTRAKV_KV_CORE_TOPOLOGY="$topology" \
   ASTRAKV_KV_CORE_LOCAL_CPU="$([[ "$topology" == gpu_cpu_ssd ]] && echo true || echo false)" \
   ASTRAKV_KV_CORE_PATCH_VERIFICATION="$OUTPUT_DIR/connector_patch_verification.json" \
@@ -142,7 +144,8 @@ run_one() {
     --random-seed 0 --cache-state "$cache_state" --connector-version "lmcache-vllm-v1-0.4.7" \
     --pair-id "${label}-${workload}-${cache_state}" --pair-role "$role" --claim-scope kv_core \
     --runtime-state-dir "$state_dir" --request-context-url "http://${HOST}:${CONTEXT_PORT}/request-context" \
-    --request-context-session-id "$run_id-session" --timeout "$TIMEOUT" --output-tokens 128
+    --request-context-session-id "$run_id-session" --request-context-secret-hex "$runtime_secret_hex" \
+    --timeout "$TIMEOUT" --output-tokens 128
   # These artifacts are emitted by the version-locked connector patch after
   # native events.  Do not synthesize estimated receipts or block capacity.
   for artifact in kv_core_native_receipts.jsonl kv_core_request_accounting.jsonl kv_core_prefetch_tickets.jsonl uma_resource_samples.jsonl kv_core_run_metadata.json; do

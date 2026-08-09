@@ -125,6 +125,7 @@ class RequestResult:
     endpoint_response_id: str = ""
     request_started_s: float = 0.0
     request_ended_s: float = 0.0
+    prefetch_lead_s: float | None = None
     sample_path: str = ""
     attribution_mode: str = "unattributed"
     request_nonce: str = ""
@@ -533,8 +534,10 @@ def run_one_request(
     request_metadata = request_metadata or {}
     cpu_before = cpu_rss_mb()
     gpu_before, gpu_probe = gpu_memory_mb()
-    request_started_s = time.time()
-    started = time.perf_counter()
+    # The context may be intentionally published before HTTP dispatch for a
+    # deterministic request-level prefetch window.  TTFT remains defined from
+    # the actual HTTP submission below, never from context publication.
+    ingress_published_s = time.time()
     ttft_ms: float | None = None
     first_sse_ms: float | None = None
     endpoint_response_id = ""
@@ -553,6 +556,7 @@ def run_one_request(
     runtime_event_id = ""
     request_context_error = ""
     published_context: RuntimeRequestContext | None = None
+    prefetch_lead_s = max(0.0, as_float_or_none(request_metadata.get("prefetch_lead_s")) or 0.0)
     run_id = str(request_metadata.get("run_id") or "")
     task_metadata = request_metadata.get("metadata") if isinstance(request_metadata.get("metadata"), dict) else {}
     supplied_messages = task_metadata.get("messages")
@@ -587,7 +591,7 @@ def run_one_request(
                 request_id=str(request_id),
                 case=case,
                 request_nonce=nonce,
-                request_started_s=request_started_s,
+                request_started_s=ingress_published_s,
                 metadata={
                     "prefix_id": str(request_metadata.get("prefix_id") or ""),
                     "cache_key": str(request_metadata.get("cache_key") or ""),
@@ -595,6 +599,8 @@ def run_one_request(
                     "reuse_bucket": str(request_metadata.get("reuse_bucket") or ""),
                     "reuse_ratio": request_metadata.get("reuse_ratio"),
                     "arrival_index": request_metadata.get("arrival_index"),
+                    "prefetch_lead_s": prefetch_lead_s,
+                    "ingress_published_s": ingress_published_s,
                     "context_length": request_metadata.get("context_length"),
                     "context_length_source": request_metadata.get("context_length_source", ""),
                     "scenario": str(task_metadata.get("scenario") or request_metadata.get("scenario") or ""),
@@ -623,6 +629,10 @@ def run_one_request(
         except Exception as exc:  # Context linkage must not suppress endpoint diagnostics.
             request_context_error = f"{type(exc).__name__}: {exc}"
 
+    if prefetch_lead_s > 0.0:
+        time.sleep(prefetch_lead_s)
+    request_started_s = time.time()
+    started = time.perf_counter()
     request_scope = metrics_collector.request_scope(request_id) if metrics_collector is not None else nullcontext()
     with request_scope:
         try:
@@ -781,6 +791,7 @@ def run_one_request(
         endpoint_response_id=endpoint_response_id,
         request_started_s=request_started_s,
         request_ended_s=request_ended_s,
+        prefetch_lead_s=prefetch_lead_s,
         sample_path=str(metrics_collector.output_csv) if metrics_collector is not None else "",
         attribution_mode=attribution_mode or ("exclusive_request" if metrics_collector is not None else "unattributed"),
         request_nonce=nonce,

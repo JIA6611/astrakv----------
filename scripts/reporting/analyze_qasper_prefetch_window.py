@@ -27,7 +27,7 @@ def main() -> int:
 
     analysis_rows: list[dict[str, object]] = []
     paced_rows: list[dict[str, object]] = []
-    paced_index: dict[str, float] = {}
+    prefetch_leads: dict[str, float] = {}
     required_window_ms = max(0.0, float(args.required_window_ms))
     borderline_ratio = max(0.0, float(args.borderline_ratio))
 
@@ -47,8 +47,8 @@ def main() -> int:
                 feasibility = "window_borderline"
             else:
                 feasibility = "window_insufficient"
-                paced_index[current.request_id] = max(
-                    paced_index.get(current.request_id, 0.0),
+                prefetch_leads[current.request_id] = max(
+                    prefetch_leads.get(current.request_id, 0.0),
                     required_window_ms / 1000.0,
                 )
             analysis_rows.append({
@@ -65,8 +65,13 @@ def main() -> int:
 
     for row in paced_rows:
         request_id = str(row.get("request_id") or "")
-        if request_id in paced_index:
-            row["sleep_before_s"] = max(float(row.get("sleep_before_s") or 0.0), paced_index[request_id])
+        if request_id in prefetch_leads:
+            # This is published intent -> HTTP dispatch time, not a delay
+            # before ingress. It therefore represents a real opportunity for
+            # SSD -> LocalCPUBackend work to overlap before the target runs.
+            row["prefetch_lead_s"] = max(
+                float(row.get("prefetch_lead_s") or 0.0), prefetch_leads[request_id],
+            )
 
     analysis_path = output_dir / "prefetch_window_analysis.jsonl"
     summary_path = output_dir / "prefetch_window_summary.json"
@@ -89,7 +94,7 @@ def main() -> int:
         "arrival_gap_ms": float(args.arrival_gap_ms),
         "counts": dict(sorted(counts.items())),
         "analysis_rows": len(analysis_rows),
-        "paced_request_count": len(paced_index),
+        "prefetch_lead_request_count": len(prefetch_leads),
         "paced_workload_jsonl": str(paced_path),
     }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")

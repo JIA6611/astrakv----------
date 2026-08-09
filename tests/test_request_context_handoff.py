@@ -176,6 +176,49 @@ class RequestContextHandoffTests(unittest.TestCase):
             self.assertEqual(record["request_nonce"], "11111111-1111-4111-8111-111111111111")
             self.assertEqual(RuntimeRequestContext.from_record(record), published[0])
 
+    def test_prefetch_lead_publishes_exact_context_before_http_dispatch(self) -> None:
+        publication_order: list[str] = []
+        client = InMemoryLoopbackRequestContextClient(
+            "http://127.0.0.1:9988/request-context",
+            responder=lambda context: publication_order.append("context") or RequestContextReceipt(
+                run_id=context.run_id,
+                request_id=context.request_id,
+                request_nonce=context.request_nonce,
+                runtime_request_id="runtime-prefetch-lead",
+                runtime_event_id="runtime-prefetch-lead-event",
+                status="associated",
+            ),
+        )
+        stream = iter([
+            {"choices": [{"delta": {"content": "ok"}}]},
+            {"usage": {"completion_tokens": 1}, "choices": []},
+        ])
+
+        def record_dispatch(*_args, **_kwargs):
+            publication_order.append("http")
+            return stream
+
+        with patch("scripts.benchmark.run_real_benchmark.time.sleep") as sleep, patch(
+            "scripts.benchmark.run_real_benchmark.stream_chat_completion",
+            side_effect=record_dispatch,
+        ):
+            result = run_one_request(
+                base_url="http://endpoint", api_key="empty", model="model", backend="backend",
+                case="prefetch-lead", request_id="prefetch-lead-request", batch_size=1,
+                context_length=4, output_tokens=2, timeout=1, temperature=0, top_p=1,
+                system_prompt="system", prompt_seed="seed", prompt_token_scale=1,
+                request_metadata={
+                    "run_id": "run-prefetch-lead", "prefetch_lead_s": 0.05,
+                    "exact_token_ids": [1, 2, 3],
+                },
+                request_nonce="66666666-6666-4666-8666-666666666666",
+                request_context_client=client,
+            )
+
+        self.assertEqual(publication_order, ["context", "http"])
+        sleep.assert_called_once_with(0.05)
+        self.assertEqual(result.prefetch_lead_s, 0.05)
+
     def test_unmatched_or_nonloopback_context_cannot_claim_a_runtime_link(self) -> None:
         with self.assertRaisesRegex(ValueError, "loopback"):
             InMemoryLoopbackRequestContextClient("http://192.168.1.7/context", lambda _context: None)

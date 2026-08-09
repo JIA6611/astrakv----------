@@ -50,6 +50,22 @@ class RuntimeWorkloadContractTests(unittest.TestCase):
             with self.assertRaises(WorkloadContractError):
                 load_runtime_workload_jsonl(path)
 
+    def test_contract_keeps_prefetch_lead_distinct_from_arrival_sleep(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            path = Path(raw_tmp) / "workload.jsonl"
+            path.write_text(
+                json.dumps(valid_row(sleep_before_s=1.5, prefetch_lead_s=0.05)) + "\n",
+                encoding="utf-8",
+            )
+            row = load_runtime_workload_jsonl(path)[0]
+            self.assertEqual(row.sleep_before_s, 1.5)
+            self.assertEqual(row.prefetch_lead_s, 0.05)
+            self.assertEqual(row.to_record()["prefetch_lead_s"], 0.05)
+
+            path.write_text(json.dumps(valid_row(prefetch_lead_s=-0.1)) + "\n", encoding="utf-8")
+            with self.assertRaises(WorkloadContractError):
+                load_runtime_workload_jsonl(path)
+
     def test_contract_rejects_missing_duplicates_and_invalid_reuse(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             path = Path(raw_tmp) / "workload.jsonl"

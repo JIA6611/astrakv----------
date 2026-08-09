@@ -40,6 +40,7 @@ class RuntimeWorkloadRow:
     expected_output_tokens: int | None = None
     batch_size: int | None = None
     sleep_before_s: float | None = None
+    prefetch_lead_s: float | None = None
     case: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -58,6 +59,7 @@ class RuntimeWorkloadRow:
             "expected_output_tokens": self.expected_output_tokens,
             "batch_size": self.batch_size,
             "sleep_before_s": self.sleep_before_s,
+            "prefetch_lead_s": self.prefetch_lead_s,
             "case": self.case,
             "metadata": dict(self.metadata),
         }
@@ -110,6 +112,7 @@ def runtime_workload_row_from_record(record: dict[str, Any], *, line_number: int
     expected_output_tokens = _optional_int(record.get("expected_output_tokens"), "expected_output_tokens", prefix)
     batch_size = _optional_int(record.get("batch_size"), "batch_size", prefix)
     sleep_before_s = _optional_float(record.get("sleep_before_s"), "sleep_before_s", prefix)
+    prefetch_lead_s = _optional_float(record.get("prefetch_lead_s"), "prefetch_lead_s", prefix)
     for name, value, minimum in (
         ("arrival_index", arrival_index, 0),
         ("context_length", context_length, 0),
@@ -120,6 +123,8 @@ def runtime_workload_row_from_record(record: dict[str, Any], *, line_number: int
             raise WorkloadContractError(f"{prefix}{name} must be >= {minimum}")
     if sleep_before_s is not None and sleep_before_s < 0.0:
         raise WorkloadContractError(f"{prefix}sleep_before_s must be >= 0")
+    if prefetch_lead_s is not None and prefetch_lead_s < 0.0:
+        raise WorkloadContractError(f"{prefix}prefetch_lead_s must be >= 0")
     return RuntimeWorkloadRow(
         request_id=request_id,
         prompt=prompt,
@@ -133,6 +138,7 @@ def runtime_workload_row_from_record(record: dict[str, Any], *, line_number: int
         expected_output_tokens=expected_output_tokens,
         batch_size=batch_size,
         sleep_before_s=sleep_before_s,
+        prefetch_lead_s=prefetch_lead_s,
         case=str(record.get("case") or ""),
         metadata=record.get("metadata") if isinstance(record.get("metadata"), dict) else {},
     )

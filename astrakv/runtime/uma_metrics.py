@@ -31,6 +31,72 @@ def _read_int(path: Path) -> int | None:
     return parsed if parsed >= 0 else None
 
 
+def resolve_cgroup_memory_current_path(
+    *,
+    proc_cgroup_path: Path | str = "/proc/self/cgroup",
+    proc_mountinfo_path: Path | str = "/proc/self/mountinfo",
+) -> Path | None:
+    """Resolve this process's cgroup-v2 ``memory.current`` file.
+
+    A cgroup-v2 mount need not expose memory-controller files at its root.
+    On the DGX host, for example, an SSH or tmux child belongs to a nested
+    ``user.slice/...scope`` while ``/sys/fs/cgroup/memory.current`` does not
+    exist.  Reading the root path and converting failure to zero would turn a
+    missing measurement into false UMA evidence, so resolve the process's
+    actual cgroup before each snapshot instead.
+    """
+    try:
+        cgroup_rows = Path(proc_cgroup_path).read_text(encoding="utf-8").splitlines()
+        mount_rows = Path(proc_mountinfo_path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+
+    cgroup_path: str | None = None
+    for row in cgroup_rows:
+        parts = row.split(":", 2)
+        if len(parts) == 3 and parts[0] == "0" and parts[1] == "":
+            cgroup_path = parts[2]
+            break
+    if not cgroup_path:
+        return None
+
+    for row in mount_rows:
+        fields = row.split()
+        try:
+            separator = fields.index("-")
+        except ValueError:
+            continue
+        if separator + 1 >= len(fields) or fields[separator + 1] != "cgroup2":
+            continue
+        if len(fields) < 5:
+            continue
+        mount_root, mount_point = fields[3], fields[4]
+        try:
+            relative = Path(cgroup_path).relative_to(mount_root)
+        except ValueError:
+            continue
+        candidate = Path(mount_point) / relative / "memory.current"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def current_cgroup_memory_evidence() -> tuple[int | None, str, str]:
+    """Return ``(bytes, status, path)`` for the current process cgroup.
+
+    Zero is intentionally not considered valid evidence for an active runtime
+    callback.  It is returned as ``unavailable`` rather than silently
+    promoted to a physical-memory measurement.
+    """
+    path = resolve_cgroup_memory_current_path()
+    if path is None:
+        return None, "unavailable", ""
+    value = _read_int(path)
+    if value is None or value <= 0:
+        return value, "unavailable", str(path)
+    return value, "valid", str(path)
+
+
 def _rss_bytes(status_path: Path) -> int | None:
     try:
         rows = status_path.read_text(encoding="utf-8").splitlines()
@@ -60,6 +126,8 @@ def _disk_usage_bytes(path: Path) -> int | None:
 class UMAResourceSnapshot:
     timestamp_ns: int
     cgroup_memory_current_bytes: int | None
+    cgroup_memory_status: str
+    cgroup_memory_current_path: str
     process_rss_bytes: int | None
     vllm_available_kv_blocks: int | None
     lmcache_cpu_used_bytes: int | None
@@ -78,14 +146,16 @@ class UMAResourceCollector:
     def __init__(
         self,
         *,
-        cgroup_memory_current_path: Path | str = "/sys/fs/cgroup/memory.current",
+        cgroup_memory_current_path: Path | str | None = None,
         process_status_path: Path | str = "/proc/self/status",
         ssd_path: Path | str | None = None,
         topology: str = "gpu_ssd",
     ) -> None:
         if topology not in {"gpu_ssd", "gpu_cpu_ssd"}:
             raise ValueError("unsupported KV-Core topology")
-        self.cgroup_memory_current_path = Path(cgroup_memory_current_path)
+        self.cgroup_memory_current_path = (
+            None if cgroup_memory_current_path is None else Path(cgroup_memory_current_path)
+        )
         self.process_status_path = Path(process_status_path)
         self.ssd_path = None if ssd_path is None else Path(ssd_path)
         self.topology = topology
@@ -94,9 +164,17 @@ class UMAResourceCollector:
         lmcache = lmcache or {}
         vllm = vllm or {}
         disk_io = disk_io or {}
+        if self.cgroup_memory_current_path is None:
+            cgroup_value, cgroup_status, cgroup_path = current_cgroup_memory_evidence()
+        else:
+            cgroup_value = _read_int(self.cgroup_memory_current_path)
+            cgroup_status = "valid" if cgroup_value is not None and cgroup_value > 0 else "unavailable"
+            cgroup_path = str(self.cgroup_memory_current_path)
         return UMAResourceSnapshot(
             timestamp_ns=int(timestamp_ns),
-            cgroup_memory_current_bytes=_read_int(self.cgroup_memory_current_path),
+            cgroup_memory_current_bytes=cgroup_value,
+            cgroup_memory_status=cgroup_status,
+            cgroup_memory_current_path=cgroup_path,
             process_rss_bytes=_rss_bytes(self.process_status_path),
             vllm_available_kv_blocks=_non_negative_optional(vllm.get("available_kv_blocks")),
             lmcache_cpu_used_bytes=_non_negative_optional(lmcache.get("cpu_used_bytes")),
@@ -117,4 +195,7 @@ def _non_negative_optional(value: Any, *, fallback_path: Path | None = None) -> 
     return result if result >= 0 else None
 
 
-__all__ = ["UMA_RESOURCE_SCHEMA", "UMAResourceCollector", "UMAResourceSnapshot"]
+__all__ = [
+    "UMA_RESOURCE_SCHEMA", "UMAResourceCollector", "UMAResourceSnapshot",
+    "current_cgroup_memory_evidence", "resolve_cgroup_memory_current_path",
+]

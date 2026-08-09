@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from astrakv.runtime.uma_metrics import UMAResourceCollector
+from astrakv.runtime.uma_metrics import UMAResourceCollector, resolve_cgroup_memory_current_path
 
 
 class UMAResourceCollectorTests(unittest.TestCase):
@@ -34,6 +34,27 @@ class UMAResourceCollectorTests(unittest.TestCase):
         snapshot = UMAResourceCollector(cgroup_memory_current_path=root / "cgroup", process_status_path=root / "status").snapshot(timestamp_ns=1)
         self.assertIsNone(snapshot.cgroup_memory_current_bytes)
         self.assertIsNone(snapshot.process_rss_bytes)
+
+    def test_resolves_nested_cgroup_v2_memory_file_instead_of_root_path(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            cgroup_file = root / "user.slice" / "user-1005.slice" / "session.scope" / "memory.current"
+            cgroup_file.parent.mkdir(parents=True)
+            cgroup_file.write_text("8192\n", encoding="utf-8")
+            proc_cgroup = root / "cgroup"
+            proc_mountinfo = root / "mountinfo"
+            proc_cgroup.write_text("0::/user.slice/user-1005.slice/session.scope\n", encoding="utf-8")
+            proc_mountinfo.write_text(
+                f"24 23 0:22 / {root} rw,nosuid,nodev - cgroup2 cgroup rw\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                resolve_cgroup_memory_current_path(
+                    proc_cgroup_path=proc_cgroup,
+                    proc_mountinfo_path=proc_mountinfo,
+                ),
+                cgroup_file,
+            )
 
 
 if __name__ == "__main__":

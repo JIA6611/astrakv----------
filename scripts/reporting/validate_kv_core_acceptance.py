@@ -386,6 +386,26 @@ def resource_peaks(rows: list[dict[str, Any]]) -> dict[str, int | None]:
     return result
 
 
+def uma_measurement_status(rows: list[dict[str, Any]], peaks: dict[str, int | None]) -> str:
+    """Classify physical-memory evidence without upgrading missing data.
+
+    RSS is useful for diagnosis but is not a GB10 UMA total-memory proof.  A
+    cgroup measurement is accepted only when the runtime emitted at least one
+    positive value from a resolver that explicitly marked it valid.
+    """
+    cgroup_rows = [
+        row for row in rows
+        if row.get("cgroup_memory_status") == "valid"
+        and isinstance(row.get("cgroup_memory_current_bytes"), int)
+        and int(row["cgroup_memory_current_bytes"]) > 0
+    ]
+    if cgroup_rows and (peaks.get("cgroup_memory_current_bytes") or 0) > 0:
+        return "cgroup_valid"
+    if (peaks.get("process_rss_bytes") or 0) > 0:
+        return "process_rss_only"
+    return "unavailable"
+
+
 def aggregate_throughput(rows: list[dict[str, Any]]) -> float | None:
     total_tokens = 0.0
     starts: list[float] = []
@@ -588,7 +608,12 @@ def main() -> int:
     baseline_resources, variant_resources = resource_peaks(baseline_uma), resource_peaks(variant_uma)
     base_peak = baseline_resources["cgroup_memory_current_bytes"]
     variant_peak = variant_resources["cgroup_memory_current_bytes"]
-    if args.phase != "E1" and (base_peak is None or variant_peak is None):
+    baseline_uma_status = uma_measurement_status(baseline_uma, baseline_resources)
+    variant_uma_status = uma_measurement_status(variant_uma, variant_resources)
+    cgroup_evidence_valid = (
+        baseline_uma_status == "cgroup_valid" and variant_uma_status == "cgroup_valid"
+    )
+    if args.phase != "E1" and not cgroup_evidence_valid:
         errors.append("uma_evidence_missing")
     elif args.phase != "E1" and variant_peak is not None and base_peak is not None and variant_peak > base_peak * 1.02:
         errors.append("uma_peak_regression")
@@ -648,7 +673,10 @@ def main() -> int:
         "prefetch_benefit_eligible": prefetch_benefit_eligible,
         "partial_load_benefit_eligible": partial_benefit_eligible,
         "request_accounting_count": len(accounting),
-        "uma_measurement": "not_measured" if args.phase == "E1" and (base_peak is None or variant_peak is None) else "observed",
+        "uma_measurement": {
+            "baseline": baseline_uma_status,
+            "variant": variant_uma_status,
+        },
     }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

@@ -39,6 +39,7 @@ from astrakv.runtime.lmcache047_bootstrap import (
 )
 from astrakv.runtime.offline_kv_profile import OfflineKVProfileIndex, PrefixRuntimeHint
 from astrakv.runtime.third_party_patch import PATCH_ID, REQUIRED_CALLBACKS
+from astrakv.runtime.uma_metrics import current_cgroup_memory_evidence
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -1343,10 +1344,7 @@ class VendorCallbackBridge:
         self._append_uma_sample(callback)
 
     def _append_uma_sample(self, callback: str) -> None:
-        try:
-            cgroup = int(Path("/sys/fs/cgroup/memory.current").read_text().strip())
-        except (OSError, ValueError):
-            cgroup = 0
+        cgroup, cgroup_status, cgroup_path = current_cgroup_memory_evidence()
         rss = 0
         try:
             for line in Path("/proc/self/status").read_text().splitlines():
@@ -1362,6 +1360,8 @@ class VendorCallbackBridge:
         self._append("uma_resource_samples.jsonl", {
             "timestamp_ns": time.time_ns(), "callback": callback,
             "cgroup_memory_current_bytes": cgroup, "process_rss_bytes": rss,
+            "cgroup_memory_status": cgroup_status,
+            "cgroup_memory_current_path": cgroup_path,
             "lmcache_cpu_occupancy_bytes": capability.cpu_used_bytes,
             "lmcache_cpu_capacity_bytes": capability.cpu_capacity_bytes,
             "lmcache_ssd_occupancy_bytes": capability.ssd_used_bytes,

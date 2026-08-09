@@ -606,6 +606,14 @@ def run_one_request(
                     "context_length": request_metadata.get("context_length"),
                     "context_length_source": request_metadata.get("context_length_source", ""),
                     "scenario": str(task_metadata.get("scenario") or request_metadata.get("scenario") or ""),
+                    # Reserved for the version-locked, same-engine KV
+                    # equivalence probe. The runtime ignores it unless its
+                    # dedicated test environment flag is enabled.
+                    "kv_core_equivalence_mode": str(
+                        task_metadata.get("kv_core_equivalence_mode")
+                        or request_metadata.get("kv_core_equivalence_mode")
+                        or ""
+                    ),
                     "workload_case": str(request_metadata.get("case") or ""),
                     "cache_state": str(request_metadata.get("cache_state") or ""),
                     "object_key": str(
@@ -994,6 +1002,8 @@ def run_workload_rows(
         collector = start_metrics_collector(args, output_dir, case)
         prompt = str(row["prompt"])
         context_length, context_length_source = resolve_workload_context_length(row)
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        configured_generation_seed = as_int_or_none(metadata.get("generation_seed"))
         result = run_one_request(
             base_url=args.base_url, api_key=args.api_key, model=args.model, backend=args.backend,
             case=case, request_id=request_id, batch_size=max(1, as_int_or_none(row.get("batch_size")) or 1),
@@ -1014,7 +1024,11 @@ def run_workload_rows(
             request_context_client=request_context_client,
             request_context_artifact=request_context_artifact,
             request_context_association_path=request_context_association_path,
-            generation_seed=stable_generation_seed(args.random_seed, request_id),
+            generation_seed=(
+                configured_generation_seed
+                if configured_generation_seed is not None
+                else stable_generation_seed(args.random_seed, request_id)
+            ),
             tokenizer_path=args.tokenizer_path,
             tokenizer_revision=args.tokenizer_revision,
             chat_template_revision=args.chat_template_revision,

@@ -60,6 +60,12 @@ def _env_int(name: str, default: int = 0) -> int:
         return default
 
 
+def _exact_token_sequence_hash(tokens: Iterable[int]) -> str:
+    """Hash a complete token sequence without conflating it with KV identity."""
+    payload = json.dumps([int(token) for token in tokens], separators=(",", ":"))
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()
+
+
 def _owns_runtime_control_host(connector: Any) -> bool:
     """Return whether this connector process may bind the control-plane port.
 
@@ -91,6 +97,11 @@ class VendorCallbackBridge:
         self._keys_by_request: dict[str, tuple[Any, ...]] = {}
         self._prefetch_by_request: dict[str, str] = {}
         self._ingress_started_ns: dict[str, int] = {}
+        # This set exists only for the in-engine KV equivalence probe. It uses
+        # a complete exact-token digest rather than a request-ID guess because
+        # scheduler lookup legally precedes ReqMeta association. It is inert
+        # unless the explicit test environment flag is enabled.
+        self._equivalence_force_recompute_token_hashes: set[str] = set()
         self._lookup_started_ns: dict[str, int] = {}
         self._seen_callbacks: set[str] = set()
         self._prefetch_request_seen: set[str] = set()
@@ -148,6 +159,14 @@ class VendorCallbackBridge:
         if not request_id:
             return
         self._ingress_started_ns[request_id] = time.time_ns()
+        if (
+            _env_flag("ASTRAKV_KV_CORE_EQUIVALENCE_TEST")
+            and str(metadata.get("kv_core_equivalence_mode") or "") == "force_recompute"
+            and tokens
+        ):
+            self._equivalence_force_recompute_token_hashes.add(
+                _exact_token_sequence_hash(tokens)
+            )
         if not tokens:
             return
         request_configs = metadata.get("request_configs")
@@ -234,6 +253,7 @@ class VendorCallbackBridge:
                         available_external_tokens=available_hit,
                         priority=int(priority),
                         logical_request_id=logical_request_id,
+                        token_sequence_hash=_exact_token_sequence_hash(tokens),
                     )
                     callbacks.submit_intent(RequestKVIntent(
                         request_id=request_id,
@@ -622,10 +642,15 @@ class VendorCallbackBridge:
         available_external_tokens: int,
         priority: int,
         logical_request_id: str,
+        token_sequence_hash: str,
     ) -> int:
         available = max(0, int(available_external_tokens))
         if not self._active_admission() or available == 0:
             return available
+        if self._consume_equivalence_force_recompute(
+            logical_request_id, requested_tokens, token_sequence_hash,
+        ):
+            return 0
         chunk = physical.compatibility_key.chunk_size_tokens
         profile_hint = self._profile_hint(physical)
         configured_cap = _env_int("ASTRAKV_KV_CORE_EXTERNAL_TOKEN_CAP", available)
@@ -722,6 +747,35 @@ class VendorCallbackBridge:
             "timestamp_ns": time.time_ns(),
         })
         return cap if decision.action == "admit_external_prefix" else 0
+
+    def _consume_equivalence_force_recompute(
+        self,
+        logical_request_id: str,
+        requested_tokens: int,
+        token_sequence_hash: str,
+    ) -> bool:
+        """One-shot, test-only recompute control keyed by exact full tokens.
+
+        Scheduler lookup intentionally occurs before ReqMeta association. The
+        authenticated ingress context therefore authorizes this probe through
+        an exact complete-token digest, never by guessing a native request ID.
+        """
+        if (
+            not _env_flag("ASTRAKV_KV_CORE_EQUIVALENCE_TEST")
+            or token_sequence_hash not in self._equivalence_force_recompute_token_hashes
+        ):
+            return False
+        self._equivalence_force_recompute_token_hashes.remove(token_sequence_hash)
+        self._append("kv_core_policy_decisions.jsonl", {
+            "request_id": logical_request_id,
+            "action": "recompute_missing_suffix",
+            "reason": "equivalence_probe_force_recompute",
+            "requested_prefix_tokens": int(requested_tokens),
+            "exact_token_sequence_hash": token_sequence_hash,
+            "test_only": True,
+            "timestamp_ns": time.time_ns(),
+        })
+        return True
 
     def _schedule_cpu_promotion(
         self,
@@ -1679,6 +1733,7 @@ class VendorCallbackBridge:
             "lmcache_chunk_size_tokens": getattr(connector, "_lmcache_chunk_size", None),
             "vendor_patch": True,
             "legacy_owner_load_enabled": False,
+            "equivalence_test_enabled": _env_flag("ASTRAKV_KV_CORE_EQUIVALENCE_TEST"),
             "observed_at_ns": time.time_ns(),
         }
         (self._state_dir / "kv_core_run_metadata.json").write_text(

@@ -303,7 +303,11 @@ for workload in "${SELECTED_WORKLOADS[@]}"; do
       case "$phase" in
         E1) run_pair E1 E0 E1 "$workload" "$cache_state" ;;
         E2) run_pair E2 E0 E2 "$workload" "$cache_state" ;;
-        E3) run_pair E3 E2 E3 "$workload" "$cache_state" ;;
+        # Keep the CPU tier, request-scoped native admission, and the
+        # symmetric disk-backed CPU invalidation fixed. E3 then isolates only
+        # the SSD->CPU prefetch switch instead of conflating it with E2's
+        # gpu_ssd topology.
+        E3) run_pair E3 E3C E3 "$workload" "$cache_state" ;;
         E3C) run_pair E3C E3C E3C "$workload" "$cache_state" ;;
         E4) run_pair E4 E3 E4 "$workload" "$cache_state" ;;
       esac

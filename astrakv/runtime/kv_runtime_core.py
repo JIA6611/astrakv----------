@@ -349,15 +349,6 @@ class PrefetchTicketStore:
                 failure_reason=_required(reason, "reason"),
             )
 
-    def mark_wasted(self, prefetch_id: str, *, reason: str, now_ns: int | None = None) -> PrefetchTicket:
-        with self._lock:
-            ticket = self._require_open(prefetch_id, now_ns=now_ns, allow_completed=True)
-            return self._replace(
-                ticket,
-                PrefetchStatus.WASTED,
-                failure_reason=_required(reason, "reason"),
-            )
-
     def consume(
         self,
         prefetch_id: str,

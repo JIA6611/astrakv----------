@@ -211,7 +211,7 @@ class RequestContextHandoffTests(unittest.TestCase):
                     "run_id": "run-prefetch-lead", "prefetch_lead_s": 0.05,
                     "exact_token_ids": [1, 2, 3],
                 },
-                request_nonce="66666666-6666-4666-8666-666666666666",
+                request_nonce="77777777-7777-4777-8777-777777777777",
                 request_context_client=client,
             )
 

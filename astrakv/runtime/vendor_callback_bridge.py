@@ -111,6 +111,14 @@ class VendorCallbackBridge:
         self._bootstrap_loads = 0
         self._ssd_bytes_per_ms_ema = 0.0
         self._prefill_ms_per_token_ema = _env_float("ASTRAKV_KV_CORE_PREFILL_MS_PER_TOKEN", 0.0)
+        # ``scheduler_compute_progress`` is emitted immediately before each
+        # native execution step.  The following callback closes the previous
+        # step, so its elapsed time is an online, scheduler-owned prefill
+        # observation.  This avoids guessing a load-vs-recompute cost from
+        # prompt text or HTTP timing.
+        self._pending_prefill_steps: dict[str, tuple[int, int]] = {}
+        self._scheduled_prefix_tokens: dict[str, int] = {}
+        self._prefill_observation_count = 0
         state = os.environ.get("ASTRAKV_RUNTIME_CONTROL_STATE_DIR", "")
         self._state_dir = Path(state) if state else None
         self._profile_index: OfflineKVProfileIndex | None = None
@@ -343,17 +351,82 @@ class VendorCallbackBridge:
         callbacks = self._callbacks()
         if callbacks is None:
             return
+        now_ns = time.time_ns()
         try:
+            self._observe_completed_prefill_step(request_id, now_ns=now_ns)
+            scheduled = max(0, int(scheduled_tokens))
             callbacks.record_scheduler_compute(
-                request_id=request_id, scheduled_tokens=max(0, int(scheduled_tokens)),
+                request_id=request_id, scheduled_tokens=scheduled,
             )
+            intent = callbacks.intent_for(request_id)
+            admitted = callbacks.admission_for(request_id)
+            prefix_seen = self._scheduled_prefix_tokens.get(
+                request_id,
+                0 if admitted is None else admitted.allocated_external_tokens,
+            )
+            requested_prefix = 0 if intent is None else intent.requested_prefix_tokens
+            prefill_tokens = min(scheduled, max(0, requested_prefix - prefix_seen))
+            self._scheduled_prefix_tokens[request_id] = prefix_seen + prefill_tokens
+            if prefill_tokens > 0:
+                self._pending_prefill_steps[request_id] = (now_ns, prefill_tokens)
             self._record("scheduler_compute_progress", {
-                "request_id": request_id, "scheduled_tokens": max(0, int(scheduled_tokens)),
+                "request_id": request_id,
+                "scheduled_tokens": scheduled,
+                "prefill_tokens": prefill_tokens,
             })
         except ValueError as exc:
             self._record("scheduler_compute_progress", {
                 "request_id": request_id, "status": "rejected", "reason": str(exc),
             })
+
+    def _observe_completed_prefill_step(self, request_id: str, *, now_ns: int) -> None:
+        """Update the prefill-cost EMA from a completed native scheduler step.
+
+        The vendor callback has no direct model-runner timing API in the
+        supported vLLM 0.23.0/LMCache 0.4.7 integration.  Consecutive
+        scheduler progress callbacks are the narrowest native boundary that
+        surrounds an executed batch.  We retain only chunk-sized prompt work,
+        reject impossible/outlier samples, and write every accepted or
+        rejected observation to an independent audit artifact.
+        """
+        pending = self._pending_prefill_steps.pop(request_id, None)
+        if pending is None or not _env_flag("ASTRAKV_KV_CORE_PREFILL_ONLINE_CALIBRATION"):
+            return
+        started_ns, tokens = pending
+        elapsed_ns = max(0, int(now_ns) - started_ns)
+        elapsed_ms = elapsed_ns / 1_000_000.0
+        minimum_tokens = max(1, _env_int("ASTRAKV_KV_CORE_PREFILL_SAMPLE_MIN_TOKENS", 32))
+        maximum_ms_per_token = _env_float(
+            "ASTRAKV_KV_CORE_PREFILL_SAMPLE_MAX_MS_PER_TOKEN", 5.0,
+        )
+        sample = elapsed_ms / tokens if tokens > 0 else 0.0
+        accepted = (
+            tokens >= minimum_tokens
+            and elapsed_ns > 0
+            and sample > 0.0
+            and maximum_ms_per_token > 0.0
+            and sample <= maximum_ms_per_token
+        )
+        previous = self._prefill_ms_per_token_ema
+        if accepted:
+            alpha = min(1.0, max(0.0, _env_float("ASTRAKV_KV_CORE_PREFILL_EMA_ALPHA", 0.25)))
+            self._prefill_ms_per_token_ema = (
+                sample if previous <= 0.0 else (1.0 - alpha) * previous + alpha * sample
+            )
+            self._prefill_observation_count += 1
+        self._append("kv_core_cost_observations.jsonl", {
+            "schema": "astrakv-kv-core-cost-observation-v1",
+            "request_id": request_id,
+            "source": "scheduler_compute_progress",
+            "prefill_tokens": tokens,
+            "elapsed_ns": elapsed_ns,
+            "sample_ms_per_token": sample,
+            "accepted": accepted,
+            "previous_prefill_ms_per_token": previous,
+            "observed_prefill_ms_per_token": self._prefill_ms_per_token_ema,
+            "observation_count": self._prefill_observation_count,
+            "timestamp_ns": int(now_ns),
+        })
 
     def connector_metadata(self, *, request_id: str, metadata_present: bool, can_load: bool) -> None:
         receipt = self._associate_runtime_request(request_id)
@@ -591,6 +664,11 @@ class VendorCallbackBridge:
             return
         completed = "ABORT" not in finish_status.upper() and "ERROR" not in finish_status.upper()
         try:
+            # A final request callback also closes the last prefill step when
+            # no later scheduler callback exists (for example, zero-token
+            # generation).  Decode-only steps are filtered by the same
+            # minimum-token guard used by the online calibration path.
+            self._observe_completed_prefill_step(request_id, now_ns=time.time_ns())
             receipt = self._read_native_receipt(request_id)
             if receipt is not None:
                 callbacks.import_native_load_receipt(receipt, physical=physical)
@@ -620,12 +698,61 @@ class VendorCallbackBridge:
                 finish_status=finish_status,
                 completed=completed,
             )
+            self._finalize_local_prefetch_for_terminal(
+                logical_request_id=self._logical_request_id(request_id),
+                completed=completed,
+            )
         except (TypeError, ValueError) as exc:
             self._record("request_finished", {
                 "request_id": request_id, "native_request_id": request_id,
                 "logical_request_id": self._logical_request_id(request_id),
                 "status": "rejected", "reason": str(exc),
             })
+        finally:
+            self._pending_prefill_steps.pop(request_id, None)
+            self._scheduled_prefix_tokens.pop(request_id, None)
+
+    def _finalize_local_prefetch_for_terminal(
+        self,
+        *,
+        logical_request_id: str,
+        completed: bool,
+    ) -> None:
+        """Settle target tickets immediately when this bridge owns CPU tier state.
+
+        The state-dir watcher remains necessary for split scheduler/worker
+        processes.  In the supported single-worker ``kv_both`` topology the
+        native request-finished callback executes in the same process as
+        LocalCPUBackend, so waiting for a later poll can leave a completed
+        ticket unaccounted when the benchmark stops the service immediately.
+        """
+        callbacks = self._callbacks()
+        if callbacks is None or self._storage_manager() is None:
+            return
+        for ticket in callbacks.tickets.snapshot(
+            statuses=(PrefetchStatus.SUBMITTED, PrefetchStatus.COMPLETED),
+        ):
+            if ticket.target_request_id != logical_request_id:
+                continue
+            try:
+                settled = (
+                    callbacks.tickets.mark_wasted(
+                        ticket.prefetch_id,
+                        reason="target_finished_without_consumption",
+                    )
+                    if completed
+                    else callbacks.tickets.cancel(
+                        ticket.prefetch_id,
+                        reason="target_cancelled_or_failed",
+                    )
+                )
+            except ValueError:
+                continue
+            future = self._prefetch_futures.get(ticket.prefetch_id)
+            if future is not None:
+                future.cancel()
+            self._demote_prefetch_keys(ticket.prefetch_id)
+            self._append_ticket(settled)
 
     def _active_admission(self) -> bool:
         callbacks = self._callbacks()

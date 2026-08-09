@@ -184,7 +184,8 @@ run_one() {
   ASTRAKV_KV_CORE_PARTIAL_PREFIX_UPPER_BOUND_ENABLED="$partial" \
   ASTRAKV_KV_CORE_EXTERNAL_TOKEN_CAP="8192" ASTRAKV_KV_CORE_PARTIAL_PREFIX_TOKENS="2048" \
   ASTRAKV_KV_CORE_BOOTSTRAP_LOADS="2" ASTRAKV_KV_CORE_SSD_READ_GBPS="3.0" \
-  ASTRAKV_KV_CORE_PREFILL_MS_PER_TOKEN="${ASTRAKV_PAIR_PREFILL_MS_PER_TOKEN:-0}" \
+  ASTRAKV_KV_CORE_PREFILL_ONLINE_CALIBRATION=true ASTRAKV_KV_CORE_PREFILL_SAMPLE_MIN_TOKENS=32 \
+  ASTRAKV_KV_CORE_PREFILL_SAMPLE_MAX_MS_PER_TOKEN=5.0 ASTRAKV_KV_CORE_PREFILL_EMA_ALPHA=0.25 \
   ASTRAKV_KV_CORE_OFFLINE_PROFILE="$OFFLINE_PROFILE" \
   nohup bash scripts/launch/launch_lmcache_vllm.sh "$backend" > "$log_path" 2>&1 < /dev/null &
   SERVER_PID="$!"
@@ -214,7 +215,7 @@ run_one() {
   assert_lmcache_runtime_healthy "$log_path"
   # These artifacts are emitted by the version-locked connector patch after
   # native events.  Do not synthesize estimated receipts or block capacity.
-  for artifact in callback-smoke.json kv_core_native_callbacks.jsonl kv_core_native_receipts.jsonl kv_core_request_accounting.jsonl request_context_associations.jsonl kv_core_prefetch_tickets.jsonl kv_core_policy_decisions.jsonl uma_resource_samples.jsonl kv_core_run_metadata.json; do
+  for artifact in callback-smoke.json kv_core_native_callbacks.jsonl kv_core_native_receipts.jsonl kv_core_request_accounting.jsonl request_context_associations.jsonl kv_core_prefetch_tickets.jsonl kv_core_policy_decisions.jsonl kv_core_cost_observations.jsonl uma_resource_samples.jsonl kv_core_run_metadata.json; do
     if [[ -f "$state_dir/$artifact" ]]; then
       cp "$state_dir/$artifact" "$run_dir/$artifact"
     elif [[ "$phase" =~ ^E[2-4]$ && "$artifact" == kv_core_request_accounting.jsonl ]]; then
@@ -270,24 +271,10 @@ max_local_disk_size: 80.0
 EOF
   ASTRAKV_CONTROL_TOPOLOGY="$control_topology" \
     LMCACHE_CONFIG_FILE="$baseline_cache_config" run_one "$label" "$baseline_phase" baseline "$workload" "$cache_state" "$label"
-  local prefill_ms_per_token
-  prefill_ms_per_token="$("$PYTHON" - "$OUTPUT_DIR/$label/$workload/$cache_state/baseline/request_results.jsonl" <<'PY'
-import json
-import statistics
-import sys
-values = []
-with open(sys.argv[1], encoding="utf-8") as handle:
-    for line in handle:
-        row = json.loads(line)
-        ttft = row.get("ttft_ms")
-        tokens = row.get("context_length")
-        if isinstance(ttft, (int, float)) and isinstance(tokens, int) and ttft > 0 and tokens > 0:
-            values.append(float(ttft) / tokens)
-print(statistics.median(values) if values else 0.0)
-PY
-)"
-  ASTRAKV_PAIR_PREFILL_MS_PER_TOKEN="$prefill_ms_per_token" \
-    ASTRAKV_CONTROL_TOPOLOGY="$control_topology" \
+  # Both arms learn their admission cost from their own native scheduler
+  # callbacks. Do not derive variant policy inputs from baseline HTTP TTFT:
+  # TTFT includes queueing and I/O and would violate the paired control.
+  ASTRAKV_CONTROL_TOPOLOGY="$control_topology" \
     LMCACHE_CONFIG_FILE="$variant_cache_config" run_one "$label" "$variant_phase" variant "$workload" "$cache_state" "$label"
   if ! "$PYTHON" scripts/reporting/validate_kv_core_acceptance.py \
       --baseline "$OUTPUT_DIR/$label/$workload/$cache_state/baseline" \

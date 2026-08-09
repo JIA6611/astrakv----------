@@ -111,6 +111,7 @@ write_control() {
   "local_cpu_enabled": true,
   "local_disk_enabled": true,
   "admission_enabled": true,
+  "prefill_online_calibration_enabled": true,
   "invalidate_disk_backed_cpu_on_prefetch_lead": true,
   "cpu_prefetch_enabled": $prefetch,
   "output_tokens": $OUTPUT_TOKENS,
@@ -153,6 +154,8 @@ EOF
   ASTRAKV_KV_CORE_TOPOLOGY=gpu_cpu_ssd ASTRAKV_KV_CORE_LOCAL_CPU=true \
   ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD=true \
   ASTRAKV_KV_CORE_ADMISSION_ENABLED=true ASTRAKV_KV_CORE_CPU_PREFETCH_ENABLED="$prefetch" \
+  ASTRAKV_KV_CORE_PREFILL_ONLINE_CALIBRATION=true ASTRAKV_KV_CORE_PREFILL_SAMPLE_MIN_TOKENS=32 \
+  ASTRAKV_KV_CORE_PREFILL_SAMPLE_MAX_MS_PER_TOKEN=5.0 ASTRAKV_KV_CORE_PREFILL_EMA_ALPHA=0.25 \
   ASTRAKV_KV_CORE_PATCH_VERIFICATION="$OUTPUT_DIR/connector_patch_verification.json" \
   ASTRAKV_KV_CORE_EXTERNAL_TOKEN_CAP=8192 ASTRAKV_KV_CORE_BOOTSTRAP_LOADS=2 \
   ASTRAKV_KV_CORE_SSD_READ_GBPS=3.0 ASTRAKV_KV_CORE_PREFETCH_DEADLINE_NS=5000000000 \
@@ -179,7 +182,7 @@ EOF
     --request-context-session-id "$run_id-session" --request-context-secret-hex "$secret_hex" \
     --timeout "$TIMEOUT" --output-tokens "$OUTPUT_TOKENS"
   assert_lmcache_healthy "$log_path"
-  for artifact in callback-smoke.json kv_core_native_callbacks.jsonl kv_core_native_receipts.jsonl kv_core_request_accounting.jsonl request_context_associations.jsonl kv_core_prefetch_tickets.jsonl kv_core_policy_decisions.jsonl kv_core_run_metadata.json uma_resource_samples.jsonl; do
+  for artifact in callback-smoke.json kv_core_native_callbacks.jsonl kv_core_native_receipts.jsonl kv_core_request_accounting.jsonl request_context_associations.jsonl kv_core_prefetch_tickets.jsonl kv_core_policy_decisions.jsonl kv_core_cost_observations.jsonl kv_core_run_metadata.json uma_resource_samples.jsonl; do
     [[ -f "$state_dir/$artifact" ]] && cp "$state_dir/$artifact" "$run_dir/$artifact"
   done
   cleanup

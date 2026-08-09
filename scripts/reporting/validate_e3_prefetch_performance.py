@@ -59,7 +59,7 @@ def validate(baseline: Path, variant: Path) -> dict[str, Any]:
 
     baseline_tickets = read_jsonl(baseline / "kv_core_prefetch_tickets.jsonl")
     variant_tickets = read_jsonl(variant / "kv_core_prefetch_tickets.jsonl")
-    validate_ticket_evidence(baseline_tickets, variant_tickets, errors)
+    validate_ticket_evidence(baseline_tickets, variant_tickets, revisits, errors)
     validate_native_accounting(
         read_jsonl(baseline / "kv_core_request_accounting.jsonl"),
         revisits, "baseline", errors,
@@ -67,6 +67,12 @@ def validate(baseline: Path, variant: Path) -> dict[str, Any]:
     validate_native_accounting(
         read_jsonl(variant / "kv_core_request_accounting.jsonl"),
         revisits, "variant", errors,
+    )
+    validate_cost_observations(
+        read_jsonl(baseline / "kv_core_cost_observations.jsonl"), "baseline", errors,
+    )
+    validate_cost_observations(
+        read_jsonl(variant / "kv_core_cost_observations.jsonl"), "variant", errors,
     )
     ttft = paired_ttft(baseline_requests, variant_requests, revisits)
     if ttft["count"] == 0:
@@ -97,6 +103,7 @@ def validate_controls(baseline: dict[str, Any], variant: dict[str, Any], errors:
         "local_cpu_enabled": True,
         "local_disk_enabled": True,
         "admission_enabled": True,
+        "prefill_online_calibration_enabled": True,
         "invalidate_disk_backed_cpu_on_prefetch_lead": True,
     }
     for label, control, expected_prefetch in (
@@ -149,7 +156,10 @@ def validate_associations(rows: list[dict[str, Any]], label: str, errors: list[s
 
 
 def validate_ticket_evidence(
-    baseline: list[dict[str, Any]], variant: list[dict[str, Any]], errors: list[str],
+    baseline: list[dict[str, Any]],
+    variant: list[dict[str, Any]],
+    revisit_ids: Iterable[str],
+    errors: list[str],
 ) -> None:
     if any(str(row.get("source_tier")) == "ssd" and str(row.get("target_tier")) == "cpu" for row in baseline):
         errors.append("baseline_emitted_prefetch_ticket")
@@ -163,6 +173,13 @@ def validate_ticket_evidence(
     if not consumed:
         errors.append("variant_prefetch_consumption_missing")
         return
+    consumed_by_target = {
+        str(row.get("target_request_id") or ""): row
+        for row in consumed
+    }
+    for request_id in revisit_ids:
+        if request_id not in consumed_by_target:
+            errors.append(f"variant_prefetch_not_consumed:{request_id}")
     for row in consumed:
         if row.get("consumer_request_id") != row.get("target_request_id"):
             errors.append("prefetch_consumer_request_mismatch")
@@ -197,6 +214,27 @@ def validate_native_accounting(
             errors.append(f"{label}_native_accounting_invariant_failed:{request_id}")
         if loaded <= 0:
             errors.append(f"{label}_native_load_missing:{request_id}")
+
+
+def validate_cost_observations(
+    rows: list[dict[str, Any]], label: str, errors: list[str],
+) -> None:
+    accepted: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            valid = (
+                row.get("accepted") is True
+                and str(row.get("source") or "") == "scheduler_compute_progress"
+                and int(row.get("prefill_tokens") or 0) > 0
+                and float(row.get("sample_ms_per_token") or 0.0) > 0.0
+                and float(row.get("observed_prefill_ms_per_token") or 0.0) > 0.0
+            )
+        except (TypeError, ValueError):
+            valid = False
+        if valid:
+            accepted.append(row)
+    if not accepted:
+        errors.append(f"{label}_online_prefill_cost_missing")
 
 
 def paired_ttft(

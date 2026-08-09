@@ -28,6 +28,7 @@ class E3PrefetchPerformanceTests(unittest.TestCase):
         )
         source = runner.read_text(encoding="utf-8")
         self.assertIn("--claim-scope kv_core", source)
+        self.assertIn("ASTRAKV_KV_CORE_PREFILL_ONLINE_CALIBRATION=true", source)
         self.assertNotIn("--claim-scope exploratory_prefetch_only", source)
         self.assertNotIn("--connector-version lmcache-vllm-v1-0.4.7 \\\n+    #", source)
 
@@ -51,6 +52,7 @@ class E3PrefetchPerformanceTests(unittest.TestCase):
                 (path / "e3_prefetch_control.json").write_text(json.dumps({
                     "mode": "active", "topology": "gpu_cpu_ssd", "local_cpu_enabled": True,
                     "local_disk_enabled": True, "admission_enabled": True,
+                    "prefill_online_calibration_enabled": True,
                     "invalidate_disk_backed_cpu_on_prefetch_lead": True,
                     "cpu_prefetch_enabled": prefetch, "model": "Qwen3-8B", "dtype": "bfloat16",
                     "output_tokens": 16, "prefetch_lead_s": 0.25,
@@ -68,6 +70,14 @@ class E3PrefetchPerformanceTests(unittest.TestCase):
                     "recomputed_tokens": 0,
                 }
                 (path / "kv_core_request_accounting.jsonl").write_text(json.dumps(accounting) + "\n", encoding="utf-8")
+                observation = {
+                    "source": "scheduler_compute_progress", "accepted": True,
+                    "prefill_tokens": 256, "sample_ms_per_token": 0.1,
+                    "observed_prefill_ms_per_token": 0.1,
+                }
+                (path / "kv_core_cost_observations.jsonl").write_text(
+                    json.dumps(observation) + "\n", encoding="utf-8",
+                )
             ticket = {
                 "prefetch_id": "ticket", "source_tier": "ssd", "target_tier": "cpu", "status": "consumed",
                 "completed_bytes": 1, "target_request_id": "e3-prefetch-x-revisit-01",
@@ -76,10 +86,14 @@ class E3PrefetchPerformanceTests(unittest.TestCase):
             }
             (variant / "kv_core_prefetch_tickets.jsonl").write_text(json.dumps(ticket) + "\n", encoding="utf-8")
             result = validate(baseline, variant)
+            (baseline / "kv_core_cost_observations.jsonl").unlink()
+            missing_cost = validate(baseline, variant)
         self.assertTrue(result["measurement_valid"])
         self.assertFalse(result["correctness_accepted"])
         self.assertFalse(result["eligible_for_e4"])
         self.assertAlmostEqual(result["ttft_ms"]["p95_delta_percent"], -20.0)
+        self.assertFalse(missing_cost["measurement_valid"])
+        self.assertIn("baseline_online_prefill_cost_missing", missing_cost["errors"])
 
 
 if __name__ == "__main__":

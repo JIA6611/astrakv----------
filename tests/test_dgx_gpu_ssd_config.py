@@ -44,6 +44,9 @@ class DGXGPUSSDConfigTests(unittest.TestCase):
         self.assertIn('local local_cpu="false" local_cpu_size="2.0"', script)
         self.assertIn("assert_lmcache_runtime_healthy", script)
         self.assertIn("No eviction candidates found in local cpu backend", script)
+        self.assertIn("ASTRAKV_KV_CORE_PREFILL_ONLINE_CALIBRATION=true", script)
+        self.assertIn("kv_core_cost_observations.jsonl", script)
+        self.assertNotIn("ASTRAKV_PAIR_PREFILL_MS_PER_TOKEN", script)
 
 
 if __name__ == "__main__":

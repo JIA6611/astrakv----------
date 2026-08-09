@@ -8,7 +8,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from astrakv.runtime.kv_core_connector import KVCoreConnectorCallbacks
-from astrakv.runtime.kv_runtime_core import RuntimeMode, TierCapabilitySnapshot, TierTopology
+from astrakv.runtime.kv_runtime_core import (
+    PrefetchStatus,
+    PrefetchTicket,
+    RuntimeMode,
+    TierCapabilitySnapshot,
+    TierTopology,
+)
 from astrakv.runtime.request_context import RequestContextReceipt
 from astrakv.runtime.vendor_callback_bridge import VendorCallbackBridge, _owns_runtime_control_host
 
@@ -203,6 +209,122 @@ class VendorCallbackBridgeTests(unittest.TestCase):
             ledger = json.loads(intent_files[0].read_text(encoding="utf-8"))
             self.assertEqual(ledger["max_external_tokens"], 2)
             self.assertEqual(ledger["logical_request_id"], "native-request")
+
+    def test_scheduler_progress_calibrates_prefill_cost_before_next_admission(self) -> None:
+        callbacks = KVCoreConnectorCallbacks(
+            mode=RuntimeMode.ACTIVE,
+            capability=TierCapabilitySnapshot(
+                topology=TierTopology.GPU_SSD,
+                local_cpu_enabled=False,
+                local_disk_enabled=True,
+                available_kv_blocks=1024,
+                external_token_cap=128,
+            ),
+        )
+        tokens = tuple(range(128))
+        with tempfile.TemporaryDirectory() as raw_tmp, patch.dict(os.environ, {
+            "ASTRAKV_RUNTIME_CONTROL_STATE_DIR": raw_tmp,
+            "ASTRAKV_KV_CORE_ADMISSION_ENABLED": "true",
+            "ASTRAKV_KV_CORE_EXTERNAL_TOKEN_CAP": "128",
+            "ASTRAKV_KV_CORE_SSD_READ_GBPS": "3.0",
+            "ASTRAKV_KV_CORE_BOOTSTRAP_LOADS": "1",
+            "ASTRAKV_KV_CORE_PREFILL_ONLINE_CALIBRATION": "true",
+            "ASTRAKV_KV_CORE_PREFILL_SAMPLE_MIN_TOKENS": "32",
+            "ASTRAKV_KV_CORE_PREFILL_EMA_ALPHA": "1.0",
+        }, clear=False), patch(
+            "astrakv.runtime.vendor_callback_bridge.installed_kv_core_callbacks",
+            return_value=callbacks,
+        ), patch.object(VendorCallbackBridge, "_start_prefetch_watcher_if_worker"):
+            bridge = VendorCallbackBridge(_connector())
+            bridge.scheduler_exact_lookup(
+                bridge._connector,
+                request_id="calibration-request",
+                token_ids=tokens,
+                request_configs=None,
+                lookup_hit_tokens=0,
+            )
+            bridge.scheduler_compute_progress(
+                request_id="calibration-request", scheduled_tokens=64,
+            )
+            bridge._pending_prefill_steps["calibration-request"] = (1_000_000_000, 64)
+            with patch(
+                "astrakv.runtime.vendor_callback_bridge.time.time_ns",
+                return_value=1_064_000_000,
+            ):
+                bridge.scheduler_compute_progress(
+                    request_id="calibration-request", scheduled_tokens=1,
+                )
+            admitted = bridge.scheduler_exact_lookup(
+                bridge._connector,
+                request_id="measured-request",
+                token_ids=tokens,
+                request_configs=None,
+                lookup_hit_tokens=128,
+            )
+            observations = [
+                json.loads(line)
+                for line in (Path(raw_tmp) / "kv_core_cost_observations.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+        self.assertGreater(admitted, 0)
+        self.assertEqual(bridge._bootstrap_loads, 0)
+        self.assertEqual(len(observations), 1)
+        self.assertTrue(observations[0]["accepted"])
+        self.assertEqual(observations[0]["prefill_tokens"], 64)
+        self.assertAlmostEqual(observations[0]["observed_prefill_ms_per_token"], 1.0)
+
+    def test_local_request_finish_marks_unconsumed_prefetch_wasted(self) -> None:
+        callbacks = KVCoreConnectorCallbacks(
+            mode=RuntimeMode.ACTIVE,
+            capability=TierCapabilitySnapshot(
+                topology=TierTopology.GPU_CPU_SSD,
+                local_cpu_enabled=True,
+                local_disk_enabled=True,
+            ),
+        )
+        connector = _connector()
+        connector.lmcache_engine.storage_manager.storage_backends["LocalCPUBackend"] = _CPU()
+        tokens = tuple(range(8))
+        with tempfile.TemporaryDirectory() as raw_tmp, patch.dict(os.environ, {
+            "ASTRAKV_RUNTIME_CONTROL_STATE_DIR": raw_tmp,
+        }, clear=False), patch(
+            "astrakv.runtime.vendor_callback_bridge.installed_kv_core_callbacks",
+            return_value=callbacks,
+        ), patch.object(VendorCallbackBridge, "_start_prefetch_watcher_if_worker"):
+            bridge = VendorCallbackBridge(connector)
+            physical, keys = bridge._physical(connector, tokens, None)
+            self.assertIsNotNone(physical)
+            assert physical is not None
+            ticket = PrefetchTicket(
+                prefetch_id="ticket-1",
+                physical_object_id=physical.physical_object_id,
+                binding_generation=physical.binding_generation,
+                prefix_hash=physical.compatibility_key.prefix_hash,
+                source_tier="ssd",
+                target_tier="cpu",
+                requested_bytes=1024,
+                deadline_ns=9_000_000_000_000_000_000,
+                expires_at_ns=9_000_000_000_000_000_001,
+                target_request_id="target-request",
+                native_key=physical.native_key,
+                compatibility_identity=physical.compatibility_key.identity,
+            )
+            callbacks.tickets.submit(ticket)
+            bridge._prefetch_keys[ticket.prefetch_id] = keys
+            bridge._finalize_local_prefetch_for_terminal(
+                logical_request_id="target-request", completed=True,
+            )
+            persisted = [
+                json.loads(line)
+                for line in (Path(raw_tmp) / "kv_core_prefetch_tickets.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+        current = callbacks.tickets.get("ticket-1")
+        self.assertIsNotNone(current)
+        self.assertIs(current.status, PrefetchStatus.WASTED)
+        self.assertEqual(persisted[-1]["status"], "wasted")
 
     def test_scheduler_lookup_does_not_associate_before_reqmeta_metadata(self) -> None:
         callbacks = KVCoreConnectorCallbacks(

@@ -23,7 +23,7 @@ fi
 
 echo "Launching vLLM with LMCache backend intent: ${BACKEND}"
 echo "LMCACHE_CONFIG_FILE=${LMCACHE_CONFIG_FILE}"
-if [[ -n "$LMCACHE_DISK_PATH" ]]; then
+if [[ -n "${LMCACHE_DISK_PATH:-}" ]]; then
   echo "LMCache disk path=${LMCACHE_DISK_PATH}"
 fi
 echo "ASTRAKV_KV_TRANSFER_CONFIG=${ASTRAKV_KV_TRANSFER_CONFIG}"

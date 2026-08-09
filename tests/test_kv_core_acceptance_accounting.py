@@ -2,6 +2,7 @@ import unittest
 
 from scripts.reporting.validate_kv_core_acceptance import (
     _association_index,
+    validate_prefetch_disabled,
     validate_variant_request_associations,
     validate_receipts,
     validate_request_accounting,
@@ -131,6 +132,20 @@ class KVCoreAcceptanceAccountingTests(unittest.TestCase):
         validate_receipts(
             [receipt], accounting, errors, association_index=self._association(),
         )
+        self.assertEqual(errors, [])
+
+    def test_e3c_rejects_any_ssd_to_cpu_ticket(self):
+        errors = []
+        validate_prefetch_disabled(
+            [],
+            [{"source_tier": "ssd", "target_tier": "cpu", "prefetch_id": "unexpected"}],
+            errors,
+        )
+        self.assertEqual(errors, ["e3c_prefetch_ticket_emitted:variant"])
+
+    def test_e3c_allows_empty_ticket_artifacts(self):
+        errors = []
+        validate_prefetch_disabled([], [], errors)
         self.assertEqual(errors, [])
 
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# E0--E4 runner for the version-locked Qwen3-8B KV-Core experiment.  It does
+# E0--E4 runner for the version-locked Qwen3-8B KV-Core experiment.  E3C is
+# a CPU-tier A/A correctness control, not a performance phase. It does
 # not send warmup HTTP requests: every request is part of the supplied,
 # content-addressed workload and cache state is explicit in its manifest.
 
@@ -30,7 +31,7 @@ OFFLINE_PROFILE=""
 
 usage() {
   cat <<'EOF'
-Usage: bash scripts/entrypoints/run_kv_core_controlled_suite.sh --workload-dir DIR [--phases E1,E2,E3,E4] [--patch-manifest FILE --callback-smoke FILE] [options]
+Usage: bash scripts/entrypoints/run_kv_core_controlled_suite.sh --workload-dir DIR [--phases E1,E2,E3,E3C,E4] [--patch-manifest FILE --callback-smoke FILE] [options]
 
 DIR must contain these canonical JSONL workloads: repeated_long_prefix,
 random_no_reuse, constrained_kv_churn, queued_concurrency.  Each input must
@@ -70,11 +71,11 @@ IFS=',' read -r -a SELECTED_PHASES <<< "$PHASES"
 [[ "${#SELECTED_PHASES[@]}" -gt 0 ]] || { echo "--phases must not be empty" >&2; exit 2; }
 ACTIVE_PHASE_SELECTED=false
 for phase in "${SELECTED_PHASES[@]}"; do
-  [[ "$phase" =~ ^E[1-4]$ ]] || { echo "invalid phase: $phase" >&2; exit 2; }
+  [[ "$phase" =~ ^E([1-4]|3C)$ ]] || { echo "invalid phase: $phase" >&2; exit 2; }
   [[ "$phase" == E1 ]] || ACTIVE_PHASE_SELECTED=true
 done
 if [[ "$ACTIVE_PHASE_SELECTED" == true ]]; then
-  [[ -f "$PATCH_MANIFEST" && -f "$CALLBACK_SMOKE" ]] || { echo "verified deployment inputs are required for E2-E4" >&2; exit 2; }
+  [[ -f "$PATCH_MANIFEST" && -f "$CALLBACK_SMOKE" ]] || { echo "verified deployment inputs are required for E2-E4 and E3C" >&2; exit 2; }
 fi
 IFS=',' read -r -a SELECTED_WORKLOADS <<< "$WORKLOADS"
 IFS=',' read -r -a SELECTED_CACHE_STATES <<< "$CACHE_STATES"
@@ -146,6 +147,9 @@ run_one() {
     E1) mode="shadow" ;;
     E2) mode="active"; admission="true" ;;
     E3) mode="active"; admission="true"; prefetch="true"; topology="gpu_cpu_ssd"; backend="cpu" ;;
+    # A/A control for CPU-tier correctness. Both members use active native
+    # admission and demand load/recompute, but no SSD->CPU prefetch is allowed.
+    E3C) mode="active"; admission="true"; topology="gpu_cpu_ssd"; backend="cpu" ;;
     E4) mode="active"; admission="true"; prefetch="true"; partial="true"; topology="gpu_cpu_ssd"; backend="cpu" ;;
     *) echo "invalid phase: $phase" >&2; return 2 ;;
   esac
@@ -236,7 +240,7 @@ run_pair() {
   # and makes the synchronous disk-restore allocator busy-loop indefinitely.
   # Two GiB is the LMCache gpu_ssd staging budget, shared by both pair members.
   local local_cpu="false" local_cpu_size="2.0" control_topology="gpu_ssd"
-  if [[ "$variant_phase" == E3 || "$variant_phase" == E4 ]]; then
+  if [[ "$variant_phase" == E3 || "$variant_phase" == E3C || "$variant_phase" == E4 ]]; then
     local_cpu="true"
     control_topology="gpu_cpu_ssd"
     # Budget is intentionally explicit and bounded; the runtime must still
@@ -300,6 +304,7 @@ for workload in "${SELECTED_WORKLOADS[@]}"; do
         E1) run_pair E1 E0 E1 "$workload" "$cache_state" ;;
         E2) run_pair E2 E0 E2 "$workload" "$cache_state" ;;
         E3) run_pair E3 E2 E3 "$workload" "$cache_state" ;;
+        E3C) run_pair E3C E3C E3C "$workload" "$cache_state" ;;
         E4) run_pair E4 E3 E4 "$workload" "$cache_state" ;;
       esac
     done

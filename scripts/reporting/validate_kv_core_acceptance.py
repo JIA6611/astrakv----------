@@ -26,7 +26,7 @@ from astrakv.runtime.third_party_patch import PATCH_ID, REQUIRED_CALLBACKS
 
 
 SCHEMA = "astrakv-kv-core-acceptance-v2"
-PHASES = {"E1", "E2", "E3", "E4"}
+PHASES = {"E1", "E2", "E3", "E3C", "E4"}
 PREFETCH_BENEFIT_WORKLOADS = {"repeated_long_prefix", "queued_concurrency"}
 PARTIAL_LOAD_WORKLOADS = {"repeated_long_prefix", "constrained_kv_churn"}
 
@@ -531,6 +531,19 @@ def validate_prefetch(rows: list[dict[str, Any]], errors: list[str]) -> None:
         errors.append("e3_prefetch_consumption_evidence_missing")
 
 
+def validate_prefetch_disabled(
+    baseline_rows: list[dict[str, Any]],
+    variant_rows: list[dict[str, Any]],
+    errors: list[str],
+) -> None:
+    """Fail closed if the E3C A/A control emitted any prefetch ticket."""
+    for label, rows in (("baseline", baseline_rows), ("variant", variant_rows)):
+        for row in rows:
+            if str(row.get("source_tier")) == "ssd" and str(row.get("target_tier")) == "cpu":
+                errors.append(f"e3c_prefetch_ticket_emitted:{label}")
+                break
+
+
 def load_run_artifact(run: Path, filename: str) -> list[dict[str, Any]]:
     return read_jsonl(run / filename)
 
@@ -615,10 +628,10 @@ def main() -> int:
     )
     if args.phase != "E1" and not cgroup_evidence_valid:
         errors.append("uma_evidence_missing")
-    elif args.phase != "E1" and variant_peak is not None and base_peak is not None and variant_peak > base_peak * 1.02:
+    elif args.phase not in {"E1", "E3C"} and variant_peak is not None and base_peak is not None and variant_peak > base_peak * 1.02:
         errors.append("uma_peak_regression")
     point, interval = paired_ttft_bootstrap(baseline_requests, variant_requests)
-    if point is None:
+    if point is None and args.phase != "E3C":
         errors.append("ttft_evidence_missing")
     if args.phase == "E3" and prefetch_benefit_eligible and (
         point is None or point > -5.0 or interval[1] is None or interval[1] >= 0.0
@@ -626,13 +639,13 @@ def main() -> int:
         errors.append("e3_ttft_acceptance_failed")
     baseline_throughput = aggregate_throughput(baseline_requests)
     variant_throughput = aggregate_throughput(variant_requests)
-    if baseline_throughput is None or variant_throughput is None:
+    if (baseline_throughput is None or variant_throughput is None) and args.phase != "E3C":
         errors.append("throughput_evidence_missing")
-    elif variant_throughput < baseline_throughput * 0.98:
+    elif args.phase != "E3C" and variant_throughput < baseline_throughput * 0.98:
         errors.append("throughput_regression")
     no_reuse_baseline = [row for row in baseline_requests if str(row.get("workload_type")) == "random_no_reuse"]
     no_reuse_variant = [row for row in variant_requests if str(row.get("workload_type")) == "random_no_reuse"]
-    if no_reuse_baseline or no_reuse_variant:
+    if args.phase != "E3C" and (no_reuse_baseline or no_reuse_variant):
         no_reuse_point, _ = paired_ttft_bootstrap(no_reuse_baseline, no_reuse_variant)
         if no_reuse_point is None or no_reuse_point > 2.0:
             errors.append("no_reuse_ttft_regression")
@@ -646,15 +659,21 @@ def main() -> int:
         )
         errors.extend(capacity_errors)
         capacity_status = "passed" if capacity_ok else "failed"
-    if args.phase in {"E3", "E4"}:
+    if args.phase in {"E3", "E3C", "E4"}:
         for label, path in (("baseline", baseline_path), ("variant", variant_path)):
             metadata = runtime_metadata(path)
             if metadata.get("topology") != "gpu_cpu_ssd" or metadata.get("lmcache_local_cpu_enabled") is not True:
                 errors.append(f"e3_local_cpu_topology_not_proven:{label}")
             if metadata.get("disk_backed_cpu_invalidation_on_prefetch_lead") is not True:
                 errors.append(f"e3_disk_backed_cpu_invalidation_not_proven:{label}")
-        if prefetch_benefit_eligible:
+        if args.phase in {"E3", "E4"} and prefetch_benefit_eligible:
             validate_prefetch(load_run_artifact(variant_path, "kv_core_prefetch_tickets.jsonl"), errors)
+        if args.phase == "E3C":
+            validate_prefetch_disabled(
+                load_run_artifact(baseline_path, "kv_core_prefetch_tickets.jsonl"),
+                load_run_artifact(variant_path, "kv_core_prefetch_tickets.jsonl"),
+                errors,
+            )
     if args.phase == "E4" and partial_benefit_eligible:
         # Upper-bound partial load must retain receipt accounting, enforced above.
         partial_rows = [row for row in accounting if int(row.get("allocated_external_tokens") or 0) < int(row.get("lookup_hit_tokens") or 0)]
@@ -673,8 +692,9 @@ def main() -> int:
         "throughput_tokens_s": {"baseline": baseline_throughput, "variant": variant_throughput},
         "vllm_kv_block_budget": {"baseline": baseline_budget, "variant": variant_budget},
         "capacity_claim": {"status": capacity_status, "manifest": capacity_record},
-        "prefetch_benefit_eligible": prefetch_benefit_eligible,
-        "partial_load_benefit_eligible": partial_benefit_eligible,
+        "prefetch_benefit_eligible": prefetch_benefit_eligible and args.phase != "E3C",
+        "partial_load_benefit_eligible": partial_benefit_eligible and args.phase != "E3C",
+        "control_mode": "cpu_tier_aa_no_prefetch" if args.phase == "E3C" else "",
         "request_accounting_count": len(accounting),
         "uma_measurement": {
             "baseline": baseline_uma_status,

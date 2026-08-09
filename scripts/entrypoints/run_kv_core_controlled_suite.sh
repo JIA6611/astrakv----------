@@ -174,6 +174,7 @@ run_one() {
   ASTRAKV_REQUIRE_EXACT_TOKEN_IDS=true \
   ASTRAKV_KV_CORE_MODE="$mode" ASTRAKV_KV_CORE_TOPOLOGY="$topology" \
   ASTRAKV_KV_CORE_LOCAL_CPU="$([[ "$topology" == gpu_cpu_ssd ]] && echo true || echo false)" \
+  ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD="$([[ "$topology" == gpu_cpu_ssd ]] && echo true || echo false)" \
   ASTRAKV_KV_CORE_PATCH_VERIFICATION="$OUTPUT_DIR/connector_patch_verification.json" \
   ASTRAKV_KV_CORE_ADMISSION_ENABLED="$admission" ASTRAKV_KV_CORE_CPU_PREFETCH_ENABLED="$prefetch" \
   ASTRAKV_KV_CORE_PARTIAL_PREFIX_UPPER_BOUND_ENABLED="$partial" \

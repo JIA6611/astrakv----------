@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -46,6 +47,40 @@ class _Disk:
     def contains(self, key, pin):
         del pin
         self.dict.setdefault(key, SimpleNamespace(size=1024))
+        return True
+
+
+class _SelectiveDisk(_Disk):
+    def __init__(self, keys) -> None:
+        super().__init__()
+        self.keys = set(keys)
+
+    def contains(self, key, pin):
+        del pin
+        return key in self.keys
+
+
+class _CPU:
+    use_hot = True
+
+    def __init__(self) -> None:
+        self.cpu_lock = threading.Lock()
+        self.hot_cache = {}
+        self.cache_policy = SimpleNamespace(update_on_force_evict=lambda _key: None)
+        self.removed = []
+
+    def contains(self, key, pin):
+        del pin
+        return key in self.hot_cache
+
+    def remove(self, key, force=True) -> bool:
+        if force:
+            with self.cpu_lock:
+                return self.remove(key, force=False)
+        if key not in self.hot_cache:
+            return False
+        self.hot_cache.pop(key)
+        self.removed.append(key)
         return True
 
 
@@ -272,6 +307,46 @@ class VendorCallbackBridgeTests(unittest.TestCase):
                 num_computed_tokens=0,
             )
             self.assertIsNotNone(callbacks.lookup_for("native-request"))
+
+    def test_prefetch_lead_invalidates_only_disk_backed_target_cpu_chunks(self) -> None:
+        callbacks = KVCoreConnectorCallbacks(
+            mode=RuntimeMode.OFF,
+            capability=TierCapabilitySnapshot(
+                topology=TierTopology.GPU_CPU_SSD, local_cpu_enabled=True, local_disk_enabled=True,
+            ),
+        )
+        connector = _connector()
+        cpu = _CPU()
+        keys = tuple(key for _start, _end, key in connector.lmcache_engine.token_database.process_tokens(tokens=[1, 2, 3, 4]))
+        cpu.hot_cache[keys[0]] = SimpleNamespace(is_pinned=False)
+        cpu.hot_cache[keys[1]] = SimpleNamespace(is_pinned=False)
+        connector.lmcache_engine.storage_manager.storage_backends["LocalDiskBackend"] = _SelectiveDisk([keys[0]])
+        connector.lmcache_engine.storage_manager.storage_backends["LocalCPUBackend"] = cpu
+        with tempfile.TemporaryDirectory() as raw_tmp, patch.dict(os.environ, {
+            "ASTRAKV_RUNTIME_CONTROL_STATE_DIR": raw_tmp,
+            "ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD": "true",
+            "ASTRAKV_KV_CORE_CPU_PREFETCH_ENABLED": "false",
+        }, clear=False), patch(
+            "astrakv.runtime.vendor_callback_bridge.installed_kv_core_callbacks",
+            return_value=callbacks,
+        ), patch.object(VendorCallbackBridge, "_start_prefetch_watcher_if_worker"):
+            bridge = VendorCallbackBridge(connector)
+            bridge.ingress_request(SimpleNamespace(
+                request_id="target", metadata={
+                    "exact_token_ids": [1, 2, 3, 4], "prefetch_lead_s": 0.05,
+                },
+            ))
+            self.assertEqual(cpu.removed, [keys[0]])
+            self.assertIn(keys[1], cpu.hot_cache)
+            records = [
+                json.loads(line)
+                for line in (Path(raw_tmp) / "kv_core_policy_decisions.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            self.assertEqual(records[-1]["action"], "invalidate_external_copy")
+            self.assertEqual(records[-1]["cpu_removed_chunk_count"], 1)
+            self.assertEqual(records[-1]["cpu_only_chunk_count"], 1)
 
 
 if __name__ == "__main__":

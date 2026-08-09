@@ -150,28 +150,49 @@ class VendorCallbackBridge:
         self._ingress_started_ns[request_id] = time.time_ns()
         if not tokens:
             return
-        if self._callbacks() is None or self._callbacks().mode is not RuntimeMode.ACTIVE:
-            return
         request_configs = metadata.get("request_configs")
         normalized_configs = request_configs if isinstance(request_configs, dict) else None
+        callbacks = self._callbacks()
+        active = callbacks is not None and callbacks.mode is RuntimeMode.ACTIVE
+        try:
+            prefetch_lead_s = float(metadata.get("prefetch_lead_s") or 0.0)
+        except (TypeError, ValueError):
+            prefetch_lead_s = 0.0
+        invalidate_disk_backed_cpu = (
+            _env_flag("ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD")
+            and prefetch_lead_s > 0.0
+        )
+        promote = active and _env_flag("ASTRAKV_KV_CORE_CPU_PREFETCH_ENABLED")
         if self._storage_manager() is None:
             # The EngineCore scheduler owns authenticated ingress, while the
             # worker owns LocalDiskBackend/LocalCPUBackend.  Publish the exact
-            # request intent so the worker can overlap promotion with queueing.
-            self._write_prefetch_request(
-                request_id,
-                tokens,
-                normalized_configs,
-                promote=_env_flag("ASTRAKV_KV_CORE_CPU_PREFETCH_ENABLED"),
-            )
-        else:
-            self._publish_tier_observation(request_id, tokens, normalized_configs)
-            if _env_flag("ASTRAKV_KV_CORE_CPU_PREFETCH_ENABLED"):
-                self._schedule_cpu_promotion(
-                    request_id=request_id,
-                    token_ids=tokens,
-                    request_configs=normalized_configs,
+            # request intent so the worker can reset a stale hot copy and,
+            # only for the active variant, overlap promotion with queueing.
+            if invalidate_disk_backed_cpu or active:
+                self._write_prefetch_request(
+                    request_id,
+                    tokens,
+                    normalized_configs,
+                    promote=promote,
+                    invalidate_disk_backed_cpu=invalidate_disk_backed_cpu,
                 )
+            return
+        if invalidate_disk_backed_cpu:
+            self._invalidate_disk_backed_cpu_prefix(
+                request_id=request_id,
+                token_ids=tokens,
+                request_configs=normalized_configs,
+                reason="symmetric_cpu_cold_before_prefetch_lead",
+            )
+        if not active:
+            return
+        self._publish_tier_observation(request_id, tokens, normalized_configs)
+        if promote:
+            self._schedule_cpu_promotion(
+                request_id=request_id,
+                token_ids=tokens,
+                request_configs=normalized_configs,
+            )
 
     def scheduler_exact_lookup(
         self,
@@ -845,7 +866,10 @@ class VendorCallbackBridge:
         ):
             return
         callbacks = self._callbacks()
-        if callbacks is None or callbacks.mode is not RuntimeMode.ACTIVE:
+        if callbacks is None or (
+            callbacks.mode is not RuntimeMode.ACTIVE
+            and not _env_flag("ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD")
+        ):
             return
 
         def watch() -> None:
@@ -864,6 +888,7 @@ class VendorCallbackBridge:
                             expires_at_ns = int(payload["expires_at_ns"])
                             request_configs = payload.get("request_configs")
                             promote = payload.get("promote") is True
+                            invalidate_disk_backed_cpu = payload.get("invalidate_disk_backed_cpu") is True
                             if not isinstance(request_configs, dict):
                                 request_configs = None
                         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
@@ -872,10 +897,17 @@ class VendorCallbackBridge:
                         self._prefetch_request_seen.add(key)
                         if expires_at_ns <= time.time_ns():
                             continue
+                        if invalidate_disk_backed_cpu:
+                            self._invalidate_disk_backed_cpu_prefix(
+                                request_id=request_id,
+                                token_ids=token_ids,
+                                request_configs=request_configs,
+                                reason="symmetric_cpu_cold_before_prefetch_lead",
+                            )
                         self._publish_tier_observation(
                             request_id, token_ids, request_configs,
                         )
-                        if promote:
+                        if promote and callbacks.mode is RuntimeMode.ACTIVE:
                             self._schedule_cpu_promotion(
                                 request_id=request_id,
                                 token_ids=token_ids,
@@ -980,6 +1012,7 @@ class VendorCallbackBridge:
         request_configs: dict[str, Any] | None,
         *,
         promote: bool,
+        invalidate_disk_backed_cpu: bool = False,
     ) -> None:
         if self._state_dir is None:
             return
@@ -994,6 +1027,7 @@ class VendorCallbackBridge:
             "exact_token_ids": list(token_ids),
             "request_configs": request_configs,
             "promote": bool(promote),
+            "invalidate_disk_backed_cpu": bool(invalidate_disk_backed_cpu),
             "created_at_ns": now,
             "expires_at_ns": now + _env_int(
                 "ASTRAKV_KV_CORE_PREFETCH_TTL_NS", 30_000_000_000,
@@ -1002,6 +1036,89 @@ class VendorCallbackBridge:
         temporary = path.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temporary, path)
+
+    def _invalidate_disk_backed_cpu_prefix(
+        self,
+        *,
+        request_id: str,
+        token_ids: tuple[int, ...],
+        request_configs: dict[str, Any] | None,
+        reason: str,
+    ) -> None:
+        """Remove only unpinned target chunks with a confirmed SSD copy.
+
+        ``LocalCPUBackend.clear()`` is intentionally not used: it can erase
+        unrelated or CPU-only objects.  This version-locked operation first
+        verifies each exact native chunk in ``LocalDiskBackend``, then removes
+        only its matching, unpinned CPU-hot copy under LMCache's CPU lock.
+        CPU-only, absent, and pinned chunks remain resident and cannot be
+        misrepresented as SSD-prefetch candidates.
+        """
+        manager = self._storage_manager()
+        backends = {} if manager is None else getattr(manager, "storage_backends", {})
+        cpu, disk = backends.get("LocalCPUBackend"), backends.get("LocalDiskBackend")
+        chunks = self._token_chunks(self._connector, token_ids, request_configs)
+        physical, _native_keys = self._physical(self._connector, token_ids, request_configs)
+        disk_backed_keys: list[Any] = []
+        cpu_only_chunks = 0
+        for _start, _end, key in chunks:
+            try:
+                disk_backed = bool(disk is not None and disk.contains(key, False))
+            except Exception:
+                disk_backed = False
+            if disk_backed:
+                disk_backed_keys.append(key)
+            else:
+                try:
+                    cpu_only_chunks += int(cpu is not None and cpu.contains(key, False))
+                except Exception:
+                    pass
+        removed = 0
+        pinned = 0
+        cpu_missing = 0
+        lock = getattr(cpu, "cpu_lock", None)
+        hot_cache = getattr(cpu, "hot_cache", None)
+        if (
+            cpu is not None and bool(getattr(cpu, "use_hot", False))
+            and lock is not None and callable(getattr(hot_cache, "get", None))
+        ):
+            with lock:
+                for key in disk_backed_keys:
+                    memory_obj = hot_cache.get(key)
+                    if memory_obj is None:
+                        cpu_missing += 1
+                        continue
+                    if bool(getattr(memory_obj, "is_pinned", False)):
+                        pinned += 1
+                        continue
+                    try:
+                        deleted = bool(cpu.remove(key, force=False))
+                        if deleted:
+                            policy = getattr(cpu, "cache_policy", None)
+                            update = getattr(policy, "update_on_force_evict", None)
+                            if callable(update):
+                                update(key)
+                            removed += 1
+                    except (AttributeError, TypeError, ValueError):
+                        continue
+        self._append("kv_core_policy_decisions.jsonl", {
+            "request_id": request_id,
+            "action": "invalidate_external_copy",
+            "tier": "cpu",
+            "reason": reason,
+            "physical_object_id": "" if physical is None else physical.physical_object_id,
+            "binding_generation": 0 if physical is None else physical.binding_generation,
+            "native_key": "" if physical is None else physical.native_key,
+            "compatibility_identity": "" if physical is None else physical.compatibility_key.identity,
+            "prefix_hash": "" if physical is None else physical.compatibility_key.prefix_hash,
+            "requested_chunk_count": len(chunks),
+            "disk_backed_chunk_count": len(disk_backed_keys),
+            "cpu_only_chunk_count": cpu_only_chunks,
+            "cpu_removed_chunk_count": removed,
+            "pinned_cpu_chunk_count": pinned,
+            "cpu_missing_chunk_count": cpu_missing,
+            "timestamp_ns": time.time_ns(),
+        })
 
     def _publish_tier_observation(
         self,
@@ -1536,6 +1653,9 @@ class VendorCallbackBridge:
             "topology": os.environ.get("ASTRAKV_KV_CORE_TOPOLOGY", "unknown"),
             "lmcache_local_cpu_enabled": bool(getattr(config, "local_cpu", False)),
             "lmcache_local_disk_enabled": bool(getattr(config, "local_disk", False)),
+            "disk_backed_cpu_invalidation_on_prefetch_lead": _env_flag(
+                "ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD"
+            ),
             "vllm_kv_block_budget": getattr(cache_config, "num_gpu_blocks", None),
             "vllm_block_size_tokens": getattr(connector, "_block_size", None),
             "lmcache_chunk_size_tokens": getattr(connector, "_lmcache_chunk_size", None),

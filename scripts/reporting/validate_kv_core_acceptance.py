@@ -647,9 +647,12 @@ def main() -> int:
         errors.extend(capacity_errors)
         capacity_status = "passed" if capacity_ok else "failed"
     if args.phase in {"E3", "E4"}:
-        metadata = runtime_metadata(variant_path)
-        if metadata.get("topology") != "gpu_cpu_ssd" or metadata.get("lmcache_local_cpu_enabled") is not True:
-            errors.append("e3_local_cpu_topology_not_proven")
+        for label, path in (("baseline", baseline_path), ("variant", variant_path)):
+            metadata = runtime_metadata(path)
+            if metadata.get("topology") != "gpu_cpu_ssd" or metadata.get("lmcache_local_cpu_enabled") is not True:
+                errors.append(f"e3_local_cpu_topology_not_proven:{label}")
+            if metadata.get("disk_backed_cpu_invalidation_on_prefetch_lead") is not True:
+                errors.append(f"e3_disk_backed_cpu_invalidation_not_proven:{label}")
         if prefetch_benefit_eligible:
             validate_prefetch(load_run_artifact(variant_path, "kv_core_prefetch_tickets.jsonl"), errors)
     if args.phase == "E4" and partial_benefit_eligible:

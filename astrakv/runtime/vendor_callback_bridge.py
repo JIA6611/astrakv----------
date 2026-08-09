@@ -97,10 +97,8 @@ class VendorCallbackBridge:
         self._keys_by_request: dict[str, tuple[Any, ...]] = {}
         self._prefetch_by_request: dict[str, str] = {}
         self._ingress_started_ns: dict[str, int] = {}
-        # This set exists only for the in-engine KV equivalence probe. It uses
-        # a complete exact-token digest rather than a request-ID guess because
-        # scheduler lookup legally precedes ReqMeta association. It is inert
-        # unless the explicit test environment flag is enabled.
+        # In-memory fallback for the same-process equivalence probe. The
+        # authoritative cross-process handoff is an atomic state-dir record.
         self._equivalence_force_recompute_token_hashes: set[str] = set()
         self._lookup_started_ns: dict[str, int] = {}
         self._seen_callbacks: set[str] = set()
@@ -164,8 +162,11 @@ class VendorCallbackBridge:
             and str(metadata.get("kv_core_equivalence_mode") or "") == "force_recompute"
             and tokens
         ):
-            self._equivalence_force_recompute_token_hashes.add(
-                _exact_token_sequence_hash(tokens)
+            token_sequence_hash = _exact_token_sequence_hash(tokens)
+            self._equivalence_force_recompute_token_hashes.add(token_sequence_hash)
+            self._write_equivalence_recompute_intent(
+                token_sequence_hash=token_sequence_hash,
+                logical_request_id=request_id,
             )
         if not tokens:
             return
@@ -760,22 +761,76 @@ class VendorCallbackBridge:
         authenticated ingress context therefore authorizes this probe through
         an exact complete-token digest, never by guessing a native request ID.
         """
-        if (
-            not _env_flag("ASTRAKV_KV_CORE_EQUIVALENCE_TEST")
-            or token_sequence_hash not in self._equivalence_force_recompute_token_hashes
-        ):
+        if not _env_flag("ASTRAKV_KV_CORE_EQUIVALENCE_TEST"):
             return False
-        self._equivalence_force_recompute_token_hashes.remove(token_sequence_hash)
+        intent_path = self._consume_equivalence_recompute_intent(token_sequence_hash)
+        if intent_path is None:
+            return False
+        self._equivalence_force_recompute_token_hashes.discard(token_sequence_hash)
         self._append("kv_core_policy_decisions.jsonl", {
             "request_id": logical_request_id,
             "action": "recompute_missing_suffix",
             "reason": "equivalence_probe_force_recompute",
             "requested_prefix_tokens": int(requested_tokens),
             "exact_token_sequence_hash": token_sequence_hash,
+            "equivalence_intent_path": str(intent_path),
             "test_only": True,
             "timestamp_ns": time.time_ns(),
         })
         return True
+
+    def _equivalence_recompute_intent_path(
+        self, token_sequence_hash: str, *, consumed: bool = False,
+    ) -> Path | None:
+        if self._state_dir is None or len(token_sequence_hash) != 64:
+            return None
+        directory = self._state_dir / "equivalence_recompute_intents"
+        directory.mkdir(parents=True, exist_ok=True)
+        suffix = ".consumed.json" if consumed else ".json"
+        return directory / f"{token_sequence_hash}{suffix}"
+
+    def _write_equivalence_recompute_intent(
+        self, *, token_sequence_hash: str, logical_request_id: str,
+    ) -> None:
+        """Publish test-only intent for the separate EngineCore process."""
+        path = self._equivalence_recompute_intent_path(token_sequence_hash)
+        if path is None:
+            return
+        now_ns = time.time_ns()
+        payload = {
+            "schema": "astrakv-kv-equivalence-intent-v1",
+            "exact_token_sequence_hash": token_sequence_hash,
+            "logical_request_id": logical_request_id,
+            "created_at_ns": now_ns,
+            "expires_at_ns": now_ns + _env_int(
+                "ASTRAKV_KV_CORE_EQUIVALENCE_TEST_TTL_NS", 30_000_000_000,
+            ),
+        }
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+
+    def _consume_equivalence_recompute_intent(self, token_sequence_hash: str) -> Path | None:
+        """Atomically claim an unexpired exact-token test intent once."""
+        path = self._equivalence_recompute_intent_path(token_sequence_hash)
+        consumed_path = self._equivalence_recompute_intent_path(token_sequence_hash, consumed=True)
+        if path is None or consumed_path is None:
+            # Unit-level bridge tests may not use a state directory. Runtime
+            # execution never takes this branch because active mode requires it.
+            return Path("<in-memory>") if token_sequence_hash in self._equivalence_force_recompute_token_hashes else None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            expires_at_ns = int(payload.get("expires_at_ns") or 0)
+            if (
+                payload.get("schema") != "astrakv-kv-equivalence-intent-v1"
+                or payload.get("exact_token_sequence_hash") != token_sequence_hash
+                or expires_at_ns <= time.time_ns()
+            ):
+                return None
+            os.replace(path, consumed_path)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return consumed_path
 
     def _schedule_cpu_promotion(
         self,

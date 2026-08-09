@@ -32,25 +32,79 @@ class KVEquivalenceTests(unittest.TestCase):
         self.assertEqual(rows[-1].metadata["kv_core_equivalence_mode"], "force_recompute")
         self.assertEqual(rows[1].sleep_before_s, 1.0)
 
-    def test_force_recompute_is_one_shot_and_exact_token_scoped(self):
+    def test_force_recompute_is_cross_process_one_shot_and_exact_token_scoped(self):
         with tempfile.TemporaryDirectory() as raw_tmp, patch.dict(os.environ, {
             "ASTRAKV_KV_CORE_EQUIVALENCE_TEST": "true",
             "ASTRAKV_RUNTIME_CONTROL_STATE_DIR": raw_tmp,
         }, clear=False):
-            bridge = VendorCallbackBridge(SimpleNamespace())
+            ingress_bridge = VendorCallbackBridge(SimpleNamespace())
             tokens = (1, 2, 3, 4)
-            bridge.ingress_request(SimpleNamespace(
+            ingress_bridge.ingress_request(SimpleNamespace(
                 request_id="probe", metadata={
                     "exact_token_ids": tokens, "kv_core_equivalence_mode": "force_recompute",
                 },
             ))
             exact_hash = _exact_token_sequence_hash(tokens)
-            self.assertTrue(bridge._consume_equivalence_force_recompute("native", len(tokens), exact_hash))
-            self.assertFalse(bridge._consume_equivalence_force_recompute("native", len(tokens), exact_hash))
-            self.assertFalse(bridge._consume_equivalence_force_recompute("native", len(tokens), _exact_token_sequence_hash((1, 2, 3))))
+            intent_dir = Path(raw_tmp) / "equivalence_recompute_intents"
+            intent_path = intent_dir / f"{exact_hash}.json"
+            self.assertTrue(intent_path.is_file())
+            intent = json.loads(intent_path.read_text(encoding="utf-8"))
+            self.assertEqual(intent["schema"], "astrakv-kv-equivalence-intent-v1")
+            self.assertEqual(intent["exact_token_sequence_hash"], exact_hash)
+            self.assertEqual(intent["logical_request_id"], "probe")
+            self.assertGreater(intent["expires_at_ns"], intent["created_at_ns"])
+
+            # A fresh bridge simulates the separate EngineCore process. It can
+            # observe only the state-dir record, not ingress process memory.
+            engine_core_bridge = VendorCallbackBridge(SimpleNamespace())
+            wrong_hash = _exact_token_sequence_hash((1, 2, 3))
+            self.assertFalse(engine_core_bridge._consume_equivalence_force_recompute(
+                "native", len(tokens), wrong_hash,
+            ))
+            self.assertTrue(engine_core_bridge._consume_equivalence_force_recompute(
+                "native", len(tokens), exact_hash,
+            ))
+            self.assertFalse(intent_path.exists())
+            consumed_path = intent_dir / f"{exact_hash}.consumed.json"
+            self.assertTrue(consumed_path.is_file())
+            self.assertEqual(
+                json.loads(consumed_path.read_text(encoding="utf-8")),
+                intent,
+            )
+            self.assertFalse(engine_core_bridge._consume_equivalence_force_recompute(
+                "native", len(tokens), exact_hash,
+            ))
             records = [json.loads(line) for line in (Path(raw_tmp) / "kv_core_policy_decisions.jsonl").read_text().splitlines()]
             self.assertEqual(records[-1]["reason"], "equivalence_probe_force_recompute")
             self.assertTrue(records[-1]["test_only"])
+            self.assertEqual(records[-1]["equivalence_intent_path"], str(consumed_path))
+
+    def test_force_recompute_rejects_expired_cross_process_intent(self):
+        with tempfile.TemporaryDirectory() as raw_tmp, patch.dict(os.environ, {
+            "ASTRAKV_KV_CORE_EQUIVALENCE_TEST": "true",
+            "ASTRAKV_RUNTIME_CONTROL_STATE_DIR": raw_tmp,
+        }, clear=False):
+            tokens = (5, 6, 7, 8)
+            exact_hash = _exact_token_sequence_hash(tokens)
+            ingress_bridge = VendorCallbackBridge(SimpleNamespace())
+            ingress_bridge.ingress_request(SimpleNamespace(
+                request_id="expired-probe", metadata={
+                    "exact_token_ids": tokens, "kv_core_equivalence_mode": "force_recompute",
+                },
+            ))
+            intent_path = (
+                Path(raw_tmp) / "equivalence_recompute_intents" / f"{exact_hash}.json"
+            )
+            intent = json.loads(intent_path.read_text(encoding="utf-8"))
+            intent["expires_at_ns"] = 0
+            intent_path.write_text(json.dumps(intent), encoding="utf-8")
+
+            engine_core_bridge = VendorCallbackBridge(SimpleNamespace())
+            self.assertFalse(engine_core_bridge._consume_equivalence_force_recompute(
+                "native", len(tokens), exact_hash,
+            ))
+            self.assertTrue(intent_path.is_file())
+            self.assertFalse(intent_path.with_name(f"{exact_hash}.consumed.json").exists())
 
 
 if __name__ == "__main__":

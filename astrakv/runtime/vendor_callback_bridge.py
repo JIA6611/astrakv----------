@@ -766,6 +766,8 @@ class VendorCallbackBridge:
             return
         capability = self._runtime_capability(external_token_cap=0)
         callbacks.update_capability(capability)
+        profile_hint = self._profile_hint(physical)
+        in_flight_reserved_bytes = callbacks.tickets.in_flight_reserved_bytes()
         now = time.time_ns()
         ticket = PrefetchTicket(
             prefetch_id=f"prefetch:{request_id}:{physical.binding_generation}:{now}",
@@ -781,15 +783,31 @@ class VendorCallbackBridge:
             native_key=physical.native_key,
             compatibility_identity=physical.compatibility_key.identity,
         )
-        reason = callbacks.begin_cpu_prefetch(ticket, physical, now_ns=now)
-        profile_hint = self._profile_hint(physical)
-        if reason is None and profile_hint is not None and capability.cpu_prefetch_budget_bytes > 0:
+        reason: str | None = None
+        if profile_hint is not None and capability.cpu_prefetch_budget_bytes > 0:
             budget_utilization = (
-                capability.cpu_prefetch_used_budget_bytes
-                / capability.cpu_prefetch_budget_bytes
-            )
+                capability.cpu_prefetch_used_budget_bytes + in_flight_reserved_bytes
+            ) / capability.cpu_prefetch_budget_bytes
             if budget_utilization > profile_hint.prefetch_priority:
                 reason = "profile_prefetch_priority"
+        if reason is None:
+            reason = callbacks.begin_cpu_prefetch(ticket, physical, now_ns=now)
+        self._append("kv_core_policy_decisions.jsonl", {
+            "action": "prefetch_ssd_to_cpu",
+            "request_id": request_id,
+            "prefetch_id": ticket.prefetch_id,
+            "physical_object_id": physical.physical_object_id,
+            "binding_generation": physical.binding_generation,
+            "requested_bytes": ticket.requested_bytes,
+            "cpu_used_bytes": capability.cpu_used_bytes,
+            "cpu_capacity_bytes": capability.cpu_capacity_bytes,
+            "cpu_prefetch_budget_bytes": capability.cpu_prefetch_budget_bytes,
+            "in_flight_reserved_bytes": in_flight_reserved_bytes,
+            "memory_pressure": capability.memory_pressure,
+            "status": "rejected" if reason is not None else "submitted",
+            "reason": reason or "",
+            "timestamp_ns": time.time_ns(),
+        })
         if reason is not None:
             self._append_ticket(replace(ticket, status=PrefetchStatus.CANCELLED, failure_reason=reason))
             return

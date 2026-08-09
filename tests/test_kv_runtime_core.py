@@ -85,6 +85,36 @@ class KVRuntimeCoreTests(unittest.TestCase):
         )
         self.assertEqual(consumed.status, PrefetchStatus.CONSUMED)
 
+    def test_in_flight_reservation_covers_only_submitted_promotions(self) -> None:
+        store = PrefetchTicketStore()
+        ticket = store.submit(PrefetchTicket(
+            "prefetch-reservation", "physical-0", 2, self.key.prefix_hash, "ssd", "cpu", 128,
+            deadline_ns=2_000_000_000, expires_at_ns=3_000_000_000,
+            native_key=self.object.native_key, compatibility_identity=self.key.identity,
+        ))
+        self.assertEqual(store.in_flight_reserved_bytes(), 128)
+        store.complete(ticket.prefetch_id, completed_bytes=128, now_ns=1_000_000_000)
+        self.assertEqual(store.in_flight_reserved_bytes(), 0)
+        store.consume(
+            ticket.prefetch_id, request_id="request-0", physical_object_id="physical-0",
+            binding_generation=2, prefix_hash=self.key.prefix_hash, now_ns=1_100_000_000,
+            native_key=self.object.native_key, compatibility_identity=self.key.identity,
+        )
+        self.assertEqual(store.in_flight_reserved_bytes(), 0)
+
+    def test_prefetch_budget_includes_only_in_flight_reservation(self) -> None:
+        capability = TierCapabilitySnapshot(
+            TierTopology.GPU_CPU_SSD, local_cpu_enabled=True, local_disk_enabled=True,
+            cpu_capacity_bytes=1024, ssd_capacity_bytes=1024, uma_available_bytes=10_000,
+        )
+        self.assertEqual(
+            capability.prefetch_block_reason(
+                size_bytes=400, in_flight_reserved_bytes=200,
+                deadline_ns=2_000_000_000, now_ns=1_000_000_000,
+            ),
+            "cpu_prefetch_budget",
+        )
+
     def test_load_receipt_requires_recompute_for_every_unloaded_token(self) -> None:
         receipt = NativeKVLoadReceipt(
             request_id="request-0", physical_object_id="physical-0", binding_generation=2,

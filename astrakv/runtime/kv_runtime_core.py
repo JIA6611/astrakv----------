@@ -223,8 +223,16 @@ class TierCapabilitySnapshot:
     def cpu_prefetch_used_budget_bytes(self) -> int:
         return max(0, self.cpu_used_bytes)
 
-    def prefetch_block_reason(self, *, size_bytes: int, deadline_ns: int, now_ns: int | None = None) -> str | None:
+    def prefetch_block_reason(
+        self,
+        *,
+        size_bytes: int,
+        deadline_ns: int,
+        now_ns: int | None = None,
+        in_flight_reserved_bytes: int = 0,
+    ) -> str | None:
         current = time.time_ns() if now_ns is None else int(now_ns)
+        reserved = _non_negative(in_flight_reserved_bytes, "in_flight_reserved_bytes")
         if not self.local_cpu_enabled or self.topology is not TierTopology.GPU_CPU_SSD:
             return "cpu_tier_unavailable"
         if not self.local_disk_enabled:
@@ -233,9 +241,9 @@ class TierCapabilitySnapshot:
             return "deadline_expired"
         if self.memory_pressure >= 0.90:
             return "uma_memory_pressure"
-        if self.cpu_prefetch_used_budget_bytes + size_bytes > self.cpu_prefetch_budget_bytes:
+        if self.cpu_prefetch_used_budget_bytes + reserved + size_bytes > self.cpu_prefetch_budget_bytes:
             return "cpu_prefetch_budget"
-        if self.cpu_used_bytes + size_bytes > self.cpu_capacity_bytes:
+        if self.cpu_used_bytes + reserved + size_bytes > self.cpu_capacity_bytes:
             return "cpu_capacity"
         return None
 
@@ -395,6 +403,21 @@ class PrefetchTicketStore:
             return tuple(
                 ticket for ticket in self._tickets.values()
                 if allowed is None or ticket.status in allowed
+            )
+
+    def in_flight_reserved_bytes(self) -> int:
+        """Return bytes reserved only by asynchronous SSD->CPU promotions.
+
+        A submitted ticket reserves capacity before LocalCPUBackend reports the
+        promoted object as resident.  Once a promotion completes, its bytes
+        must be charged to the backend's observed occupancy instead; retaining
+        it here would double-count a consumed CPU-hot copy indefinitely.
+        """
+        with self._lock:
+            return sum(
+                ticket.requested_bytes
+                for ticket in self._tickets.values()
+                if ticket.status is PrefetchStatus.SUBMITTED
             )
 
     def _require_open(self, prefetch_id: str, *, now_ns: int | None, allow_completed: bool = False) -> PrefetchTicket:

@@ -139,6 +139,7 @@ class RequestResult:
     output_token_ids: tuple[int, ...] = ()
     finish_reason: str = ""
     deterministic_logprob: float | None = None
+    generation_seed: int | None = None
 
 
 def main() -> int:
@@ -526,6 +527,7 @@ def run_one_request(
     request_context_client: RequestContextClient | None = None,
     request_context_artifact: RequestContextArtifact | None = None,
     request_context_association_path: Path | None = None,
+    generation_seed: int | None = None,
     request_context_reserved: bool = False,
     tokenizer_path: str = "",
     tokenizer_revision: str = "",
@@ -647,6 +649,8 @@ def run_one_request(
                 "user": str(request_id),
                 "_astrakv_request_id": str(request_id),
             }
+            if generation_seed is not None:
+                payload["seed"] = int(generation_seed)
             if backend == "vllm-lmcache-kv-core":
                 # vLLM's documented compatibility extension returns stable
                 # token identifiers in streamed choices.  Other benchmark
@@ -802,6 +806,7 @@ def run_one_request(
         output_token_ids=tuple(output_token_ids),
         finish_reason=finish_reason,
         deterministic_logprob=deterministic_logprob if logprob_observed else None,
+        generation_seed=generation_seed,
     )
 
 
@@ -1009,6 +1014,7 @@ def run_workload_rows(
             request_context_client=request_context_client,
             request_context_artifact=request_context_artifact,
             request_context_association_path=request_context_association_path,
+            generation_seed=stable_generation_seed(args.random_seed, request_id),
             tokenizer_path=args.tokenizer_path,
             tokenizer_revision=args.tokenizer_revision,
             chat_template_revision=args.chat_template_revision,
@@ -1204,6 +1210,10 @@ def finalize_experiment_manifest(output_dir: Path, args: argparse.Namespace, con
         "dtype": args.dtype,
         "quantization": args.quantization,
         "random_seed": args.random_seed,
+        "vllm_seed": os.environ.get("ASTRAKV_VLLM_SEED", ""),
+        "request_seed_scheme": "sha256(random_seed,request_id):first_8_bytes_mod_2^31",
+        "temperature": args.temperature,
+        "top_p": args.top_p,
         "cache_state": args.cache_state,
         "connector_version": args.connector_version,
         "base_url": args.base_url,
@@ -1783,6 +1793,12 @@ def as_float_or_none(value: Any) -> float | None:
 
 def stable_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def stable_generation_seed(random_seed: object, request_id: int | str) -> int:
+    """Derive a per-request OpenAI/vLLM seed without Python hash randomization."""
+    payload = f"{random_seed}\x00{request_id}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % (2**31)
 
 
 def _arrival_sort_key(row: dict[str, Any], fallback: int) -> tuple[int, int]:

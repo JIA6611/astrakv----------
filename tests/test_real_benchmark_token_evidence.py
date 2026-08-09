@@ -6,6 +6,7 @@ from scripts.benchmark.run_real_benchmark import (
     normalize_exact_token_ids,
     resolve_workload_context_length,
     run_one_request,
+    stable_generation_seed,
 )
 
 
@@ -94,6 +95,26 @@ class RealBenchmarkTokenEvidenceTests(unittest.TestCase):
         payload = request.call_args.args[1]
         self.assertTrue(payload["return_token_ids"])
         self.assertNotIn("return_tokens_as_token_ids", payload)
+
+    def test_generation_seed_is_stable_and_is_sent_to_vllm(self) -> None:
+        self.assertEqual(stable_generation_seed("0", "request-a"), stable_generation_seed("0", "request-a"))
+        self.assertNotEqual(stable_generation_seed("0", "request-a"), stable_generation_seed("0", "request-b"))
+        stream = iter([
+            {"choices": [{"delta": {"content": "hello"}, "token_ids": [123]}]},
+            {"choices": [{"finish_reason": "length", "delta": {}}]},
+        ])
+        with patch("scripts.benchmark.run_real_benchmark.stream_chat_completion", return_value=stream) as request:
+            result = run_one_request(
+                base_url="http://endpoint", api_key="empty", model="model",
+                backend="vllm-lmcache-kv-core", case="case", request_id="request-a",
+                batch_size=1, context_length=32, output_tokens=1, timeout=1,
+                temperature=0, top_p=1, system_prompt="system", prompt_seed="seed",
+                prompt_token_scale=1, prompt="prompt", generation_seed=17,
+                request_metadata={"run_id": "run-token-evidence"},
+                request_nonce="66666666-6666-4666-8666-666666666666",
+            )
+        self.assertEqual(result.generation_seed, 17)
+        self.assertEqual(request.call_args.args[1]["seed"], 17)
 
 
 if __name__ == "__main__":

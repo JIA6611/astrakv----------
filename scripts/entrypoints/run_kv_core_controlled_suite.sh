@@ -160,7 +160,7 @@ run_one() {
   # Both pair members have the same setting; reuse comes only from the
   # pair-scoped LMCache disk store.
   ASTRAKV_MODEL="$MODEL" ASTRAKV_HOST="$HOST" ASTRAKV_PORT="$PORT" \
-  PYTHONHASHSEED=0 \
+  PYTHONHASHSEED=0 ASTRAKV_VLLM_SEED=0 \
   ASTRAKV_GPU_MEMORY_UTILIZATION="$GPU_MEMORY_UTILIZATION" ASTRAKV_MAX_MODEL_LEN="32768" \
   LMCACHE_CONFIG_FILE="${LMCACHE_CONFIG_FILE:?pair-scoped LMCache config is required}" \
   ASTRAKV_PREFIX_CACHING=false ASTRAKV_ENABLE_LMCACHE047_HOOKS=true \
@@ -189,7 +189,7 @@ run_one() {
   # The benchmark process is separate from the server child. Repeat only
   # immutable, non-secret controls here so the paired manifest fingerprints
   # the configuration actually used by the server rather than blank values.
-  if ! ASTRAKV_GPU_MEMORY_UTILIZATION="$GPU_MEMORY_UTILIZATION" \
+  if ! ASTRAKV_GPU_MEMORY_UTILIZATION="$GPU_MEMORY_UTILIZATION" ASTRAKV_VLLM_SEED=0 \
     ASTRAKV_MAX_MODEL_LEN="32768" ASTRAKV_PREFIX_CACHING=false \
     ASTRAKV_KV_TRANSFER_CONFIG='{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}' \
     LMCACHE_CONFIG_FILE="${LMCACHE_CONFIG_FILE:?pair-scoped LMCache config is required}" \

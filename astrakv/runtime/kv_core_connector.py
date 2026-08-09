@@ -83,7 +83,10 @@ class KVCoreConnectorCallbacks:
         if physical.source_tier not in {"ssd", "mixed"} or ticket.source_tier != "ssd":
             return "source_tier_not_ssd"
         reason = self.capability.prefetch_block_reason(
-            size_bytes=ticket.requested_bytes, deadline_ns=ticket.deadline_ns, now_ns=now_ns,
+            size_bytes=ticket.requested_bytes,
+            deadline_ns=ticket.deadline_ns,
+            now_ns=now_ns,
+            in_flight_reserved_bytes=self.tickets.in_flight_reserved_bytes(),
         )
         if reason is not None:
             return reason

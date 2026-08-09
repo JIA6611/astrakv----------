@@ -32,6 +32,7 @@ PREFIX_CACHING="${ASTRAKV_PREFIX_CACHING:-true}"
 VLLM_DEV_MODE="${ASTRAKV_VLLM_DEV_MODE:-false}"
 LMCACHE047_HOOKS="${ASTRAKV_ENABLE_LMCACHE047_HOOKS:-false}"
 RUNTIME_CONTROL_RUN_ID="${ASTRAKV_RUNTIME_CONTROL_RUN_ID:-}"
+VLLM_SEED="${ASTRAKV_VLLM_SEED:-0}"
 
 case "$PREFIX_CACHING" in
   true|false) ;;
@@ -52,6 +53,10 @@ if [[ "$LMCACHE047_HOOKS" == "true" ]]; then
   export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
   export ASTRAKV_LMCACHE047_EVENTS="${ASTRAKV_LMCACHE047_EVENTS:-$ROOT/results/lmcache047_events.jsonl}"
   export ASTRAKV_KV_CORE_VENDOR_PATCH="${ASTRAKV_KV_CORE_VENDOR_PATCH:-true}"
+fi
+if ! [[ "$VLLM_SEED" =~ ^[0-9]+$ ]]; then
+  echo "ASTRAKV_VLLM_SEED must be a non-negative integer, got: $VLLM_SEED" >&2
+  exit 2
 fi
 if [[ -n "$RUNTIME_CONTROL_RUN_ID" ]]; then
   if [[ "$LMCACHE047_HOOKS" != "true" ]]; then
@@ -89,6 +94,7 @@ echo "Model=${MODEL} Host=${HOST} Port=${PORT} MaxModelLen=${MAX_MODEL_LEN}"
 echo "Explicit fallback model=${FALLBACK_MODEL}"
 echo "HF_ENDPOINT=${HF_ENDPOINT}"
 echo "PrefixCaching=${PREFIX_CACHING} VllmDevMode=${VLLM_DEV_MODE}"
+echo "VllmSeed=${VLLM_SEED}"
 echo "LMCache047Hooks=${LMCACHE047_HOOKS}"
 if [[ -n "$KV_CACHE_MEMORY_BYTES" ]]; then
   echo "KvCacheMemoryBytes=${KV_CACHE_MEMORY_BYTES}"
@@ -103,6 +109,7 @@ CMD=(
   --host "$HOST"
   --port "$PORT"
   --dtype auto
+  --seed "$VLLM_SEED"
   --gpu-memory-utilization "$GPU_MEMORY"
   --max-model-len "$MAX_MODEL_LEN"
   --tensor-parallel-size "$TENSOR_PARALLEL"

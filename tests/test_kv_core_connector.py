@@ -57,6 +57,28 @@ class KVCoreConnectorCallbackTests(unittest.TestCase):
         callbacks.complete_cpu_prefetch("ticket", completed_bytes=128, now_ns=1_100_000_000)
         self.assertIsNone(callbacks.receipt_for("request"))
 
+    def test_in_flight_ticket_reservation_blocks_overcommit(self) -> None:
+        capability = TierCapabilitySnapshot(
+            TierTopology.GPU_CPU_SSD, True, True, cpu_capacity_bytes=1024,
+            ssd_capacity_bytes=1024, uma_available_bytes=10_000,
+        )
+        callbacks = KVCoreConnectorCallbacks(mode=RuntimeMode.ACTIVE, capability=capability)
+        first = PrefetchTicket(
+            "first", "physical", 1, self.key.prefix_hash, "ssd", "cpu", 400,
+            deadline_ns=2_000_000_000, expires_at_ns=3_000_000_000,
+            native_key=self.physical.native_key, compatibility_identity=self.key.identity,
+        )
+        second = PrefetchTicket(
+            "second", "physical", 1, self.key.prefix_hash, "ssd", "cpu", 200,
+            deadline_ns=2_000_000_000, expires_at_ns=3_000_000_000,
+            native_key=self.physical.native_key, compatibility_identity=self.key.identity,
+        )
+        self.assertIsNone(callbacks.begin_cpu_prefetch(first, self.physical, now_ns=1_000_000_000))
+        self.assertEqual(
+            callbacks.begin_cpu_prefetch(second, self.physical, now_ns=1_000_000_000),
+            "cpu_prefetch_budget",
+        )
+
     def test_scheduler_keeps_true_lookup_count_but_enforces_intent_upper_bound(self) -> None:
         callbacks = KVCoreConnectorCallbacks(mode=RuntimeMode.ACTIVE, capability=self.capability)
         limited = RequestKVIntent("request", self.key, self.physical, 32, 64, deadline_ns=2_000_000_000)

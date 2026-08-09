@@ -29,6 +29,7 @@ class E3PrefetchPerformanceTests(unittest.TestCase):
         source = runner.read_text(encoding="utf-8")
         self.assertIn("--claim-scope kv_core", source)
         self.assertNotIn("--claim-scope exploratory_prefetch_only", source)
+        self.assertNotIn("--connector-version lmcache-vllm-v1-0.4.7 \\\n+    #", source)
 
     def test_materialized_workload_has_one_seed_and_identical_prefetch_targets(self) -> None:
         rows = materialize(source(), revisits=16, prefetch_lead_s=0.25, output_tokens=16)

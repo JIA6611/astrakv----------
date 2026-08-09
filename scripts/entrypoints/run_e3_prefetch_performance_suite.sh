@@ -161,6 +161,9 @@ EOF
   SERVER_PID="$!"
   wait_for_server "$log_path"
   assert_lmcache_healthy "$log_path"
+  # ``run_real_benchmark`` records the native KV runtime contract under its
+  # existing ``kv_core`` manifest scope. The E3-P validator, not this generic
+  # manifest enum, is responsible for keeping the outcome exploratory.
   ASTRAKV_GPU_MEMORY_UTILIZATION="$GPU_MEMORY_UTILIZATION" ASTRAKV_VLLM_SEED=0 \
   ASTRAKV_MAX_MODEL_LEN=32768 ASTRAKV_PREFIX_CACHING=false \
   ASTRAKV_KV_TRANSFER_CONFIG='{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}' \
@@ -171,9 +174,6 @@ EOF
     --model-revision local-qwen3-8b --tokenizer-revision local-qwen3-8b --dtype bfloat16 \
     --quantization unquantized --tokenizer-path "$MODEL" --chat-template-revision qwen3-default \
     --random-seed 0 --cache-state cold --connector-version lmcache-vllm-v1-0.4.7 \
-    # ``run_real_benchmark`` records the native KV runtime contract under its
-    # existing ``kv_core`` manifest scope. The E3-P validator, not this generic
-    # manifest enum, is responsible for keeping the outcome exploratory.
     --pair-id "e3p-repeat-${repeat_dir##*/}" --pair-role "$role" --claim-scope kv_core \
     --runtime-state-dir "$state_dir" --request-context-url "http://${HOST}:${CONTEXT_PORT}/request-context" \
     --request-context-session-id "$run_id-session" --request-context-secret-hex "$secret_hex" \

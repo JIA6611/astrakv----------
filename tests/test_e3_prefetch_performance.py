@@ -21,6 +21,15 @@ def source() -> RuntimeWorkloadRow:
 
 
 class E3PrefetchPerformanceTests(unittest.TestCase):
+    def test_runner_uses_the_supported_kv_core_manifest_scope(self) -> None:
+        runner = (
+            Path(__file__).resolve().parents[1]
+            / "scripts" / "entrypoints" / "run_e3_prefetch_performance_suite.sh"
+        )
+        source = runner.read_text(encoding="utf-8")
+        self.assertIn("--claim-scope kv_core", source)
+        self.assertNotIn("--claim-scope exploratory_prefetch_only", source)
+
     def test_materialized_workload_has_one_seed_and_identical_prefetch_targets(self) -> None:
         rows = materialize(source(), revisits=16, prefetch_lead_s=0.25, output_tokens=16)
         self.assertEqual(len(rows), 17)

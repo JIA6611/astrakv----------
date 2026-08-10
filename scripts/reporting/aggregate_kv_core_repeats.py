@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Aggregate independent validated KV-Core repetitions without pseudo-replication.
 
-Each acceptance file is one independent service startup and paired E0/E2,
-E2/E3, or E3/E4 comparison.  Request rows within a repeat share the same
+Each acceptance file is one independent service startup and a paired
+E0/E2, E2/E3, E3/E4, or E5C/E5 comparison.  Request rows within a repeat share the same
 server and cache-state realization, so this tool resamples repeat clusters
 first and paired requests only within each selected cluster.
 """

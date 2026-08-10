@@ -48,6 +48,18 @@ experiments:
     admission: true
     cpu_prefetch: true
     partial_prefix_upper_bound: true
+  E5C:
+    mode: active
+    admission: true
+    cpu_prefetch: true
+    partial_prefix_upper_bound: true
+    cold_reap: false
+  E5:
+    mode: active
+    admission: true
+    cpu_prefetch: true
+    partial_prefix_upper_bound: true
+    cold_reap: true
 workloads:
   required:
     - repeated_long_prefix

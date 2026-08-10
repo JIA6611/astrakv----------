@@ -31,13 +31,15 @@ OFFLINE_PROFILE=""
 
 usage() {
   cat <<'EOF'
-Usage: bash scripts/entrypoints/run_kv_core_controlled_suite.sh --workload-dir DIR [--phases E1,E2,E3,E3C,E4] [--patch-manifest FILE --callback-smoke FILE] [options]
+Usage: bash scripts/entrypoints/run_kv_core_controlled_suite.sh --workload-dir DIR [--phases E1,E2,E3,E3C,E4,E5,E5C] [--patch-manifest FILE --callback-smoke FILE] [options]
 
 DIR must contain these canonical JSONL workloads: repeated_long_prefix,
 random_no_reuse, constrained_kv_churn, queued_concurrency.  Each input must
 already fix request order, seed, sampling parameters, output length, and cold
 or warm cache-state cases.  Active phases additionally require verified
 connector evidence and real runtime accounting.
+--page-cache-evidence additionally samples mincore residency of the LMCache
+disk store alongside every run (OS virtual-memory evidence for the report).
 EOF
 }
 
@@ -59,6 +61,7 @@ while [[ $# -gt 0 ]]; do
     --cache-states) CACHE_STATES="$2"; shift 2 ;;
     --allow-ineligible) ALLOW_INELIGIBLE=true; shift ;;
     --offline-profile) OFFLINE_PROFILE="$2"; shift 2 ;;
+    --page-cache-evidence) PAGE_CACHE_EVIDENCE=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -71,7 +74,7 @@ IFS=',' read -r -a SELECTED_PHASES <<< "$PHASES"
 [[ "${#SELECTED_PHASES[@]}" -gt 0 ]] || { echo "--phases must not be empty" >&2; exit 2; }
 ACTIVE_PHASE_SELECTED=false
 for phase in "${SELECTED_PHASES[@]}"; do
-  [[ "$phase" =~ ^E([1-4]|3C)$ ]] || { echo "invalid phase: $phase" >&2; exit 2; }
+  [[ "$phase" =~ ^E([1-5]|3C|5C)$ ]] || { echo "invalid phase: $phase" >&2; exit 2; }
   [[ "$phase" == E1 ]] || ACTIVE_PHASE_SELECTED=true
 done
 if [[ "$ACTIVE_PHASE_SELECTED" == true ]]; then
@@ -97,12 +100,19 @@ if [[ "$ACTIVE_PHASE_SELECTED" == true ]]; then
 fi
 
 SERVER_PID=""
+PAGE_CACHE_PID=""
+PAGE_CACHE_EVIDENCE=false
 cleanup() {
   if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill -TERM "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
+  if [[ -n "$PAGE_CACHE_PID" ]] && kill -0 "$PAGE_CACHE_PID" 2>/dev/null; then
+    kill -TERM "$PAGE_CACHE_PID" 2>/dev/null || true
+    wait "$PAGE_CACHE_PID" 2>/dev/null || true
+  fi
   SERVER_PID=""
+  PAGE_CACHE_PID=""
 }
 trap cleanup EXIT INT TERM
 
@@ -140,7 +150,7 @@ run_one() {
   local run_dir="$OUTPUT_DIR/$label/$workload/$cache_state/$role"
   local state_dir="$run_dir/state"
   local log_path="$run_dir/server.log"
-  local backend="disk" topology="gpu_ssd" mode="off" admission="false" prefetch="false" partial="false"
+  local backend="disk" topology="gpu_ssd" mode="off" admission="false" prefetch="false" partial="false" reap="false"
   mkdir -p "$state_dir"
   case "$phase" in
     E0) mode="off" ;;
@@ -151,6 +161,11 @@ run_one() {
     # admission and demand load/recompute, but no SSD->CPU prefetch is allowed.
     E3C) mode="active"; admission="true"; topology="gpu_cpu_ssd"; backend="cpu" ;;
     E4) mode="active"; admission="true"; prefetch="true"; partial="true"; topology="gpu_cpu_ssd"; backend="cpu" ;;
+    # E5 isolates the cold external-copy reaper on top of the E4 configuration
+    # (admission + CPU prefetch + partial prefix). E5C is the A/A control with
+    # the reaper disabled and every other runtime knob identical.
+    E5C) mode="active"; admission="true"; prefetch="true"; partial="true"; topology="gpu_cpu_ssd"; backend="cpu" ;;
+    E5) mode="active"; admission="true"; prefetch="true"; partial="true"; reap="true"; topology="gpu_cpu_ssd"; backend="cpu" ;;
     *) echo "invalid phase: $phase" >&2; return 2 ;;
   esac
   if [[ -n "${ASTRAKV_CONTROL_TOPOLOGY:-}" ]]; then
@@ -182,6 +197,7 @@ run_one() {
   ASTRAKV_KV_CORE_PATCH_VERIFICATION="$OUTPUT_DIR/connector_patch_verification.json" \
   ASTRAKV_KV_CORE_ADMISSION_ENABLED="$admission" ASTRAKV_KV_CORE_CPU_PREFETCH_ENABLED="$prefetch" \
   ASTRAKV_KV_CORE_PARTIAL_PREFIX_UPPER_BOUND_ENABLED="$partial" \
+  ASTRAKV_KV_CORE_COLD_REAP_ENABLED="$reap" \
   ASTRAKV_KV_CORE_EXTERNAL_TOKEN_CAP="8192" ASTRAKV_KV_CORE_PARTIAL_PREFIX_TOKENS="2048" \
   ASTRAKV_KV_CORE_BOOTSTRAP_LOADS="2" ASTRAKV_KV_CORE_SSD_READ_GBPS="3.0" \
   ASTRAKV_KV_CORE_PREFILL_ONLINE_CALIBRATION=true ASTRAKV_KV_CORE_PREFILL_SAMPLE_MIN_TOKENS=32 \
@@ -191,6 +207,19 @@ run_one() {
   SERVER_PID="$!"
   wait_for_server "$log_path"
   assert_lmcache_healthy "$log_path"
+  if [[ "$PAGE_CACHE_EVIDENCE" == "true" ]]; then
+    local disk_dir
+    disk_dir="$(sed -n 's/^local_disk: *//p' "$LMCACHE_CONFIG_FILE")"
+    if [[ -n "$disk_dir" && -d "$disk_dir" ]]; then
+      mkdir -p "$OUTPUT_DIR/page_cache_evidence/$label"
+      nohup "$PYTHON" scripts/runtime/collect_page_cache_evidence.py \
+        --path "$disk_dir" \
+        --output "$OUTPUT_DIR/page_cache_evidence/$label/$workload-$cache_state.jsonl" \
+        --interval-s 1.0 --duration-s "$TIMEOUT" \
+        > "$OUTPUT_DIR/page_cache_evidence/$label/collector.log" 2>&1 < /dev/null &
+      PAGE_CACHE_PID="$!"
+    fi
+  fi
   # The benchmark process is separate from the server child. Repeat only
   # immutable, non-secret controls here so the paired manifest fingerprints
   # the configuration actually used by the server rather than blank values.
@@ -215,10 +244,10 @@ run_one() {
   assert_lmcache_runtime_healthy "$log_path"
   # These artifacts are emitted by the version-locked connector patch after
   # native events.  Do not synthesize estimated receipts or block capacity.
-  for artifact in callback-smoke.json kv_core_native_callbacks.jsonl kv_core_native_receipts.jsonl kv_core_request_accounting.jsonl request_context_associations.jsonl kv_core_prefetch_tickets.jsonl kv_core_policy_decisions.jsonl kv_core_cost_observations.jsonl uma_resource_samples.jsonl kv_core_run_metadata.json; do
+  for artifact in callback-smoke.json kv_core_native_callbacks.jsonl kv_core_native_receipts.jsonl kv_core_request_accounting.jsonl request_context_associations.jsonl kv_core_prefetch_tickets.jsonl kv_core_policy_decisions.jsonl kv_core_cost_observations.jsonl uma_resource_samples.jsonl kv_core_external_reaps.jsonl kv_core_run_metadata.json; do
     if [[ -f "$state_dir/$artifact" ]]; then
       cp "$state_dir/$artifact" "$run_dir/$artifact"
-    elif [[ "$phase" =~ ^E[2-4]$ && "$artifact" == kv_core_request_accounting.jsonl ]]; then
+    elif [[ "$phase" =~ ^E([2-5]|3C|5C)$ && "$artifact" == kv_core_request_accounting.jsonl ]]; then
       echo "Missing required active-phase accounting artifact: $state_dir/$artifact" >&2
       return 1
     fi
@@ -297,6 +326,10 @@ for workload in "${SELECTED_WORKLOADS[@]}"; do
         E3) run_pair E3 E3C E3 "$workload" "$cache_state" ;;
         E3C) run_pair E3C E3C E3C "$workload" "$cache_state" ;;
         E4) run_pair E4 E3 E4 "$workload" "$cache_state" ;;
+        # E5's baseline is E5C: identical admission/prefetch/partial knobs with
+        # only the cold external-copy reaper toggled.
+        E5) run_pair E5 E5C E5 "$workload" "$cache_state" ;;
+        E5C) run_pair E5C E5C E5C "$workload" "$cache_state" ;;
       esac
     done
   done

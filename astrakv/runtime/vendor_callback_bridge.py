@@ -108,6 +108,11 @@ class VendorCallbackBridge:
         self._prefetch_keys: dict[str, tuple[Any, ...]] = {}
         self._prefetch_futures: dict[str, Any] = {}
         self._prefetch_watcher: threading.Thread | None = None
+        # Cold external-copy reaper state, keyed by physical object id.  The
+        # reaper only ever removes LocalCPU/LocalDisk copies through the
+        # manager's ref-count-aware ``remove`` API; it never touches GPU paged
+        # KV and never bypasses LMCache ownership.
+        self._reap_state: dict[str, dict[str, Any]] = {}
         self._bootstrap_loads = 0
         self._ssd_bytes_per_ms_ema = 0.0
         self._prefill_ms_per_token_ema = _env_float("ASTRAKV_KV_CORE_PREFILL_MS_PER_TOKEN", 0.0)
@@ -291,6 +296,12 @@ class VendorCallbackBridge:
                 )
                 self._consume_matching_prefetch(
                     logical_request_id, request_id, physical, native_keys, available_hit,
+                )
+                self._note_reap_reference(
+                    physical=physical,
+                    native_keys=native_keys,
+                    hit_tokens=available_hit,
+                    now_ns=time.time_ns(),
                 )
                 intent = callbacks.intent_for(request_id)
                 if intent is None:
@@ -709,6 +720,7 @@ class VendorCallbackBridge:
                 "status": "rejected", "reason": str(exc),
             })
         finally:
+            self._note_reap_release(physical, time.time_ns())
             self._pending_prefill_steps.pop(request_id, None)
             self._scheduled_prefix_tokens.pop(request_id, None)
 
@@ -1171,6 +1183,7 @@ class VendorCallbackBridge:
                         self._append_ticket(expired)
                         self._demote_prefetch_keys(expired.prefetch_id)
                     self._reap_terminal_prefetches(callbacks)
+                    self._cold_reap_pass(callbacks)
                 except Exception as exc:
                     self._append("kv_core_prefetch_watcher_errors.jsonl", {
                         "error": type(exc).__name__, "timestamp_ns": time.time_ns(),
@@ -1258,6 +1271,165 @@ class VendorCallbackBridge:
             "key_count": len(keys),
             "timestamp_ns": time.time_ns(),
         })
+
+    def _note_reap_reference(
+        self,
+        *,
+        physical: PhysicalKVObject,
+        native_keys: Iterable[Any],
+        hit_tokens: int,
+        now_ns: int,
+    ) -> None:
+        state = self._reap_state.setdefault(physical.physical_object_id, {
+            "physical_object_id": physical.physical_object_id,
+            "binding_generation": physical.binding_generation,
+            "prefix_hash": physical.compatibility_key.prefix_hash,
+            "request_count": 0,
+            "reuse_count": 0,
+            "ref_count": 0,
+            "last_reference_ns": 0,
+            "last_release_ns": None,
+            "native_keys": [],
+        })
+        state["request_count"] = int(state.get("request_count") or 0) + 1
+        if int(hit_tokens) > 0:
+            state["reuse_count"] = int(state.get("reuse_count") or 0) + 1
+        state["ref_count"] = int(state.get("ref_count") or 0) + 1
+        state["last_reference_ns"] = int(now_ns)
+        state["last_release_ns"] = None
+        state["native_keys"] = [key for key in native_keys if key is not None]
+
+    def _note_reap_release(self, physical: PhysicalKVObject | None, now_ns: int) -> None:
+        if physical is None:
+            return
+        state = self._reap_state.get(physical.physical_object_id)
+        if state is None:
+            return
+        state["ref_count"] = max(0, int(state.get("ref_count") or 0) - 1)
+        if int(state.get("ref_count") or 0) == 0:
+            state["last_release_ns"] = int(now_ns)
+
+    @staticmethod
+    def _cpu_bytes(cpu: Any, keys: Iterable[Any]) -> int:
+        if cpu is None:
+            return 0
+        total = 0
+        lock = getattr(cpu, "cpu_lock", None)
+        context = lock if lock is not None else _NullContext()
+        with context:
+            hot = getattr(cpu, "hot_cache", {}) or {}
+            for key in keys:
+                obj = hot.get(key)
+                if obj is None:
+                    continue
+                size = getattr(obj, "get_physical_size", None)
+                total += max(0, int(size())) if callable(size) else 0
+        return total
+
+    def _cold_reap_pass(self, callbacks: KVCoreConnectorCallbacks) -> None:
+        """Reap cold external copies (E5).  Fail-closed and owner-safe."""
+        if callbacks is None or callbacks.mode is not RuntimeMode.ACTIVE:
+            return
+        if not _env_flag("ASTRAKV_KV_CORE_COLD_REAP_ENABLED"):
+            return
+        manager = self._storage_manager()
+        if manager is None:
+            return
+        backends = getattr(manager, "storage_backends", {}) or {}
+        cpu = backends.get("LocalCPUBackend")
+        disk = backends.get("LocalDiskBackend")
+        if cpu is None and disk is None:
+            return
+        threshold = _env_float("ASTRAKV_KV_CORE_COLD_REAP_REUSE_THRESHOLD", 0.2)
+        idle_ms = _env_int("ASTRAKV_KV_CORE_COLD_REAP_IDLE_MS", 30000)
+        now = time.time_ns()
+        pending = tuple(
+            callbacks.tickets.snapshot(statuses=(PrefetchStatus.SUBMITTED, PrefetchStatus.COMPLETED))
+        )
+        pending_object_ids = {ticket.physical_object_id for ticket in pending}
+        run_id = os.environ.get("ASTRAKV_RUNTIME_CONTROL_RUN_ID", "")
+        for object_id, state in list(self._reap_state.items()):
+            if int(state.get("ref_count") or 0) > 0:
+                continue
+            if object_id in pending_object_ids:
+                continue
+            last_release_ns = state.get("last_release_ns")
+            if last_release_ns is None:
+                continue
+            if (int(now) - int(last_release_ns)) / 1_000_000.0 < idle_ms:
+                continue
+            request_count = max(1, int(state.get("request_count") or 0))
+            if (int(state.get("reuse_count") or 0) / request_count) >= threshold:
+                continue
+            keys = tuple(state.get("native_keys") or ())
+            if not keys:
+                continue
+            if not callable(getattr(manager, "remove", None)):
+                self._append("kv_core_external_reaps.jsonl", {
+                    "schema": "astrakv-kv-core-external-reap-v1",
+                    "run_id": run_id,
+                    "physical_object_id": object_id,
+                    "binding_generation": int(state.get("binding_generation") or 0),
+                    "prefix_hash": str(state.get("prefix_hash") or ""),
+                    "source_tier": "cpu",
+                    "target_tier": "none",
+                    "freed_bytes": 0,
+                    "reason": "cold_reuse_below_threshold",
+                    "status": "delegated_to_lmcache_eviction",
+                    "demoted_keys": 0,
+                    "invalidated_keys": 0,
+                    "failed_keys": 0,
+                    "timestamp_ns": now,
+                })
+                state["request_count"] = 0
+                state["reuse_count"] = 0
+                continue
+            freed_cpu = self._cpu_bytes(cpu, keys)
+            freed_disk = self._disk_bytes(disk, keys)
+            demoted = 0
+            invalidated = 0
+            failed = 0
+            with self._lock:
+                for key in keys:
+                    if cpu is not None and bool(getattr(cpu, "contains", lambda *_: False)(key, False)):
+                        try:
+                            removed = bool(manager.remove(key, ["LocalCPUBackend"]))
+                        except Exception:
+                            failed += 1
+                        else:
+                            if removed:
+                                demoted += 1
+                    if disk is not None and bool(getattr(disk, "contains", lambda *_: False)(key, False)):
+                        try:
+                            removed = bool(manager.remove(key, ["LocalDiskBackend"]))
+                        except Exception:
+                            failed += 1
+                        else:
+                            if removed:
+                                invalidated += 1
+            status = (
+                "invalidated"
+                if invalidated > 0
+                else ("demoted" if demoted > 0 else ("failed" if failed > 0 else "not_found"))
+            )
+            self._append("kv_core_external_reaps.jsonl", {
+                "schema": "astrakv-kv-core-external-reap-v1",
+                "run_id": run_id,
+                "physical_object_id": object_id,
+                "binding_generation": int(state.get("binding_generation") or 0),
+                "prefix_hash": str(state.get("prefix_hash") or ""),
+                "source_tier": "cpu",
+                "target_tier": "none" if invalidated > 0 else "ssd",
+                "freed_bytes": freed_cpu + freed_disk,
+                "reason": "cold_reuse_below_threshold",
+                "status": status,
+                "demoted_keys": demoted,
+                "invalidated_keys": invalidated,
+                "failed_keys": failed,
+                "timestamp_ns": now,
+            })
+            state["request_count"] = 0
+            state["reuse_count"] = 0
 
     def _write_prefetch_request(
         self,

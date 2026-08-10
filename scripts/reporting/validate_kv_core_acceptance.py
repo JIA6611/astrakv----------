@@ -26,7 +26,7 @@ from astrakv.runtime.third_party_patch import PATCH_ID, REQUIRED_CALLBACKS
 
 
 SCHEMA = "astrakv-kv-core-acceptance-v2"
-PHASES = {"E1", "E2", "E3", "E3C", "E4"}
+PHASES = {"E1", "E2", "E3", "E3C", "E4", "E5", "E5C"}
 PREFETCH_BENEFIT_WORKLOADS = {"repeated_long_prefix", "queued_concurrency"}
 PARTIAL_LOAD_WORKLOADS = {"repeated_long_prefix", "constrained_kv_churn"}
 
@@ -544,6 +544,24 @@ def validate_prefetch_disabled(
                 break
 
 
+def validate_external_reaping(run: Path, errors: list[str], *, expect_reaps: bool) -> dict[str, Any]:
+    """Validate E5/E5C cold external-copy reaping evidence (fail-closed)."""
+    rows = load_run_artifact(run, "kv_core_external_reaps.jsonl")
+    reaps = [row for row in rows if str(row.get("status")) in {"demoted", "invalidated"}]
+    if expect_reaps:
+        if not reaps:
+            errors.append("e5_external_reap_evidence_missing")
+            return {"reap_count": 0, "freed_bytes": 0}
+        freed_bytes = sum(max(0, int(row.get("freed_bytes") or 0)) for row in reaps)
+        if freed_bytes <= 0:
+            errors.append("e5_reap_freed_bytes_missing")
+        return {"reap_count": len(reaps), "freed_bytes": freed_bytes}
+    leaks = [row for row in rows if str(row.get("status")) in {"demoted", "invalidated", "failed"}]
+    if leaks:
+        errors.append("e5c_reap_control_leak")
+    return {"reap_count": len(rows), "freed_bytes": 0}
+
+
 def load_run_artifact(run: Path, filename: str) -> list[dict[str, Any]]:
     return read_jsonl(run / filename)
 
@@ -628,10 +646,10 @@ def main() -> int:
     )
     if args.phase != "E1" and not cgroup_evidence_valid:
         errors.append("uma_evidence_missing")
-    elif args.phase not in {"E1", "E3C"} and variant_peak is not None and base_peak is not None and variant_peak > base_peak * 1.02:
+    elif args.phase not in {"E1", "E3C", "E5C"} and variant_peak is not None and base_peak is not None and variant_peak > base_peak * 1.02:
         errors.append("uma_peak_regression")
     point, interval = paired_ttft_bootstrap(baseline_requests, variant_requests)
-    if point is None and args.phase != "E3C":
+    if point is None and args.phase not in {"E3C", "E5C"}:
         errors.append("ttft_evidence_missing")
     if args.phase == "E3" and prefetch_benefit_eligible and (
         point is None or point > -5.0 or interval[1] is None or interval[1] >= 0.0
@@ -639,13 +657,13 @@ def main() -> int:
         errors.append("e3_ttft_acceptance_failed")
     baseline_throughput = aggregate_throughput(baseline_requests)
     variant_throughput = aggregate_throughput(variant_requests)
-    if (baseline_throughput is None or variant_throughput is None) and args.phase != "E3C":
+    if (baseline_throughput is None or variant_throughput is None) and args.phase not in {"E3C", "E5C"}:
         errors.append("throughput_evidence_missing")
-    elif args.phase != "E3C" and variant_throughput < baseline_throughput * 0.98:
+    elif args.phase not in {"E3C", "E5C"} and variant_throughput < baseline_throughput * 0.98:
         errors.append("throughput_regression")
     no_reuse_baseline = [row for row in baseline_requests if str(row.get("workload_type")) == "random_no_reuse"]
     no_reuse_variant = [row for row in variant_requests if str(row.get("workload_type")) == "random_no_reuse"]
-    if args.phase != "E3C" and (no_reuse_baseline or no_reuse_variant):
+    if args.phase not in {"E3C", "E5C"} and (no_reuse_baseline or no_reuse_variant):
         no_reuse_point, _ = paired_ttft_bootstrap(no_reuse_baseline, no_reuse_variant)
         if no_reuse_point is None or no_reuse_point > 2.0:
             errors.append("no_reuse_ttft_regression")
@@ -659,14 +677,14 @@ def main() -> int:
         )
         errors.extend(capacity_errors)
         capacity_status = "passed" if capacity_ok else "failed"
-    if args.phase in {"E3", "E3C", "E4"}:
+    if args.phase in {"E3", "E3C", "E4", "E5", "E5C"}:
         for label, path in (("baseline", baseline_path), ("variant", variant_path)):
             metadata = runtime_metadata(path)
             if metadata.get("topology") != "gpu_cpu_ssd" or metadata.get("lmcache_local_cpu_enabled") is not True:
                 errors.append(f"e3_local_cpu_topology_not_proven:{label}")
             if metadata.get("disk_backed_cpu_invalidation_on_prefetch_lead") is not True:
                 errors.append(f"e3_disk_backed_cpu_invalidation_not_proven:{label}")
-        if args.phase in {"E3", "E4"} and prefetch_benefit_eligible:
+        if args.phase in {"E3", "E4", "E5"} and prefetch_benefit_eligible:
             validate_prefetch(load_run_artifact(variant_path, "kv_core_prefetch_tickets.jsonl"), errors)
         if args.phase == "E3C":
             validate_prefetch_disabled(
@@ -674,11 +692,25 @@ def main() -> int:
                 load_run_artifact(variant_path, "kv_core_prefetch_tickets.jsonl"),
                 errors,
             )
-    if args.phase == "E4" and partial_benefit_eligible:
+    if args.phase in {"E4", "E5", "E5C"} and partial_benefit_eligible:
         # Upper-bound partial load must retain receipt accounting, enforced above.
         partial_rows = [row for row in accounting if int(row.get("allocated_external_tokens") or 0) < int(row.get("lookup_hit_tokens") or 0)]
         if not partial_rows:
             errors.append("e4_partial_prefix_evidence_missing")
+    reap_evidence = {
+        "baseline": {"reap_count": 0, "freed_bytes": 0},
+        "variant": {"reap_count": 0, "freed_bytes": 0},
+    }
+    if args.phase in {"E5", "E5C"}:
+        reap_evidence["baseline"] = validate_external_reaping(baseline_path, errors, expect_reaps=False)
+        if args.phase == "E5":
+            reap_evidence["variant"] = validate_external_reaping(variant_path, errors, expect_reaps=True)
+            base_cpu = baseline_resources.get("lmcache_cpu_occupancy_bytes")
+            variant_cpu = variant_resources.get("lmcache_cpu_occupancy_bytes")
+            if base_cpu is not None and variant_cpu is not None and variant_cpu > base_cpu * 1.02:
+                errors.append("e5_external_occupancy_regression")
+        else:
+            reap_evidence["variant"] = validate_external_reaping(variant_path, errors, expect_reaps=False)
     record = {
         "schema": SCHEMA,
         "phase": args.phase,
@@ -694,7 +726,12 @@ def main() -> int:
         "capacity_claim": {"status": capacity_status, "manifest": capacity_record},
         "prefetch_benefit_eligible": prefetch_benefit_eligible and args.phase != "E3C",
         "partial_load_benefit_eligible": partial_benefit_eligible and args.phase != "E3C",
-        "control_mode": "cpu_tier_aa_no_prefetch" if args.phase == "E3C" else "",
+        "external_reap_evidence": reap_evidence,
+        "control_mode": (
+            "cpu_tier_aa_no_prefetch"
+            if args.phase == "E3C"
+            else ("cold_reap_aa" if args.phase == "E5C" else ("cold_reap_active" if args.phase == "E5" else ""))
+        ),
         "request_accounting_count": len(accounting),
         "uma_measurement": {
             "baseline": baseline_uma_status,

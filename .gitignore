@@ -31,6 +31,10 @@ dist/
 *.temp
 .DS_Store
 Thumbs.db
+docs/
+figures/
+scripts/plotting/
+scripts/reporting/
 
 # Large/generated research artifacts
 results/**

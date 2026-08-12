@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 
-from astrakv.runtime.kv_core_connector import KVCoreConnectorCallbacks
+from astrakv.runtime.kv_core_connector import KVCoreConnectorCallbacks, native_key_prefix_ok
 from astrakv.runtime.kv_runtime_core import (
-    KVCompatibilityKey, PhysicalKVObject, PrefetchTicket, RequestKVIntent,
-    RuntimeMode, TierCapabilitySnapshot, TierTopology, exact_token_prefix_hash,
+    KVCompatibilityKey, NativeKVLoadReceipt, PhysicalKVObject, PrefetchTicket,
+    RequestKVIntent, RuntimeMode, TierCapabilitySnapshot, TierTopology,
+    exact_token_prefix_hash,
 )
 
 
@@ -45,6 +47,98 @@ class KVCoreConnectorCallbackTests(unittest.TestCase):
         self.assertFalse(accounting.recompute_confirmed)
         self.assertEqual(accounting.recomputed_tokens, 0)
         self.assertEqual(accounting.terminal_reason, "native_load_shortfall_unsafe")
+
+    def test_native_key_prefix_ok(self) -> None:
+        expected = json.dumps(["a", "b", "c"])
+        self.assertTrue(native_key_prefix_ok(expected, json.dumps(["a"])))
+        self.assertTrue(native_key_prefix_ok(expected, json.dumps(["a", "b"])))
+        self.assertTrue(native_key_prefix_ok(expected, expected))
+        self.assertFalse(native_key_prefix_ok(expected, json.dumps(["b"])))
+        self.assertFalse(native_key_prefix_ok(expected, json.dumps(["a", "c"])))
+        self.assertFalse(native_key_prefix_ok(expected, json.dumps(["a", "b", "c", "d"])))
+        self.assertFalse(native_key_prefix_ok("[]", "[]"))
+        self.assertFalse(native_key_prefix_ok("not-json", "[]"))
+
+    def test_partial_prefix_receipt_after_churn_is_recompute_confirmed(self) -> None:
+        callbacks = KVCoreConnectorCallbacks(mode=RuntimeMode.ACTIVE, capability=self.capability)
+        long_key = KVCompatibilityKey(
+            "Qwen3-8B", "qwen3-8b-bf16", "qwen3-8b", "qwen3-default", "bfloat16", "default", "base",
+            "vllm-paged-kv-v1", 16, 256, "all-layers", exact_token_prefix_hash((1, 2, 3, 4)), "engine", "worker",
+        )
+        short_key = KVCompatibilityKey(
+            "Qwen3-8B", "qwen3-8b-bf16", "qwen3-8b", "qwen3-default", "bfloat16", "default", "base",
+            "vllm-paged-kv-v1", 16, 256, "all-layers", exact_token_prefix_hash((1, 2)), "engine", "worker",
+        )
+        long_physical = PhysicalKVObject(
+            json.dumps(["chunk-0", "chunk-1"]), "long-object", 1, long_key, source_tier="ssd", size_bytes=128,
+        )
+        short_physical = PhysicalKVObject(
+            json.dumps(["chunk-0"]), "short-object", 1, short_key, source_tier="ssd", size_bytes=64,
+        )
+        intent = RequestKVIntent("request", long_key, long_physical, 64, 64, deadline_ns=2_000_000_000)
+        callbacks.submit_intent(intent)
+        callbacks.record_scheduler_lookup(
+            request_id="request", physical=long_physical, lookup_hit_tokens=64, native_request_id="native-request",
+        )
+        callbacks.record_scheduler_admission(
+            request_id="request", physical=long_physical, allocated_external_tokens=32,
+        )
+        receipt = callbacks.record_native_load_completion(
+            request_id="request", physical=short_physical, actual_loaded_tokens=32, bytes_loaded=64,
+            load_latency_ns=100, native_request_id="native-request", status="completed",
+        )
+        self.assertEqual(receipt.load_shortfall_tokens, 0)
+        # Import against the scheduler-owned (long) physical: churn evicted the
+        # tail chunks between lookup and load; the shorter prefix is accepted.
+        callbacks.import_native_load_receipt(receipt, physical=long_physical)
+        accounting = callbacks.finalize_request(
+            request_id="request", physical=long_physical,
+            finish_status="FINISHED_STOPPED", completed=True, native_num_computed_tokens=64,
+        )
+        self.assertTrue(accounting.recompute_confirmed)
+        self.assertEqual(accounting.recomputed_tokens, 32)
+        self.assertEqual(accounting.terminal_reason, "native_partial_prefix_load_recompute")
+
+    def test_receipt_rejects_non_prefix_identity(self) -> None:
+        callbacks = KVCoreConnectorCallbacks(mode=RuntimeMode.ACTIVE, capability=self.capability)
+        long_key = KVCompatibilityKey(
+            "Qwen3-8B", "qwen3-8b-bf16", "qwen3-8b", "qwen3-default", "bfloat16", "default", "base",
+            "vllm-paged-kv-v1", 16, 256, "all-layers", exact_token_prefix_hash((1, 2, 3, 4)), "engine", "worker",
+        )
+        long_physical = PhysicalKVObject(
+            json.dumps(["chunk-0", "chunk-1"]), "long-object", 1, long_key, source_tier="ssd", size_bytes=128,
+        )
+        intent = RequestKVIntent("request", long_key, long_physical, 64, 64, deadline_ns=2_000_000_000)
+        callbacks.submit_intent(intent)
+        callbacks.record_scheduler_lookup(
+            request_id="request", physical=long_physical, lookup_hit_tokens=64, native_request_id="native-request",
+        )
+        callbacks.record_scheduler_admission(
+            request_id="request", physical=long_physical, allocated_external_tokens=32,
+        )
+        wrong = NativeKVLoadReceipt(
+            request_id="request",
+            physical_object_id="wrong-object",
+            binding_generation=1,
+            native_key=json.dumps(["chunk-9"]),
+            compatibility_identity=long_key.identity,
+            prefix_hash=long_key.prefix_hash,
+            requested_prefix_tokens=64,
+            locally_cached_tokens=0,
+            lookup_hit_tokens=64,
+            allocated_external_tokens=32,
+            actual_loaded_tokens=32,
+            native_retrieved_tokens=32,
+            missing_tokens=32,
+            unallocated_recompute_tokens=32,
+            load_shortfall_tokens=0,
+            bytes_loaded=64,
+            load_latency_ns=100,
+            status="completed",
+            native_request_id="native-request",
+        )
+        with self.assertRaisesRegex(ValueError, "compatibility identity mismatch"):
+            callbacks.import_native_load_receipt(wrong, physical=long_physical)
 
     def test_cpu_prefetch_never_implies_gpu_load(self) -> None:
         callbacks = KVCoreConnectorCallbacks(mode=RuntimeMode.ACTIVE, capability=self.capability)

@@ -8,6 +8,7 @@ KV writer.
 
 from __future__ import annotations
 
+import json
 import time
 import threading
 from dataclasses import dataclass
@@ -22,6 +23,38 @@ from astrakv.runtime.kv_runtime_core import (
     RuntimeMode,
     TierCapabilitySnapshot,
 )
+
+
+def native_key_prefix_ok(expected: str, observed: str) -> bool:
+    """True when ``observed`` native-key JSON is a block-aligned prefix of ``expected``.
+
+    Churn can evict the tail chunks of a long prefix between scheduler lookup
+    and native load.  The worker then loads a shorter, block-aligned prefix of
+    the very same object.  ``observed == expected[:len(observed)]`` is the
+    safety condition that keeps the loaded KV inside the scheduler-declared
+    prefix; the evicted tail is reconciled by ``missing_tokens`` recompute.
+    """
+    try:
+        expected_keys = json.loads(expected)
+        observed_keys = json.loads(observed)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(expected_keys, list) or not isinstance(observed_keys, list):
+        return False
+    if not observed_keys or len(observed_keys) > len(expected_keys):
+        return False
+    return observed_keys == expected_keys[: len(observed_keys)]
+
+
+def physical_identity_compatible(expected: PhysicalKVObject, observed: PhysicalKVObject) -> bool:
+    """True when ``observed`` is the same binding as ``expected`` or a shorter
+    block-aligned prefix of it (churn can evict tail chunks between scheduler
+    lookup and native load)."""
+    if expected.binding_generation != observed.binding_generation:
+        return False
+    if observed.native_key == expected.native_key:
+        return True
+    return native_key_prefix_ok(expected.native_key, observed.native_key)
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,13 +281,21 @@ class KVCoreConnectorCallbacks:
         lookup = self._lookup(receipt.request_id, physical)
         admission = self._admissions.get(receipt.request_id)
         allocated = 0 if admission is None else admission.allocated_external_tokens
-        if (
-            receipt.generation_key != physical.generation_key
-            or receipt.native_key != physical.native_key
-            or receipt.compatibility_identity != physical.compatibility_key.identity
+        if receipt.binding_generation != physical.binding_generation:
+            raise ValueError("worker receipt compatibility identity mismatch")
+        keys_equal = receipt.native_key == physical.native_key
+        keys_partial = native_key_prefix_ok(physical.native_key, receipt.native_key)
+        if not (keys_equal or keys_partial):
+            raise ValueError("worker receipt compatibility identity mismatch")
+        if keys_equal and (
+            receipt.compatibility_identity != physical.compatibility_key.identity
             or receipt.prefix_hash != physical.compatibility_key.prefix_hash
         ):
             raise ValueError("worker receipt compatibility identity mismatch")
+        # ``keys_partial`` describes a block-aligned prefix of the same object
+        # after churn evicted tail chunks; the shorter prefix legitimately
+        # carries different derived identity fields.  ``missing_tokens``
+        # reconciles the evicted tail through recompute.
         if receipt.requested_prefix_tokens != intent.requested_prefix_tokens:
             raise ValueError("worker receipt requested prefix mismatch")
         if receipt.locally_cached_tokens != lookup.locally_cached_tokens:
@@ -351,17 +392,15 @@ class KVCoreConnectorCallbacks:
         intent = self._intents.get(request_id)
         if intent is None:
             raise ValueError("native callback has no request intent")
-        if intent.physical_object.generation_key != physical.generation_key:
-            raise ValueError("native callback physical generation mismatch")
-        if intent.compatibility_key != physical.compatibility_key:
-            raise ValueError("native callback compatibility key mismatch")
+        if not physical_identity_compatible(intent.physical_object, physical):
+            raise ValueError("native callback physical identity mismatch")
         return intent
 
     def _lookup(self, request_id: str, physical: PhysicalKVObject) -> SchedulerLookupObservation:
         lookup = self._lookups.get(request_id)
         if lookup is None:
             raise ValueError("native callback has no scheduler lookup")
-        if (lookup.physical_object_id, lookup.binding_generation) != physical.generation_key:
+        if lookup.binding_generation != physical.binding_generation:
             raise ValueError("scheduler lookup physical generation mismatch")
         return lookup
 

@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from scripts.reporting.validate_kv_core_acceptance import (
@@ -48,6 +49,80 @@ class KVCoreAcceptanceAccountingTests(unittest.TestCase):
             index["chatcmpl-logical-request-1"]["logical_request_id"],
             "logical-request",
         )
+
+    def test_receipts_accept_partial_prefix_identity_after_churn(self) -> None:
+        accounting = [{
+            "request_id": "logical-request",
+            "physical_object_id": "long-object",
+            "binding_generation": 1,
+            "native_key": json.dumps(["c0", "c1", "c2"]),
+            "compatibility_identity": "long-id",
+            "prefix_hash": "long-hash",
+            "allocated_external_tokens": 16,
+            "lookup_hit_tokens": 32,
+            "actual_loaded_tokens": 16,
+            "requested_prefix_tokens": 32,
+            "locally_cached_tokens": 0,
+            "missing_tokens": 16,
+            "unallocated_recompute_tokens": 16,
+            "load_shortfall_tokens": 0,
+        }]
+        receipt = {
+            "request_id": "logical-request",
+            "physical_object_id": "short-object",
+            "binding_generation": 1,
+            "native_key": json.dumps(["c0"]),
+            "compatibility_identity": "short-id",
+            "prefix_hash": "short-hash",
+            "allocated_external_tokens": 16,
+            "lookup_hit_tokens": 32,
+            "actual_loaded_tokens": 16,
+            "requested_prefix_tokens": 32,
+            "locally_cached_tokens": 0,
+            "missing_tokens": 16,
+            "unallocated_recompute_tokens": 16,
+            "load_shortfall_tokens": 0,
+        }
+        errors: list[str] = []
+        validate_receipts([receipt], accounting, errors)
+        self.assertEqual(errors, [])
+
+    def test_receipts_reject_non_prefix_identity(self) -> None:
+        accounting = [{
+            "request_id": "logical-request",
+            "physical_object_id": "long-object",
+            "binding_generation": 1,
+            "native_key": json.dumps(["c0", "c1"]),
+            "compatibility_identity": "long-id",
+            "prefix_hash": "long-hash",
+            "allocated_external_tokens": 16,
+            "lookup_hit_tokens": 32,
+            "actual_loaded_tokens": 16,
+            "requested_prefix_tokens": 32,
+            "locally_cached_tokens": 0,
+            "missing_tokens": 16,
+            "unallocated_recompute_tokens": 16,
+            "load_shortfall_tokens": 0,
+        }]
+        receipt = {
+            "request_id": "logical-request",
+            "physical_object_id": "other-object",
+            "binding_generation": 1,
+            "native_key": json.dumps(["c9"]),
+            "compatibility_identity": "other-id",
+            "prefix_hash": "other-hash",
+            "allocated_external_tokens": 16,
+            "lookup_hit_tokens": 32,
+            "actual_loaded_tokens": 16,
+            "requested_prefix_tokens": 32,
+            "locally_cached_tokens": 0,
+            "missing_tokens": 16,
+            "unallocated_recompute_tokens": 16,
+            "load_shortfall_tokens": 0,
+        }
+        errors: list[str] = []
+        validate_receipts([receipt], accounting, errors)
+        self.assertIn("receipt_identity_mismatch:native_key:logical-request", errors)
 
     def test_e1_rejects_unlinked_or_missing_runtime_association(self):
         errors = []

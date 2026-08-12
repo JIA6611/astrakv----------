@@ -178,6 +178,7 @@ run_one() {
   # Disable vLLM's in-process prefix cache for this external-KV experiment.
   # Both pair members have the same setting; reuse comes only from the
   # pair-scoped LMCache disk store.
+  ASTRAKV_PYTHON="$PYTHON" \
   ASTRAKV_MODEL="$MODEL" ASTRAKV_HOST="$HOST" ASTRAKV_PORT="$PORT" \
   PYTHONHASHSEED=0 ASTRAKV_VLLM_SEED=0 \
   ASTRAKV_GPU_MEMORY_UTILIZATION="$GPU_MEMORY_UTILIZATION" ASTRAKV_MAX_MODEL_LEN="32768" \

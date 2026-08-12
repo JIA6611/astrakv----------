@@ -9,11 +9,14 @@ from unittest.mock import patch
 
 from astrakv.runtime.kv_core_connector import KVCoreConnectorCallbacks
 from astrakv.runtime.kv_runtime_core import (
+    KVCompatibilityKey,
+    PhysicalKVObject,
     PrefetchStatus,
     PrefetchTicket,
     RuntimeMode,
     TierCapabilitySnapshot,
     TierTopology,
+    exact_token_prefix_hash,
 )
 from astrakv.runtime.request_context import RequestContextReceipt
 from astrakv.runtime.vendor_callback_bridge import VendorCallbackBridge, _owns_runtime_control_host
@@ -469,6 +472,72 @@ class VendorCallbackBridgeTests(unittest.TestCase):
             self.assertEqual(records[-1]["action"], "invalidate_external_copy")
             self.assertEqual(records[-1]["cpu_removed_chunk_count"], 1)
             self.assertEqual(records[-1]["cpu_only_chunk_count"], 1)
+
+    def test_native_load_start_accepts_partial_prefix_after_churn(self) -> None:
+        callbacks = KVCoreConnectorCallbacks(
+            mode=RuntimeMode.ACTIVE,
+            capability=TierCapabilitySnapshot(
+                topology=TierTopology.GPU_SSD,
+                local_cpu_enabled=False,
+                local_disk_enabled=True,
+                available_kv_blocks=1024,
+                external_token_cap=8,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as raw_tmp, patch.dict(os.environ, {
+            "ASTRAKV_RUNTIME_CONTROL_STATE_DIR": raw_tmp,
+            "ASTRAKV_KV_CORE_ADMISSION_ENABLED": "true",
+            "ASTRAKV_KV_CORE_EXTERNAL_TOKEN_CAP": "8",
+            "ASTRAKV_KV_CORE_BOOTSTRAP_LOADS": "1",
+        }, clear=False), patch(
+            "astrakv.runtime.vendor_callback_bridge.installed_kv_core_callbacks",
+            return_value=callbacks,
+        ), patch.object(VendorCallbackBridge, "_start_prefetch_watcher_if_worker"):
+            bridge = VendorCallbackBridge(_connector())
+            bridge.scheduler_exact_lookup(
+                bridge._connector,
+                request_id="native-request",
+                token_ids=(1, 2, 3, 4),
+                request_configs=None,
+                lookup_hit_tokens=4,
+                num_computed_tokens=0,
+            )
+            # Simulate the worker-side view after churn evicted tail chunks:
+            # only the first block-aligned key remains available.
+            short_key = KVCompatibilityKey(
+                "Qwen3-8B", "local-qwen3-8b", "local-qwen3-8b", "qwen3-default", "bfloat16",
+                "{}", "base", "vllm-paged-kv-v1", 1, 2, "all-kv-layers",
+                exact_token_prefix_hash((1, 2)), "", "",
+            )
+            short_physical = PhysicalKVObject(
+                json.dumps([key.to_string() for key in bridge._keys_by_request["native-request"][:1]]),
+                "short-object", 1, short_key, source_tier="ssd", size_bytes=1,
+            )
+            bridge._physical_by_request["native-request"] = short_physical
+            bridge.native_load_start(
+                request_id="native-request",
+                connector=bridge._connector,
+                token_ids=(1, 2, 3, 4),
+                request_configs=None,
+                compatibility_prefix_tokens=2,
+                allocated_external_tokens=2,
+            )
+            records = [
+                json.loads(line)
+                for line in (Path(raw_tmp) / "kv_core_native_callbacks.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            partial = [
+                row for row in records
+                if row.get("callback") == "native_load_start" and row.get("status") == "accepted_partial_prefix"
+            ]
+            rejected = [
+                row for row in records
+                if row.get("callback") == "native_load_start" and row.get("status") == "rejected"
+            ]
+            self.assertEqual(len(partial), 1)
+            self.assertEqual(rejected, [])
 
 
 if __name__ == "__main__":

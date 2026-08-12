@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from astrakv.runtime.kv_core_connector import KVCoreConnectorCallbacks
+from astrakv.runtime.kv_core_connector import native_key_prefix_ok
 from astrakv.runtime.kv_runtime_core import (
     KVCompatibilityKey,
     NativeKVLoadReceipt,
@@ -632,13 +633,30 @@ class VendorCallbackBridge:
                 physical.compatibility_key.identity,
             )
             if expected != observed:
+                # Churn can evict tail chunks between scheduler lookup and the
+                # native load.  A shorter block-aligned prefix of the same
+                # binding is still the scheduler-declared object; the evicted
+                # tail is reconciled by missing_tokens recompute.
+                partial_prefix_ok = (
+                    int(expected[1]) == int(observed[1])
+                    and native_key_prefix_ok(str(expected[2]), str(observed[2]))
+                )
+                if not partial_prefix_ok:
+                    self._record("native_load_start", {
+                        "request_id": request_id,
+                        **self._association_evidence(request_id, association_receipt),
+                        "status": "rejected",
+                        "reason": "native_intent_identity_mismatch",
+                    })
+                    return
                 self._record("native_load_start", {
                     "request_id": request_id,
                     **self._association_evidence(request_id, association_receipt),
-                    "status": "rejected",
-                    "reason": "native_intent_identity_mismatch",
+                    "status": "accepted_partial_prefix",
+                    "reason": "observed_prefix_subset_of_intent",
+                    "physical_object_id": physical.physical_object_id,
+                    "binding_generation": physical.binding_generation,
                 })
-                return
         logical_request_id = str(
             (intent_record or {}).get("logical_request_id") or request_id
         )

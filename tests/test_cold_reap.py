@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import tempfile
 import threading
@@ -288,6 +289,76 @@ class ColdReapTests(unittest.TestCase):
             ]
             self.assertEqual(records[-1]["action"], "release_cpu_staging_after_consume")
             self.assertEqual(records[-1]["removed_count"], 1)
+
+    def test_release_consumed_prefetches_after_terminal(self) -> None:
+        cpu, disk = _CPU(), _Disk()
+        callbacks = _callbacks()
+        with tempfile.TemporaryDirectory() as raw_tmp, patch.dict(os.environ, {
+            "ASTRAKV_RUNTIME_CONTROL_STATE_DIR": raw_tmp,
+            "ASTRAKV_KV_CORE_RELEASE_CPU_STAGING_ON_CONSUME": "true",
+        }, clear=False), patch(
+            "astrakv.runtime.vendor_callback_bridge.installed_kv_core_callbacks",
+            return_value=callbacks,
+        ), patch.object(VendorCallbackBridge, "_start_prefetch_watcher_if_worker"):
+            bridge = VendorCallbackBridge(_connector(cpu, disk))
+            prefetch_id = "prefetch:p1"
+            target = "request-1"
+            key = _Key("key-0")
+            bridge._prefetch_keys[prefetch_id] = (key,)
+            cpu.hot_cache[key] = SimpleNamespace(get_physical_size=lambda: 1024)
+            consumed_dir = Path(raw_tmp) / "consumed_prefetches"
+            consumed_dir.mkdir()
+            digest = hashlib.sha256(prefetch_id.encode("utf-8")).hexdigest()
+            (consumed_dir / f"{digest}.json").write_text(json.dumps({
+                "schema": "astrakv-consumed-prefetch-v1",
+                "prefetch_id": prefetch_id,
+                "target_request_id": target,
+            }), encoding="utf-8")
+            terminals = Path(raw_tmp) / "request_terminals"
+            terminals.mkdir()
+            terminal_digest = hashlib.sha256(target.encode("utf-8")).hexdigest()
+            (terminals / f"{terminal_digest}.json").write_text(
+                json.dumps({"request_id": target, "completed": True}), encoding="utf-8",
+            )
+            bridge._release_consumed_prefetches()
+            self.assertEqual(cpu.removed, [key])
+            self.assertFalse(cpu.hot_cache)
+            records = [
+                json.loads(line)
+                for line in (Path(raw_tmp) / "kv_core_policy_decisions.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            self.assertEqual(records[-1]["action"], "release_cpu_staging_after_consume")
+            self.assertEqual(records[-1]["removed_count"], 1)
+
+    def test_release_consumed_prefetches_waits_for_terminal(self) -> None:
+        cpu, disk = _CPU(), _Disk()
+        callbacks = _callbacks()
+        with tempfile.TemporaryDirectory() as raw_tmp, patch.dict(os.environ, {
+            "ASTRAKV_RUNTIME_CONTROL_STATE_DIR": raw_tmp,
+            "ASTRAKV_KV_CORE_RELEASE_CPU_STAGING_ON_CONSUME": "true",
+        }, clear=False), patch(
+            "astrakv.runtime.vendor_callback_bridge.installed_kv_core_callbacks",
+            return_value=callbacks,
+        ), patch.object(VendorCallbackBridge, "_start_prefetch_watcher_if_worker"):
+            bridge = VendorCallbackBridge(_connector(cpu, disk))
+            prefetch_id = "prefetch:p1"
+            key = _Key("key-0")
+            bridge._prefetch_keys[prefetch_id] = (key,)
+            cpu.hot_cache[key] = SimpleNamespace(get_physical_size=lambda: 1024)
+            consumed_dir = Path(raw_tmp) / "consumed_prefetches"
+            consumed_dir.mkdir()
+            digest = hashlib.sha256(prefetch_id.encode("utf-8")).hexdigest()
+            (consumed_dir / f"{digest}.json").write_text(json.dumps({
+                "schema": "astrakv-consumed-prefetch-v1",
+                "prefetch_id": prefetch_id,
+                "target_request_id": "request-1",
+            }), encoding="utf-8")
+            # No request_terminals marker yet: release must wait.
+            bridge._release_consumed_prefetches()
+            self.assertEqual(cpu.removed, [])
+            self.assertEqual(len(cpu.hot_cache), 1)
 
 
 if __name__ == "__main__":

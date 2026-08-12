@@ -105,6 +105,7 @@ class VendorCallbackBridge:
         self._seen_callbacks: set[str] = set()
         self._prefetch_request_seen: set[str] = set()
         self._terminal_request_seen: set[str] = set()
+        self._consumed_prefetch_seen: set[str] = set()
         self._association_receipts: dict[str, Any] = {}
         self._prefetch_keys: dict[str, tuple[Any, ...]] = {}
         self._prefetch_futures: dict[str, Any] = {}
@@ -1203,6 +1204,7 @@ class VendorCallbackBridge:
                         self._demote_prefetch_keys(expired.prefetch_id)
                     self._reap_terminal_prefetches(callbacks)
                     self._cold_reap_pass(callbacks)
+                    self._release_consumed_prefetches()
                 except Exception as exc:
                     self._append("kv_core_prefetch_watcher_errors.jsonl", {
                         "error": type(exc).__name__, "timestamp_ns": time.time_ns(),
@@ -1373,6 +1375,89 @@ class VendorCallbackBridge:
             "status": "completed" if removed else "pinned_or_missing",
             "timestamp_ns": time.time_ns(),
         })
+
+    def _write_consumed_prefetch_marker(self, *, prefetch_id: str, target_request_id: str) -> None:
+        if self._state_dir is None:
+            return
+        if not _env_flag("ASTRAKV_KV_CORE_RELEASE_CPU_STAGING_ON_CONSUME", True):
+            return
+        directory = self._state_dir / "consumed_prefetches"
+        directory.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(prefetch_id.encode("utf-8")).hexdigest()
+        path = directory / f"{digest}.json"
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps({
+            "schema": "astrakv-consumed-prefetch-v1",
+            "prefetch_id": prefetch_id,
+            "target_request_id": target_request_id,
+            "consumed_at_ns": time.time_ns(),
+        }, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+
+    def _release_consumed_prefetches(self) -> None:
+        """Cross-process release of consumed CPU staging copies.
+
+        Consumption is recorded in the scheduler-side bridge while the CPU
+        backend and ``_prefetch_keys`` live in the worker-side bridge.  A
+        state-dir marker bridges the two; release only runs after the target
+        request's terminal marker exists, so the native load has already read
+        the CPU copy.
+        """
+        if self._state_dir is None:
+            return
+        if not _env_flag("ASTRAKV_KV_CORE_RELEASE_CPU_STAGING_ON_CONSUME", True):
+            return
+        manager = self._storage_manager()
+        if manager is None:
+            return
+        cpu = getattr(manager, "storage_backends", {}).get("LocalCPUBackend")
+        if cpu is None:
+            return
+        directory = self._state_dir / "consumed_prefetches"
+        terminals = self._state_dir / "request_terminals"
+        paths = tuple(directory.glob("*.json")) if directory.is_dir() else ()
+        for path in paths:
+            if path.name in self._consumed_prefetch_seen:
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                prefetch_id = str(payload["prefetch_id"])
+                target_request_id = str(payload["target_request_id"] or "")
+            except (OSError, KeyError, TypeError, json.JSONDecodeError):
+                self._consumed_prefetch_seen.add(path.name)
+                continue
+            if not target_request_id:
+                self._consumed_prefetch_seen.add(path.name)
+                continue
+            terminal_digest = hashlib.sha256(target_request_id.encode("utf-8")).hexdigest()
+            if not (terminals / f"{terminal_digest}.json").exists():
+                continue  # target still running; wait for the terminal marker
+            self._consumed_prefetch_seen.add(path.name)
+            keys = self._prefetch_keys.pop(prefetch_id, ())
+            if not keys:
+                continue
+            removed = 0
+            for key in keys:
+                try:
+                    deleted = bool(cpu.remove(key, force=False))
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if deleted:
+                    policy = getattr(cpu, "cache_policy", None)
+                    update = getattr(policy, "update_on_force_evict", None)
+                    if callable(update):
+                        update(key)
+                    removed += 1
+            self._append("kv_core_policy_decisions.jsonl", {
+                "request_id": target_request_id,
+                "prefetch_id": prefetch_id,
+                "action": "release_cpu_staging_after_consume",
+                "tier": "cpu",
+                "key_count": len(keys),
+                "removed_count": removed,
+                "status": "completed" if removed else "pinned_or_missing",
+                "timestamp_ns": time.time_ns(),
+            })
 
     @staticmethod
     def _cpu_bytes(cpu: Any, keys: Iterable[Any]) -> int:
@@ -1733,6 +1818,10 @@ class VendorCallbackBridge:
                     physical=physical,
                 )
                 self._prefetch_by_request[native_request_id] = ticket.prefetch_id
+                self._write_consumed_prefetch_marker(
+                    prefetch_id=ticket.prefetch_id,
+                    target_request_id=logical_request_id,
+                )
                 self._append_ticket(consumed)
                 return
 

@@ -19,7 +19,7 @@ runtime:
   topology:
     demand_load: gpu_ssd
     cpu_prefetch: gpu_cpu_ssd
-  cpu_prefetch_budget_fraction: 0.05
+  cpu_prefetch_budget_fraction: 0.2
   block_size_tokens: 16
   partial_load: continuous_prefix_from_zero_block_aligned
 experiments:

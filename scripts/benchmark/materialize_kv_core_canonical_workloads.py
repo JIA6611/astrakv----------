@@ -139,6 +139,7 @@ def _row(
     reuse_bucket: str,
     expected_output_tokens: int,
     prefetch_lead_s: float,
+    sleep_before_s: float = 0.0,
     batch_size: int = 1,
     case_suffix: str = "",
     extra_metadata: dict[str, Any] | None = None,
@@ -164,7 +165,7 @@ def _row(
         "context_length": source.estimated_prompt_tokens,
         "expected_output_tokens": expected_output_tokens,
         "batch_size": batch_size,
-        "sleep_before_s": 0.0,
+        "sleep_before_s": sleep_before_s,
         "prefetch_lead_s": prefetch_lead_s,
         "case": f"{workload}{case_suffix}",
         "metadata": metadata,
@@ -178,6 +179,7 @@ def build_repeated_long_prefix(
     revisits: int = 8,
     output_tokens: int = 128,
     prefetch_lead_s: float = 0.25,
+    sleep_between_revisits_s: float = 0.0,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     index = 0
@@ -198,6 +200,7 @@ def build_repeated_long_prefix(
                     reuse_bucket="none" if visit == 0 else "high",
                     expected_output_tokens=output_tokens,
                     prefetch_lead_s=0.0 if visit == 0 else prefetch_lead_s,
+                    sleep_before_s=0.0 if visit == 0 else sleep_between_revisits_s,
                     extra_metadata={"group_visit": visit},
                 )
             )
@@ -235,6 +238,7 @@ def build_constrained_kv_churn(
     revisits: int = 3,
     output_tokens: int = 16,
     prefetch_lead_s: float = 0.25,
+    sleep_between_revisits_s: float = 0.0,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     index = 0
@@ -256,6 +260,7 @@ def build_constrained_kv_churn(
                     reuse_bucket="none" if visit == 0 else "low",
                     expected_output_tokens=output_tokens,
                     prefetch_lead_s=0.0 if visit == 0 else prefetch_lead_s,
+                    sleep_before_s=0.0 if visit == 0 else sleep_between_revisits_s,
                     extra_metadata={"group_visit": visit},
                 )
             )
@@ -269,6 +274,7 @@ def build_queued_concurrency(
     revisits: int = 8,
     output_tokens: int = 16,
     prefetch_lead_s: float = 0.25,
+    sleep_between_revisits_s: float = 0.0,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     index = 0
@@ -290,6 +296,7 @@ def build_queued_concurrency(
                     reuse_bucket="none" if visit == 0 else "high",
                     expected_output_tokens=output_tokens,
                     prefetch_lead_s=0.0 if visit == 0 else prefetch_lead_s,
+                    sleep_before_s=0.0 if visit == 0 else sleep_between_revisits_s,
                     batch_size=1,
                     extra_metadata={"group_visit": visit},
                 )
@@ -324,6 +331,22 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-context-tokens", type=int, default=16384)
     parser.add_argument("--output-tokens", type=int, default=128)
+    parser.add_argument(
+        "--prefetch-lead-s",
+        type=float,
+        default=0.25,
+        help="SSD->CPU prefetch lead window for revisit requests.  It must exceed "
+        "the measured SSD->CPU promotion time (E2 receipts show ~1s loads) or "
+        "tickets expire/cancel before consumption.",
+    )
+    parser.add_argument(
+        "--sleep-between-revisits-s",
+        type=float,
+        default=0.0,
+        help="Gap inserted before each revisit so the previous request's native "
+        "store write settles before the next prefetch promotion reads the disk. "
+        "Avoids promotion-vs-write races that corrupt partial prefixes.",
+    )
     args = parser.parse_args()
 
     prompts_dir = Path(args.prompts_dir)
@@ -359,10 +382,25 @@ def main() -> int:
     rng.shuffle(unique)
 
     builders: dict[str, list[dict[str, Any]]] = {
-        "repeated_long_prefix": build_repeated_long_prefix(grouped, output_tokens=args.output_tokens),
+        "repeated_long_prefix": build_repeated_long_prefix(
+            grouped,
+            output_tokens=args.output_tokens,
+            prefetch_lead_s=args.prefetch_lead_s,
+            sleep_between_revisits_s=args.sleep_between_revisits_s,
+        ),
         "random_no_reuse": build_random_no_reuse(unique, output_tokens=args.output_tokens),
-        "constrained_kv_churn": build_constrained_kv_churn(grouped, output_tokens=args.output_tokens),
-        "queued_concurrency": build_queued_concurrency(grouped, output_tokens=args.output_tokens),
+        "constrained_kv_churn": build_constrained_kv_churn(
+            grouped,
+            output_tokens=args.output_tokens,
+            prefetch_lead_s=args.prefetch_lead_s,
+            sleep_between_revisits_s=args.sleep_between_revisits_s,
+        ),
+        "queued_concurrency": build_queued_concurrency(
+            grouped,
+            output_tokens=args.output_tokens,
+            prefetch_lead_s=args.prefetch_lead_s,
+            sleep_between_revisits_s=args.sleep_between_revisits_s,
+        ),
     }
 
     output_dir = Path(args.output_dir)
@@ -386,6 +424,8 @@ def main() -> int:
             "seed": args.seed,
             "max_context_tokens": args.max_context_tokens,
             "output_tokens": args.output_tokens,
+            "prefetch_lead_s": args.prefetch_lead_s,
+            "sleep_between_revisits_s": args.sleep_between_revisits_s,
         },
         "workloads": summaries,
     }

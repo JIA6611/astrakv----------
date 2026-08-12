@@ -61,10 +61,20 @@ class _CPU:
     def __init__(self) -> None:
         self.cpu_lock = threading.Lock()
         self.hot_cache = {}
+        self.cache_policy = SimpleNamespace(update_on_force_evict=lambda _key: None)
+        self.removed = []
 
     def contains(self, key, pin):
         del pin
         return key in self.hot_cache
+
+    def remove(self, key, force=True):
+        del force
+        if key not in self.hot_cache:
+            return False
+        self.hot_cache.pop(key)
+        self.removed.append(key)
+        return True
 
 
 class _Manager:
@@ -226,6 +236,58 @@ class ColdReapTests(unittest.TestCase):
         events, _cpu, _disk = self._scenario(removable=False)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["status"], "delegated_to_lmcache_eviction")
+
+    def test_prefetch_budget_fraction_env_override(self) -> None:
+        cpu, disk = _CPU(), _Disk()
+        callbacks = KVCoreConnectorCallbacks(
+            mode=RuntimeMode.ACTIVE,
+            capability=TierCapabilitySnapshot(
+                topology=TierTopology.GPU_CPU_SSD,
+                local_cpu_enabled=True,
+                local_disk_enabled=True,
+                available_kv_blocks=1024,
+                external_token_cap=8,
+                uma_available_bytes=100_000_000_000,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as raw_tmp, patch.dict(os.environ, {
+            "ASTRAKV_RUNTIME_CONTROL_STATE_DIR": raw_tmp,
+            "ASTRAKV_KV_CORE_CPU_PREFETCH_BUDGET_FRACTION": "0.2",
+        }, clear=False), patch(
+            "astrakv.runtime.vendor_callback_bridge.installed_kv_core_callbacks",
+            return_value=callbacks,
+        ), patch.object(VendorCallbackBridge, "_start_prefetch_watcher_if_worker"):
+            bridge = VendorCallbackBridge(_connector(cpu, disk))
+            capability = bridge._runtime_capability(external_token_cap=0)
+            self.assertAlmostEqual(capability.cpu_prefetch_budget_fraction, 0.2)
+            self.assertEqual(capability.cpu_prefetch_budget_bytes, 20_000_000_000)
+
+    def test_release_cpu_staging_after_consume(self) -> None:
+        cpu, disk = _CPU(), _Disk()
+        callbacks = _callbacks()
+        with tempfile.TemporaryDirectory() as raw_tmp, patch.dict(os.environ, {
+            "ASTRAKV_RUNTIME_CONTROL_STATE_DIR": raw_tmp,
+            "ASTRAKV_KV_CORE_RELEASE_CPU_STAGING_ON_CONSUME": "true",
+        }, clear=False), patch(
+            "astrakv.runtime.vendor_callback_bridge.installed_kv_core_callbacks",
+            return_value=callbacks,
+        ), patch.object(VendorCallbackBridge, "_start_prefetch_watcher_if_worker"):
+            bridge = VendorCallbackBridge(_connector(cpu, disk))
+            key = _Key("key-0")
+            bridge._prefetch_by_request["native-request"] = "prefetch:p1"
+            bridge._prefetch_keys["prefetch:p1"] = (key,)
+            cpu.hot_cache[key] = SimpleNamespace(get_physical_size=lambda: 1024)
+            bridge._release_cpu_staging_after_consume("native-request")
+            self.assertEqual(cpu.removed, [key])
+            self.assertFalse(cpu.hot_cache)
+            records = [
+                json.loads(line)
+                for line in (Path(raw_tmp) / "kv_core_policy_decisions.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            self.assertEqual(records[-1]["action"], "release_cpu_staging_after_consume")
+            self.assertEqual(records[-1]["removed_count"], 1)
 
 
 if __name__ == "__main__":

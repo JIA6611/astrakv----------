@@ -739,6 +739,7 @@ class VendorCallbackBridge:
             })
         finally:
             self._note_reap_release(physical, time.time_ns())
+            self._release_cpu_staging_after_consume(request_id)
             self._pending_prefill_steps.pop(request_id, None)
             self._scheduled_prefix_tokens.pop(request_id, None)
 
@@ -1327,6 +1328,52 @@ class VendorCallbackBridge:
         if int(state.get("ref_count") or 0) == 0:
             state["last_release_ns"] = int(now_ns)
 
+    def _release_cpu_staging_after_consume(self, native_request_id: str) -> None:
+        """Demote a consumed CPU staging copy back out of LocalCPUBackend.
+
+        A prefetched CPU copy exists only to stage the load; once the native
+        request has consumed it, keeping it resident accumulates unified-memory
+        peak and exhausts the CPU prefetch budget for later prefixes.  Release
+        respects LMCache ref-count ownership via non-force ``remove`` and skips
+        pinned/missing chunks.
+        """
+        if not _env_flag("ASTRAKV_KV_CORE_RELEASE_CPU_STAGING_ON_CONSUME", True):
+            return
+        prefetch_id = self._prefetch_by_request.pop(native_request_id, "")
+        if not prefetch_id:
+            return
+        keys = self._prefetch_keys.pop(prefetch_id, ())
+        if not keys:
+            return
+        manager = self._storage_manager()
+        if manager is None:
+            return
+        cpu = getattr(manager, "storage_backends", {}).get("LocalCPUBackend")
+        if cpu is None:
+            return
+        removed = 0
+        for key in keys:
+            try:
+                deleted = bool(cpu.remove(key, force=False))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if deleted:
+                policy = getattr(cpu, "cache_policy", None)
+                update = getattr(policy, "update_on_force_evict", None)
+                if callable(update):
+                    update(key)
+                removed += 1
+        self._append("kv_core_policy_decisions.jsonl", {
+            "request_id": native_request_id,
+            "prefetch_id": prefetch_id,
+            "action": "release_cpu_staging_after_consume",
+            "tier": "cpu",
+            "key_count": len(keys),
+            "removed_count": removed,
+            "status": "completed" if removed else "pinned_or_missing",
+            "timestamp_ns": time.time_ns(),
+        })
+
     @staticmethod
     def _cpu_bytes(cpu: Any, keys: Iterable[Any]) -> int:
         if cpu is None:
@@ -1842,7 +1889,10 @@ class VendorCallbackBridge:
             uma_available_bytes=max(0, uma_available),
             memory_pressure=pressure,
             queue_depth=max(0, queue_depth),
-            cpu_prefetch_budget_fraction=base.cpu_prefetch_budget_fraction,
+            cpu_prefetch_budget_fraction=_env_float(
+                "ASTRAKV_KV_CORE_CPU_PREFETCH_BUDGET_FRACTION",
+                float(base.cpu_prefetch_budget_fraction),
+            ),
         )
 
     def _logical_request_id(self, native_request_id: str) -> str:

@@ -17,7 +17,7 @@ cd "$ROOT"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 PYTHON="${ASTRAKV_PYTHON:-/home/zyx/venv_for_zyx/bin/python3}"
-MODEL="${ASTRAKV_MODEL:-/home/zyx/astrakv-W/models/Qwen3-8B}"
+MODEL="${ASTRAKV_MODEL:-/home/zyx/astrakv2/models/Qwen3-8B}"
 MANIFEST="${ASTRAKV_MANIFEST:-/home/zyx/astrakv-W/deployments/kv-core-v3-e3-deterministic-recovery-20260809/deployment.manifest.json}"
 SMOKE="${ASTRAKV_SMOKE:-/home/zyx/astrakv-W/results/kv-core-e1-smoke-20260813T120659Z/E1/repeated_long_prefix/cold/variant/callback-smoke.json}"
 GROUPED_ROOT="${ASTRAKV_GROUPED_ROOT:-/home/zyx/astrakv-W/results/dgx_prefetch_validation_bundle/workloads}"

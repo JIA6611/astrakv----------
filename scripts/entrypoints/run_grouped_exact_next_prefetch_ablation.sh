@@ -39,6 +39,7 @@ LIMIT="0"
 SERVER_PID=""
 SIDECAR_MODE="build"
 EXTERNAL_SIDECAR=""
+DATASETS="qasper,multifieldqa_en"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -53,6 +54,7 @@ while [[ $# -gt 0 ]]; do
     --limit) LIMIT="$2"; shift 2 ;;
     --no-sidecar) SIDECAR_MODE="none"; shift ;;
     --sidecar-path) EXTERNAL_SIDECAR="$2"; shift 2 ;;
+    --datasets) DATASETS="$2"; shift 2 ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -63,6 +65,12 @@ done
 [[ "$HOST" == "127.0.0.1" || "$HOST" == "localhost" ]] || { echo "Only loopback hosts are allowed" >&2; exit 2; }
 [[ "$LIMIT" =~ ^[0-9]+$ ]] || { echo "--limit must be a non-negative integer" >&2; exit 2; }
 [[ -n "$GROUPED_ROOT" ]] || { echo "--grouped-root is required" >&2; exit 2; }
+IFS=',' read -r -a SELECTED_DATASETS <<< "$DATASETS"
+[[ "${#SELECTED_DATASETS[@]}" -gt 0 ]] || { echo "--datasets must not be empty" >&2; exit 2; }
+for dataset in "${SELECTED_DATASETS[@]}"; do
+  [[ -f "$GROUPED_ROOT/$dataset/grouped_prompts.jsonl" ]] || {
+    echo "missing $GROUPED_ROOT/$dataset/grouped_prompts.jsonl" >&2; exit 2; }
+done
 
 cleanup() {
   if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -228,7 +236,7 @@ run_condition() {
 
 mkdir -p "$OUTPUT_DIR"
 
-for dataset in qasper multifieldqa_en; do
+for dataset in "${SELECTED_DATASETS[@]}"; do
   materialize_dataset "$dataset"
   build_analysis_artifacts "$dataset"
   canonical="$OUTPUT_DIR/$dataset/materialized/${dataset}_grouped_exact_next_canonical_workload.jsonl"

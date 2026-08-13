@@ -38,6 +38,13 @@ class Prefetch2x2ValidatorTests(unittest.TestCase):
                 {"prefetch_id": "p1", "status": "consumed"},
                 {"prefetch_id": "p2", "status": "wasted"},
             ])
+            (run_dir / "benchmark_results.csv").write_text(
+                "case,status,ttft_ms\n"
+                "c1,ok,100.0\n"
+                "c2,ok,200.0\n"
+                "c3,error,300.0\n",
+                encoding="utf-8",
+            )
 
             cell = _aggregate_cell(root, "qasper", "variant")
 
@@ -48,6 +55,9 @@ class Prefetch2x2ValidatorTests(unittest.TestCase):
         self.assertEqual(cell["prefetch_a"]["tickets_wasted"], 1)
         self.assertEqual(cell["conflict_signals"]["invalidate_removed_chunk_count"], 3)
         self.assertTrue(cell["conflict_signals"]["dual_accounting_ticket_consumed_and_b_completed"])
+        self.assertEqual(cell["benchmark"]["success_count"], 2)
+        self.assertEqual(cell["benchmark"]["ttft_p50_ms"], 100.0)
+        self.assertEqual(cell["benchmark"]["ttft_p95_ms"], 200.0)
 
     def test_missing_artifacts_aggregate_to_zeros(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:

@@ -24,6 +24,7 @@ MODEL="${ASTRAKV_MODEL:-$ROOT/models/Qwen3-8B}"
 OUTPUT_ROOT="${ASTRAKV_ROOT:-$ROOT}/results/prefetch-ablation-2x2-$TIMESTAMP"
 LIMIT="50"
 SKIP_VALIDATE="false"
+DATASETS="qasper,multifieldqa_en"
 
 usage() {
   cat <<'EOF'
@@ -35,6 +36,7 @@ Options:
   --model PATH         Local model path (default $ASTRAKV_MODEL or repo models).
   --output-root PATH   Root for the two ablation runs (default results/...).
   --limit N            Per-dataset request limit for both runs (default 50).
+  --datasets LIST      Comma-separated datasets (default qasper,multifieldqa_en).
   --skip-validate      Skip the final 4-cell aggregation step.
 EOF
 }
@@ -45,6 +47,7 @@ while [[ $# -gt 0 ]]; do
     --model) MODEL="$2"; shift 2 ;;
     --output-root) OUTPUT_ROOT="$2"; shift 2 ;;
     --limit) LIMIT="$2"; shift 2 ;;
+    --datasets) DATASETS="$2"; shift 2 ;;
     --skip-validate) SKIP_VALIDATE="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -54,7 +57,9 @@ done
 [[ -n "$GROUPED_ROOT" && -d "$GROUPED_ROOT" ]] || { echo "--grouped-root is required" >&2; exit 2; }
 [[ -d "$MODEL" ]] || { echo "model directory is missing: $MODEL" >&2; exit 2; }
 [[ "$LIMIT" =~ ^[0-9]+$ ]] || { echo "--limit must be a non-negative integer" >&2; exit 2; }
-for dataset in qasper multifieldqa_en; do
+IFS=',' read -r -a SELECTED_DATASETS <<< "$DATASETS"
+[[ "${#SELECTED_DATASETS[@]}" -gt 0 ]] || { echo "--datasets must not be empty" >&2; exit 2; }
+for dataset in "${SELECTED_DATASETS[@]}"; do
   [[ -f "$GROUPED_ROOT/$dataset/grouped_prompts.jsonl" ]] || {
     echo "missing $GROUPED_ROOT/$dataset/grouped_prompts.jsonl" >&2
     exit 2
@@ -69,6 +74,7 @@ bash scripts/entrypoints/run_grouped_exact_next_prefetch_ablation.sh \
   --grouped-root "$GROUPED_ROOT" \
   --model "$MODEL" \
   --limit "$LIMIT" \
+  --datasets "$DATASETS" \
   --output-dir "$AOFF_DIR"
 
 echo "=== [2x2] Run 2/2: A on (cells: A1B0, A1B1) ==="
@@ -79,6 +85,7 @@ ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD=true \
   --grouped-root "$GROUPED_ROOT" \
   --model "$MODEL" \
   --limit "$LIMIT" \
+  --datasets "$DATASETS" \
   --output-dir "$AON_DIR"
 
 if [[ "$SKIP_VALIDATE" == "true" ]]; then
@@ -89,6 +96,7 @@ fi
 PYTHON="${ASTRAKV_PYTHON:-python3}"
 "$PYTHON" scripts/reporting/validate_prefetch_2x2_ablation.py \
   --a-off "$AOFF_DIR" --a-on "$AON_DIR" \
+  --datasets "$DATASETS" \
   --output "$OUTPUT_ROOT/prefetch_2x2_validation.json"
 
 echo "2x2 ablation completed: $OUTPUT_ROOT"

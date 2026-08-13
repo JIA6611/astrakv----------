@@ -88,10 +88,8 @@ done
 [[ -n "$TEST_ROOT" && -d "$TEST_ROOT" ]] || { echo "--test-grouped-root is required" >&2; exit 2; }
 [[ -f "$TRAIN_ROOT/$TRAIN_DATASET/grouped_prompts.jsonl" ]] || {
   echo "missing $TRAIN_ROOT/$TRAIN_DATASET/grouped_prompts.jsonl" >&2; exit 2; }
-for dataset in qasper multifieldqa_en; do
-  [[ -f "$TEST_ROOT/$dataset/grouped_prompts.jsonl" ]] || {
-    echo "missing $TEST_ROOT/$dataset/grouped_prompts.jsonl" >&2; exit 2; }
-done
+[[ -f "$TEST_ROOT/$TEST_DATASET/grouped_prompts.jsonl" ]] || {
+  echo "missing $TEST_ROOT/$TEST_DATASET/grouped_prompts.jsonl" >&2; exit 2; }
 [[ -d "$MODEL" ]] || { echo "model directory is missing: $MODEL" >&2; exit 2; }
 [[ "$TRAIN_LIMIT" =~ ^[0-9]+$ && "$LIMIT" =~ ^[0-9]+$ ]] || {
   echo "--train-limit and --limit must be non-negative integers" >&2; exit 2; }
@@ -142,6 +140,7 @@ echo "=== [transfer] Test phase on $TEST_DATASET (Profile-B) ==="
 echo "=== [2x2] Run 1/2: A off (cells: A0B0, A0B1) ==="
 bash scripts/entrypoints/run_grouped_exact_next_prefetch_ablation.sh \
   --grouped-root "$TEST_ROOT" --model "$MODEL" --limit "$LIMIT" \
+  --datasets "$TEST_DATASET" \
   --output-dir "$OUTPUT_ROOT/test-a-off" "${SIDECAR_ARGS[@]}"
 
 echo "=== [2x2] Run 2/2: A on (cells: A1B0, A1B1) ==="
@@ -150,10 +149,12 @@ ASTRAKV_KV_CORE_LOCAL_CPU=true ASTRAKV_KV_CORE_CPU_PREFETCH_ENABLED=true \
 ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD=true \
   bash scripts/entrypoints/run_grouped_exact_next_prefetch_ablation.sh \
   --grouped-root "$TEST_ROOT" --model "$MODEL" --limit "$LIMIT" \
+  --datasets "$TEST_DATASET" \
   --output-dir "$OUTPUT_ROOT/test-a-on" "${SIDECAR_ARGS[@]}"
 
 "$PYTHON" scripts/reporting/validate_prefetch_2x2_ablation.py \
   --a-off "$OUTPUT_ROOT/test-a-off" --a-on "$OUTPUT_ROOT/test-a-on" \
+  --datasets "$TEST_DATASET" \
   --output "$OUTPUT_ROOT/prefetch_2x2_validation.json"
 
 echo "Transfer ablation completed: $OUTPUT_ROOT"

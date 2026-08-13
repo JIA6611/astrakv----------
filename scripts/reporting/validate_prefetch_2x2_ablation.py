@@ -16,6 +16,7 @@ that feed the Phase-2 mitigation decision.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from collections import Counter
 from pathlib import Path
@@ -23,7 +24,6 @@ from typing import Any
 
 
 SCHEMA = "astrakv-prefetch-2x2-validation-v1"
-DATASETS = ("qasper", "multifieldqa_en")
 ROLES = ("baseline", "variant")
 
 
@@ -74,6 +74,42 @@ def _tickets(run_dir: Path, state_dir: Path) -> list[dict[str, Any]]:
     return _read_jsonl(path) if path is not None else []
 
 
+def _benchmark_ttft(run_dir: Path, state_dir: Path) -> dict[str, Any]:
+    path = _first_existing(
+        run_dir / "benchmark_results.csv",
+        state_dir / "benchmark_results.csv",
+    )
+    if path is None:
+        return {"success_count": 0, "ttft_p50_ms": None, "ttft_p95_ms": None}
+    values: list[float] = []
+    with path.open(encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            if str(row.get("status") or "") != "ok":
+                continue
+            raw = row.get("ttft_ms") or row.get("ttft_p50_ms")
+            if raw in (None, ""):
+                continue
+            try:
+                values.append(float(raw))
+            except (TypeError, ValueError):
+                continue
+    values.sort()
+    if not values:
+        return {"success_count": 0, "ttft_p50_ms": None, "ttft_p95_ms": None}
+    return {
+        "success_count": len(values),
+        "ttft_p50_ms": _percentile(values, 50),
+        "ttft_p95_ms": _percentile(values, 95),
+    }
+
+
+def _percentile(sorted_values: list[float], percentile: float) -> float:
+    if not sorted_values:
+        return 0.0
+    index = max(0, min(len(sorted_values) - 1, int(round(len(sorted_values) * percentile / 100.0 - 0.5))))
+    return sorted_values[index]
+
+
 def _aggregate_cell(root: Path, dataset: str, role: str) -> dict[str, Any]:
     run_dir = root / dataset / role
     state_dir = root / dataset / f"{role}-state"
@@ -117,6 +153,7 @@ def _aggregate_cell(root: Path, dataset: str, role: str) -> dict[str, Any]:
     return {
         "dataset": dataset,
         "role": role,
+        "benchmark": _benchmark_ttft(run_dir, state_dir),
         "prefetch_b": {
             "receipt_count": len(b_receipts),
             "completed_with_bytes": len(b_completed),
@@ -148,7 +185,14 @@ def main() -> int:
     parser.add_argument("--a-off", required=True, help="Output dir of the A-off ablation run.")
     parser.add_argument("--a-on", required=True, help="Output dir of the A-on ablation run.")
     parser.add_argument("--output", default="", help="Summary JSON path (default stdout).")
+    parser.add_argument(
+        "--datasets", default="qasper,multifieldqa_en",
+        help="Comma-separated datasets to aggregate (default qasper,multifieldqa_en).",
+    )
     args = parser.parse_args()
+    datasets = tuple(item.strip() for item in args.datasets.split(",") if item.strip())
+    if not datasets:
+        raise SystemExit("--datasets must not be empty")
 
     a_off = Path(args.a_off)
     a_on = Path(args.a_on)
@@ -157,7 +201,7 @@ def main() -> int:
 
     cells: list[dict[str, Any]] = []
     for a_enabled, root in ((False, a_off), (True, a_on)):
-        for dataset in DATASETS:
+        for dataset in datasets:
             for role in ROLES:
                 cell = _aggregate_cell(root, dataset, role)
                 cell["a_enabled"] = a_enabled
@@ -189,7 +233,7 @@ def main() -> int:
         "a_on_root": str(a_on),
         "cells": cells,
         "acceptance": {
-            "cells_present": len(cells) == 8,
+            "cells_present": len(cells) == 4 * len(datasets),
             "b_only_completed_receipt": any(
                 cell["prefetch_b"]["completed_with_bytes"] > 0
                 for cell in b_only_cells

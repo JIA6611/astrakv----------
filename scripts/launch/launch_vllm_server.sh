@@ -11,10 +11,10 @@ PYTHON="${ASTRAKV_PYTHON:-$DEFAULT_PYTHON}"
 if [[ ! -x "$PYTHON" ]] || ! "$PYTHON" -c "import vllm" >/dev/null 2>&1; then
   if [[ -x "$ROOT/.venv_from_szl/bin/python" ]] && "$ROOT/.venv_from_szl/bin/python" -c "import vllm" >/dev/null 2>&1; then
     PYTHON="$ROOT/.venv_from_szl/bin/python"
-  elif command -v python3 >/dev/null 2>&1 && python3 -c "import vllm" >/dev/null 2>&1; then
-    PYTHON="$(command -v python3)"
   elif [[ -n "${ASTRAKV_PYTHON:-}" && -x "${ASTRAKV_PYTHON:-}" ]]; then
     PYTHON="${ASTRAKV_PYTHON}"
+  elif command -v python3 >/dev/null 2>&1 && python3 -c "import vllm" >/dev/null 2>&1; then
+    PYTHON="$(command -v python3)"
   fi
 fi
 # Ensure JIT subprocesses can resolve tools installed with the selected Python.

@@ -85,6 +85,23 @@ class OnlineProfileStore:
             state["event_count"] += 1
             state["bytes"] += max(0, event.bytes or 0)
             state["current_tier"] = _prefer_known_tier(event.tier_after, state["current_tier"])
+            if event.bytes and event.bytes > 0:
+                tier_after = str(event.tier_after or "")
+                if (
+                    event.action in {
+                        HookAction.CACHE_STORE,
+                        HookAction.CACHE_LOAD,
+                        HookAction.PREFETCH,
+                        HookAction.OFFLOAD,
+                    }
+                    and tier_after in {"cpu", "ssd"}
+                ):
+                    state["resident_bytes"] = max(int(state["resident_bytes"] or 0), int(event.bytes))
+            if (
+                event.action in {HookAction.EVICT, HookAction.DROP}
+                and event.status in {"completed", "ok", "executed"}
+            ):
+                state["resident_bytes"] = 0
             state["last_request_id"] = event.request_id
             state["last_object_key"] = event.object_key
             state["last_object_level"] = event.object_level.value
@@ -329,6 +346,14 @@ class OnlineProfileStore:
             value = self._objects.get(backend_object_id)
             return None if value is None else json.loads(json.dumps(value, sort_keys=True))
 
+    def objects(self) -> dict[str, dict[str, Any]]:
+        """Return a deep-copied snapshot of every tracked object state."""
+        with self._lock:
+            return {
+                key: json.loads(json.dumps(value, sort_keys=True))
+                for key, value in sorted(self._objects.items())
+            }
+
     def controller_state(self) -> dict[str, Any]:
         with self._lock:
             return json.loads(json.dumps(self._controller_state, sort_keys=True))
@@ -407,6 +432,7 @@ def _new_object_state(backend_object_id: str, *, binding_generation: Any) -> dic
         "request_count": 0,
         "reuse_count": 0,
         "bytes": 0,
+        "resident_bytes": 0,
         "cache_hits": 0,
         "cache_misses": 0,
         "cache_stores": 0,

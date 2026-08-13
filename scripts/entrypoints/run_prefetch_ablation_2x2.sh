@@ -94,6 +94,7 @@ if [[ "$SKIP_VALIDATE" == "true" ]]; then
 fi
 
 PYTHON="${ASTRAKV_PYTHON:-python3}"
+export ASTRAKV_PYTHON="$PYTHON"
 "$PYTHON" scripts/reporting/validate_prefetch_2x2_ablation.py \
   --a-off "$AOFF_DIR" --a-on "$AON_DIR" \
   --datasets "$DATASETS" \

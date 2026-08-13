@@ -130,9 +130,9 @@ run_role() {
   local run_id="e3p-${role}-$(date -u +%Y%m%dT%H%M%SZ)"
   local secret_hex
   mkdir -p "$state_dir" "$cache_dir"
-  cat > "$config" <<EOF
+cat > "$config" <<EOF
 local_cpu: true
-max_local_cpu_size: 5.0
+max_local_cpu_size: ${ASTRAKV_LOCAL_CPU_SIZE_GB:-5.0}
 local_disk: $cache_dir
 max_local_disk_size: 80.0
 EOF

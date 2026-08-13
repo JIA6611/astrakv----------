@@ -97,12 +97,18 @@ start_server() {
   local run_id="$1" state_dir="$2" runtime_env="$3" cache_dir="$4" log_path="$5"
   cleanup
   mkdir -p "$cache_dir"
-  sed "s|^local_disk:.*|local_disk: $cache_dir|" configs/lmcache_disk_example.yaml > "$state_dir/lmcache.yaml"
+  # CPU==GPU on UMA: force the CPU hot cache on and size it equal to the GPU
+  # KV tier (default 5.0 GiB standalone; the full pipeline sets it to 71 GiB).
+  sed -e "s|^local_cpu:.*|local_cpu: true|" \
+      -e "s|^max_local_cpu_size:.*|max_local_cpu_size: ${ASTRAKV_LOCAL_CPU_SIZE_GB:-5.0}|" \
+      -e "s|^local_disk:.*|local_disk: $cache_dir|" \
+      configs/lmcache_disk_example.yaml > "$state_dir/lmcache.yaml"
   set -a
   # shellcheck disable=SC1090
   source "$runtime_env"
   set +a
   ASTRAKV_MODEL="$MODEL" \
+  ASTRAKV_PYTHON="$PYTHON" \
   ASTRAKV_HOST="$HOST" \
   ASTRAKV_PORT="$PORT" \
   ASTRAKV_MAX_MODEL_LEN="$MAX_MODEL_LEN" \

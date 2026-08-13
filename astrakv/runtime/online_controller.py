@@ -46,6 +46,16 @@ class OnlinePolicyControllerConfig:
     runtime_prefix_min_reuse_count: int = 2
     runtime_prefix_min_observation_count: int = 3
     runtime_prefix_confidence_threshold: float = 0.55
+    # evict-B control plane: pressure gate, coldness score, and global scan.
+    evict_dispatch_enabled: bool = True
+    evict_pressure_gate_enabled: bool = True
+    evict_pressure_trigger: float = 0.8
+    evict_cpu_capacity_bytes: int = 0
+    evict_ssd_capacity_bytes: int = 0
+    evict_cold_score_threshold: float = 0.35
+    global_evict_scan_enabled: bool = True
+    global_evict_scan_min_interval_s: float = 5.0
+    global_evict_scan_max_victims: int = 4
     # Direct controller users retain the historic active default. The service
     # host explicitly supplies off/shadow/active and defaults to off.
     kv_core_mode: RuntimeMode = RuntimeMode.ACTIVE
@@ -81,6 +91,7 @@ class OnlinePolicyController:
                 deadline_ms=self.config.deadline_ms,
             )
         )
+        self._last_global_evict_scan_ns = 0
 
     def ingest(self, event: BackendHookEvent) -> bool:
         if event.run_id != self.run_id or not self.bridge.observe_event(event):
@@ -144,6 +155,20 @@ class OnlinePolicyController:
         prefetch_hit_rate = _prefetch_hit_rate(profile, object_state)
         prefetch_waste = _as_int(object_state.get("prefetch_waste_count"))
         load_latency_ms = _profile_load_latency_ms(profile, object_state)
+        pressure_snapshot = self._pressure_snapshot()
+        pressure_over = bool(pressure_snapshot["over_pressure"]) if self.config.evict_pressure_gate_enabled else True
+        runtime_confidence = (
+            float(runtime_prefix_profile.get("runtime_confidence") or 0.0)
+            if runtime_prefix_profile is not None
+            else 0.0
+        )
+        evict_cold_score = _evict_cold_score(
+            policy_reuse_frequency=policy_reuse_frequency,
+            runtime_confidence=runtime_confidence,
+            prefetch_waste=prefetch_waste,
+            cold_reuse_threshold=self.config.cold_reuse_threshold,
+            prefetch_waste_tolerance=self.config.prefetch_waste_tolerance,
+        )
         load_target_id = _load_target_id(binding, object_state)
         load_target_reqmeta_id = _load_target_runtime_reqmeta_id(binding)
         owner_reqmeta_id = str(object_state.get("owner_runtime_reqmeta_id") or "")
@@ -161,7 +186,7 @@ class OnlinePolicyController:
         load_ready = _action_ready(execution_actions, "load")
         prefetch_ready = _action_ready(execution_actions, "prefetch")
         offload_ready = _action_ready(execution_actions, "offload")
-        evict_ready = _action_ready(execution_actions, "evict")
+        evict_ready = _action_ready(execution_actions, "evict") and self.config.evict_dispatch_enabled
         drop_ready = _action_ready(execution_actions, "drop")
         prediction = _prediction_for_binding(
             self.prediction_source,
@@ -362,7 +387,7 @@ class OnlinePolicyController:
                 action = "prefetch"
                 target_tier = "cpu"
                 reason = "online profile: SSD-resident object looks warm but is not ready for direct load, so prefetch is preferred"
-            elif active_refs == 0 and evict_ready and (
+            elif active_refs == 0 and evict_ready and pressure_over and (
                 (policy_reuse_frequency <= self.config.cold_reuse_threshold and prefetch_hit_rate > 0.0)
                 or prefetch_waste > 0
             ):
@@ -376,7 +401,7 @@ class OnlinePolicyController:
             ):
                 action = "drop"
                 reason = "online profile: SSD-resident object is cold, unreferenced, and has no prefetch waste, so drop is preferred"
-            elif active_refs == 0 and evict_ready and (
+            elif active_refs == 0 and evict_ready and pressure_over and (
                 policy_reuse_frequency <= self.config.cold_reuse_threshold
                 or prefetch_waste > 0
             ):
@@ -464,6 +489,12 @@ class OnlinePolicyController:
                 "offload_ready": offload_ready,
                 "evict_ready": evict_ready,
                 "drop_ready": drop_ready,
+                "evict_dispatch_enabled": self.config.evict_dispatch_enabled,
+                "evict_pressure_gate_enabled": self.config.evict_pressure_gate_enabled,
+                "evict_pressure_snapshot": dict(pressure_snapshot),
+                "evict_pressure_over": bool(pressure_over),
+                "runtime_confidence": runtime_confidence,
+                "evict_cold_score": evict_cold_score,
                 "load_is_worthwhile": load_is_worthwhile,
                 "last_access_time_ns": _as_int(object_state.get("last_access_time_ns")),
                 "current_tier_source": _current_tier_source(object_state, binding),

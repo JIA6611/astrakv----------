@@ -37,6 +37,8 @@ GPU_MEMORY_UTILIZATION="0.72"
 TIMEOUT="900"
 LIMIT="0"
 SERVER_PID=""
+SIDECAR_MODE="build"
+EXTERNAL_SIDECAR=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -49,6 +51,8 @@ while [[ $# -gt 0 ]]; do
     --max-model-len) MAX_MODEL_LEN="$2"; shift 2 ;;
     --gpu-memory-utilization) GPU_MEMORY_UTILIZATION="$2"; shift 2 ;;
     --limit) LIMIT="$2"; shift 2 ;;
+    --no-sidecar) SIDECAR_MODE="none"; shift ;;
+    --sidecar-path) EXTERNAL_SIDECAR="$2"; shift 2 ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -125,8 +129,11 @@ EOF
     printf 'ASTRAKV_ENABLE_ONLINE_PREFETCH_DISPATCH=false\nASTRAKV_ONLINE_OFFLINE_GATE_PATH=%s\n' \
       "$state_dir/offline_gate.json" >> "$runtime_env"
   else
-    printf 'ASTRAKV_ENABLE_ONLINE_PREFETCH_DISPATCH=true\nASTRAKV_ONLINE_OFFLINE_GATE_PATH=%s\nASTRAKV_ONLINE_PREDICTION_SIDECAR_PATH=%s\n' \
-      "$state_dir/offline_gate.json" "$sidecar_path" >> "$runtime_env"
+    printf 'ASTRAKV_ENABLE_ONLINE_PREFETCH_DISPATCH=true\nASTRAKV_ONLINE_OFFLINE_GATE_PATH=%s\n' \
+      "$state_dir/offline_gate.json" >> "$runtime_env"
+    if [[ -n "$sidecar_path" ]]; then
+      printf 'ASTRAKV_ONLINE_PREDICTION_SIDECAR_PATH=%s\n' "$sidecar_path" >> "$runtime_env"
+    fi
   fi
   chmod 600 "$runtime_env"
 }
@@ -170,14 +177,19 @@ run_condition() {
   mkdir -p "$run_dir" "$state_dir" "$sidecar_dir"
   local secret
   secret="$($PYTHON -c 'import secrets; print(secrets.token_hex(32))')"
-  local sidecar_path="$sidecar_dir/sidecar_prediction.jsonl"
+  local sidecar_path=""
   if [[ "$role" == "variant" ]]; then
-    "$PYTHON" scripts/reporting/build_sidecar_prediction.py \
-      --candidate-report "$candidate_report" \
-      --output-dir "$sidecar_dir" \
-      --run-id "$run_id" \
-      --lead-time-ms 250 \
-      --predicted-class exact-next
+    if [[ -n "$EXTERNAL_SIDECAR" ]]; then
+      sidecar_path="$EXTERNAL_SIDECAR"
+    elif [[ "$SIDECAR_MODE" == "build" ]]; then
+      "$PYTHON" scripts/reporting/build_sidecar_prediction.py \
+        --candidate-report "$candidate_report" \
+        --output-dir "$sidecar_dir" \
+        --run-id "$run_id" \
+        --lead-time-ms 250 \
+        --predicted-class exact-next
+      sidecar_path="$sidecar_dir/sidecar_prediction.jsonl"
+    fi
   fi
   write_runtime_env "$run_id" "$state_dir" "$runtime_env" "$secret" "$role" "$sidecar_path"
   start_server "$run_id" "$state_dir" "$runtime_env" "$cache_dir" "$server_log"

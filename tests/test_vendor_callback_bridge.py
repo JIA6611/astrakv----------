@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -610,6 +611,31 @@ class VendorCallbackBridgeTests(unittest.TestCase):
             )
         )
 
+    @staticmethod
+    def _wait_for_ticket_record(state_dir: str, prefetch_id: str, status: str) -> None:
+        """Wait for the async promote callback to persist its ticket record.
+
+        The promote done-callback runs on the manager event loop after the
+        future resolves; tearing down the temp dir before it writes the ticket
+        file would race with cleanup.  Poll the JSONL until the terminal
+        record appears (bounded, so a real failure still surfaces quickly).
+        """
+        ticket_path = Path(state_dir) / "kv_core_prefetch_tickets.jsonl"
+        needle = f'"prefetch_id": "{prefetch_id}"'
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            lines = (
+                ticket_path.read_text(encoding="utf-8").splitlines()
+                if ticket_path.exists()
+                else []
+            )
+            if any(needle in line and f'"status": "{status}"' in line for line in lines):
+                return
+            time.sleep(0.01)
+        raise AssertionError(
+            f"ticket record {prefetch_id} with status {status!r} not persisted within 5s"
+        )
+
     def test_schedule_cpu_promotion_happy_path_submits_ticket_and_promotes(self) -> None:
         callbacks = KVCoreConnectorCallbacks(
             mode=RuntimeMode.ACTIVE,
@@ -650,6 +676,7 @@ class VendorCallbackBridgeTests(unittest.TestCase):
                     callbacks.tickets.get(ticket.prefetch_id).status,
                     PrefetchStatus.COMPLETED,
                 )
+                self._wait_for_ticket_record(raw_tmp, ticket.prefetch_id, "completed")
                 decisions = [
                     json.loads(line)
                     for line in (Path(raw_tmp) / "kv_core_policy_decisions.jsonl").read_text(
@@ -706,6 +733,7 @@ class VendorCallbackBridgeTests(unittest.TestCase):
                     callbacks.tickets.get(ticket.prefetch_id).status,
                     PrefetchStatus.COMPLETED,
                 )
+                self._wait_for_ticket_record(raw_tmp, ticket.prefetch_id, "completed")
                 decisions = [
                     json.loads(line)
                     for line in (Path(raw_tmp) / "kv_core_policy_decisions.jsonl").read_text(

@@ -2325,7 +2325,12 @@ class VendorCallbackBridge:
     def _append(self, filename: str, record: dict[str, Any]) -> None:
         if self._state_dir is None:
             return
-        self._state_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self._state_dir.mkdir(parents=True, exist_ok=True)
+        except FileExistsError:
+            # Concurrent async callbacks and teardown can race on the leaf
+            # directory; the append below still surfaces any real problem.
+            pass
         with (self._state_dir / filename).open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
 

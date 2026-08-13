@@ -71,7 +71,40 @@ def _prefetch_ready(manager: Any) -> tuple[bool, str]:
         return False, "prefetch_target_backend_missing:LocalCPUBackend"
     if _LOCAL_DISK_BACKEND not in storage_backends:
         return False, "prefetch_source_backend_missing:LocalDiskBackend"
+    cpu_backend = storage_backends[_LOCAL_CPU_BACKEND]
+    if not bool(getattr(cpu_backend, "use_hot", False)):
+        return False, "prefetch_target_backend_not_hot:LocalCPUBackend"
     return True, ""
+
+
+def _prefetch_diagnostic_context(manager: Any) -> dict[str, Any]:
+    """Best-effort capacity/pressure snapshot for prefetch failure receipts.
+
+    The snapshot is advisory: a missing runtime host, callbacks, or backend
+    simply yields zero-filled fields so receipts stay complete and parseable.
+    """
+    try:
+        from astrakv.runtime.lmcache047_bootstrap import (
+            _environment_capability,
+            installed_kv_core_callbacks,
+        )
+        callbacks = installed_kv_core_callbacks()
+        capability = getattr(callbacks, "capability", None)
+        if capability is None:
+            capability = _environment_capability()
+        return {
+            "cpu_used_bytes": int(getattr(capability, "cpu_used_bytes", 0) or 0),
+            "cpu_capacity_bytes": int(getattr(capability, "cpu_capacity_bytes", 0) or 0),
+            "cpu_prefetch_budget_bytes": int(getattr(capability, "cpu_prefetch_budget_bytes", 0) or 0),
+            "memory_pressure": float(getattr(capability, "memory_pressure", 0.0) or 0.0),
+        }
+    except Exception:
+        return {
+            "cpu_used_bytes": 0,
+            "cpu_capacity_bytes": 0,
+            "cpu_prefetch_budget_bytes": 0,
+            "memory_pressure": 0.0,
+        }
 
 
 def _load_ready(manager: Any) -> tuple[bool, str]:
@@ -1626,6 +1659,7 @@ class LMCache047ActionEndpoint:
         if isinstance(authorized, dict):
             return authorized
         key, manager = authorized
+        diagnostics = _prefetch_diagnostic_context(manager)
         prefetch_supported, blocked_reason = _prefetch_ready(manager)
         if not prefetch_supported:
             assert reservation_lease is not None and command_id is not None
@@ -1635,6 +1669,7 @@ class LMCache047ActionEndpoint:
                 "backend_object_id": backend_object_id,
                 "status": "blocked",
                 "blocked_reason": blocked_reason,
+                **diagnostics,
             }
         if target_tier not in {"unknown", "", "cpu"}:
             assert reservation_lease is not None and command_id is not None
@@ -1644,6 +1679,7 @@ class LMCache047ActionEndpoint:
                 "backend_object_id": backend_object_id,
                 "status": "blocked",
                 "blocked_reason": f"unsupported_prefetch_target_tier:{target_tier}",
+                **diagnostics,
             }
         cpu_present_before = _safe_manager_contains(manager, key, location=_LOCAL_CPU_BACKEND)
         disk_present_before = _safe_manager_contains(manager, key, location=_LOCAL_DISK_BACKEND)
@@ -1668,6 +1704,7 @@ class LMCache047ActionEndpoint:
                 "source_location": _LOCAL_DISK_BACKEND,
                 "target_location": _LOCAL_CPU_BACKEND,
                 "reservation_lease": reservation_lease,
+                **diagnostics,
             }
         if not disk_present_before:
             assert reservation_lease is not None and command_id is not None
@@ -1688,6 +1725,7 @@ class LMCache047ActionEndpoint:
                 "source_location": _LOCAL_DISK_BACKEND,
                 "target_location": _LOCAL_CPU_BACKEND,
                 "reservation_lease": reservation_lease,
+                **diagnostics,
             }
         try:
             memory_objs = _owner_action_batched_get(manager, key, location=_LOCAL_DISK_BACKEND)
@@ -1716,6 +1754,7 @@ class LMCache047ActionEndpoint:
                 "source_location": _LOCAL_DISK_BACKEND,
                 "target_location": _LOCAL_CPU_BACKEND,
                 "reservation_lease": reservation_lease,
+                **diagnostics,
             }
         status = "completed" if cpu_present and missing_memory_obj_count == 0 else "failed"
         assert reservation_lease is not None and command_id is not None
@@ -1742,6 +1781,7 @@ class LMCache047ActionEndpoint:
             "source_location": _LOCAL_DISK_BACKEND,
             "target_location": _LOCAL_CPU_BACKEND,
             "reservation_lease": reservation_lease,
+            **diagnostics,
         }
 
     def _authorize_bound_action(

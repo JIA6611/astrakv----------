@@ -24,7 +24,10 @@ class Manager:
         self.removed = []
         self.prefetch_reads = []
         self.load_requests = []
-        self.storage_backends = {"LocalCPUBackend": object(), "LocalDiskBackend": object()}
+        self.storage_backends = {
+            "LocalCPUBackend": type("HotCPU", (), {"use_hot": True})(),
+            "LocalDiskBackend": object(),
+        }
         self.cpu_present = True
         self.disk_present = True
         self.lmcache_engine = self
@@ -390,6 +393,57 @@ class ProtectedRuntimeActionServiceTests(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(os.stat(socket_path).st_mode), 0o600)
             finally:
                 server.close()
+
+    def test_receipt_passes_through_prefetch_failure_diagnostics(self):
+        class FailingEndpoint:
+            def execute_action(self, command):
+                del command
+                return {
+                    "status": "failed",
+                    "failure_reason": "cpu_capacity",
+                    "error": "boom",
+                    "error_type": "RuntimeError",
+                    "cpu_used_bytes": 42,
+                    "cpu_capacity_bytes": 64,
+                    "cpu_prefetch_budget_bytes": 32,
+                    "memory_pressure": 0.9,
+                }
+
+        registry = BackendBindingRegistry(run_id="run", engine_instance_id="engine", worker_id="worker")
+        context = RequestContext("run", "request", "prefix", ObjectLevel.PREFIX)
+        submitted = registry.observe("physical-key", HookAction.CACHE_STORE, "submitted", context)
+        binding = registry.complete_operation(
+            "physical-key", HookAction.CACHE_STORE, "completed", context,
+            submitted.event.metadata["operation_lease"],
+        ).binding
+        registry.observe("physical-key", HookAction.RELEASE, "completed", context)
+        lease = registry.reserve_action(
+            binding_id=binding.binding_id,
+            binding_generation=binding.binding_generation,
+            backend_object_id=binding.backend_object_id,
+            request_id="request",
+            object_key="prefix",
+            object_level=ObjectLevel.PREFIX,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.service(FailingEndpoint(), directory)
+            metadata = {"reservation_lease": lease, "deadline_ns": 101}
+            value = BackendActionCommand(
+                run_id="run", command_id="command-prefetch-fail", decision_id="decision",
+                request_id="request", object_key="prefix", object_level=ObjectLevel.PREFIX,
+                binding_id=binding.binding_id, backend_object_id=binding.backend_object_id,
+                action=HookAction.PREFETCH, issued_at_ns=1, target_tier="cpu",
+                metadata=metadata, binding_generation=binding.binding_generation,
+            )
+            value = replace(value, metadata={**metadata, "command_sha256": command_integrity_digest(value)})
+            challenge, proof = self.proof(service, value)
+            receipt = service.submit(value, challenge, proof)
+        self.assertEqual(receipt.status, "failed")
+        self.assertEqual(receipt.metadata["failure_reason"], "cpu_capacity")
+        self.assertEqual(receipt.metadata["cpu_used_bytes"], 42)
+        self.assertEqual(receipt.metadata["cpu_capacity_bytes"], 64)
+        self.assertEqual(receipt.metadata["cpu_prefetch_budget_bytes"], 32)
+        self.assertEqual(receipt.metadata["memory_pressure"], 0.9)
 
 
 if __name__ == "__main__":

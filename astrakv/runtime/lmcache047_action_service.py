@@ -142,6 +142,8 @@ class ProtectedRuntimeActionService:
                 "cpu_present_before", "cpu_present_after",
                 "missing_memory_obj_count", "memory_obj_count",
                 "expected_tokens", "loaded_tokens",
+                "cpu_used_bytes", "cpu_capacity_bytes",
+                "cpu_prefetch_budget_bytes", "memory_pressure",
             ):
                 if key in response and response.get(key) is not None:
                     metadata[key] = response[key]

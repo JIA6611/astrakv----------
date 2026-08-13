@@ -2,12 +2,13 @@ import unittest
 from unittest.mock import patch
 
 from astrakv.runtime.backend_binding_registry import BackendBindingRegistry, RequestContext
-from astrakv.runtime.backend_hook import HookAction
+from astrakv.runtime.backend_hook import BackendActionCommand, HookAction
 from astrakv.runtime.lmcache047_runtime_patch import (
     LMCache047ActionEndpoint,
     LMCache047RequestContextConsumer,
     _ConnectorLifecycle,
     _owner_action_batched_get,
+    _prefetch_ready,
     install_lmcache047_hooks,
     probe_lmcache047_storage_contract,
 )
@@ -353,7 +354,10 @@ class LMCache047RuntimePatchTests(unittest.TestCase):
 
         class Storage:
             def __init__(self):
-                self.storage_backends = {"LocalCPUBackend": object(), "LocalDiskBackend": disk}
+                self.storage_backends = {
+                    "LocalCPUBackend": type("HotCPU", (), {"use_hot": True})(),
+                    "LocalDiskBackend": disk,
+                }
                 self.lmcache_engine = type("Engine", (), {"retrieve": lambda *_args, **_kwargs: [True]})()
             def batched_put(self, keys, objects, transfer_spec=None, location=None):
                 self.storage_backends["LocalDiskBackend"].batched_submit_put_task(
@@ -938,6 +942,169 @@ class LMCache047RuntimePatchTests(unittest.TestCase):
         assert inherited_spec is not None
         self.assertEqual(inherited_spec.actions["load"]["load_target_id"], "load-target-future")
         self.assertEqual(inherited_spec.actions["load"]["runtime_reqmeta_id"], "reqmeta-future")
+
+    def test_prefetch_ready_requires_hot_cpu_backend(self) -> None:
+        manager = type("Manager", (), {
+            "storage_backends": {
+                "LocalCPUBackend": object(),
+                "LocalDiskBackend": object(),
+            },
+            "batched_contains": lambda *args, **kwargs: (0, {}),
+            "batched_get": lambda *args, **kwargs: [],
+        })()
+        supported, blocked_reason = _prefetch_ready(manager)
+        self.assertFalse(supported)
+        self.assertEqual(blocked_reason, "prefetch_target_backend_not_hot:LocalCPUBackend")
+        manager.storage_backends["LocalCPUBackend"] = type("HotCPU", (), {"use_hot": True})()
+        self.assertEqual(_prefetch_ready(manager), (True, ""))
+
+    def _released_prefetch_binding(self, manager):
+        registry = BackendBindingRegistry(run_id="run", engine_instance_id="engine", worker_id="worker")
+        context = RequestContext("run", "request", "prefix", ObjectLevel.PREFIX)
+        submitted = registry.observe("physical-key", HookAction.CACHE_STORE, "submitted", context)
+        binding = registry.complete_operation(
+            "physical-key",
+            HookAction.CACHE_STORE,
+            "completed",
+            context,
+            submitted.event.metadata["operation_lease"],
+        ).binding
+        registry.observe("physical-key", HookAction.RELEASE, "completed", context)
+        endpoint = LMCache047ActionEndpoint(registry, action_registration_enabled=True)
+        endpoint.register_binding(binding, "physical-key", manager)
+        return registry, binding, endpoint
+
+    def _prefetch_command(self, registry, binding, *, command_id="command-prefetch"):
+        lease = registry.reserve_action(
+            binding_id=binding.binding_id,
+            binding_generation=binding.binding_generation,
+            backend_object_id=binding.backend_object_id,
+            request_id="request",
+            object_key="prefix",
+            object_level=ObjectLevel.PREFIX,
+        )
+        return BackendActionCommand(
+            run_id="run",
+            command_id=command_id,
+            decision_id="decision",
+            request_id="request",
+            object_key="prefix",
+            object_level=ObjectLevel.PREFIX,
+            binding_id=binding.binding_id,
+            backend_object_id=binding.backend_object_id,
+            action=HookAction.PREFETCH,
+            issued_at_ns=1,
+            target_tier="cpu",
+            metadata={"reservation_lease": lease},
+            binding_generation=binding.binding_generation,
+        )
+
+    def test_prefetch_executor_success_records_completed_receipt(self) -> None:
+        class HotCPU:
+            use_hot = True
+
+        class SuccessManager:
+            def __init__(self):
+                self.storage_backends = {
+                    "LocalCPUBackend": HotCPU(),
+                    "LocalDiskBackend": object(),
+                }
+                self.cpu_present = False
+
+            def batched_contains(self, keys, search_range=None, pin=False):
+                location = None if not search_range else search_range[0]
+                if location == "LocalCPUBackend":
+                    return (1, {"LocalCPUBackend": list(keys)}) if self.cpu_present else (0, {})
+                if location == "LocalDiskBackend":
+                    return len(keys), {location: list(keys)}
+                return 0, {}
+
+            def batched_get(self, keys, location=None):
+                class MemoryObj:
+                    def get_physical_size(self):
+                        return 2048
+
+                self.cpu_present = True
+                return [MemoryObj() for _ in keys]
+
+            def remove(self, key, locations=None):
+                return 0
+
+        registry, binding, endpoint = self._released_prefetch_binding(SuccessManager())
+        receipt = endpoint.execute_action(self._prefetch_command(registry, binding))
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(receipt["tier_before"], "ssd")
+        self.assertEqual(receipt["tier_after"], "cpu")
+        self.assertEqual(receipt["bytes"], 2048)
+        self.assertEqual(receipt["prefetched"], 1)
+
+    def test_prefetch_executor_missing_memory_objects_records_failure_reason(self) -> None:
+        class HotCPU:
+            use_hot = True
+
+        class MissingMemoryManager:
+            storage_backends = {
+                "LocalCPUBackend": HotCPU(),
+                "LocalDiskBackend": object(),
+            }
+
+            def batched_contains(self, keys, search_range=None, pin=False):
+                location = None if not search_range else search_range[0]
+                if location == "LocalCPUBackend":
+                    return 0, {}
+                if location == "LocalDiskBackend":
+                    return len(keys), {location: list(keys)}
+                return 0, {}
+
+            def batched_get(self, keys, location=None):
+                return [None for _ in keys]
+
+            def remove(self, key, locations=None):
+                return 0
+
+        registry, binding, endpoint = self._released_prefetch_binding(MissingMemoryManager())
+        receipt = endpoint.execute_action(self._prefetch_command(registry, binding))
+        self.assertEqual(receipt["status"], "failed")
+        self.assertEqual(receipt["failure_reason"], "missing_memory_objects")
+        self.assertEqual(receipt["missing_memory_obj_count"], 1)
+        self.assertEqual(receipt["prefetched"], 0)
+        self.assertIn("cpu_used_bytes", receipt)
+        self.assertIn("cpu_capacity_bytes", receipt)
+        self.assertIn("cpu_prefetch_budget_bytes", receipt)
+        self.assertIn("memory_pressure", receipt)
+
+    def test_prefetch_executor_backend_exception_records_diagnostics(self) -> None:
+        class HotCPU:
+            use_hot = True
+
+        class FailingManager:
+            storage_backends = {
+                "LocalCPUBackend": HotCPU(),
+                "LocalDiskBackend": object(),
+            }
+
+            def batched_contains(self, keys, search_range=None, pin=False):
+                location = None if not search_range else search_range[0]
+                if location == "LocalCPUBackend":
+                    return 0, {}
+                if location == "LocalDiskBackend":
+                    return len(keys), {location: list(keys)}
+                return 0, {}
+
+            def batched_get(self, keys, location=None):
+                raise RuntimeError("staging allocation failed")
+
+            def remove(self, key, locations=None):
+                return 0
+
+        registry, binding, endpoint = self._released_prefetch_binding(FailingManager())
+        receipt = endpoint.execute_action(self._prefetch_command(registry, binding))
+        self.assertEqual(receipt["status"], "failed")
+        self.assertEqual(receipt["failure_reason"], "prefetch_backend_exception")
+        self.assertEqual(receipt["error_type"], "RuntimeError")
+        self.assertIn("staging allocation failed", receipt["error"])
+        self.assertIn("cpu_used_bytes", receipt)
+        self.assertIn("memory_pressure", receipt)
 
 
 if __name__ == "__main__":

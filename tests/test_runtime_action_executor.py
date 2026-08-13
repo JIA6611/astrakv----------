@@ -12,7 +12,10 @@ class _Manager:
         self.removed = []
         self.prefetch_reads = []
         self.load_requests = []
-        self.storage_backends = {"LocalCPUBackend": object(), "LocalDiskBackend": object()}
+        self.storage_backends = {
+            "LocalCPUBackend": type("HotCPU", (), {"use_hot": True})(),
+            "LocalDiskBackend": object(),
+        }
         self.cpu_present = True
         self.disk_present = True
         self.lmcache_engine = self

@@ -1148,6 +1148,50 @@ class VendorCallbackBridge:
             return None
         return self._profile_index.hint_for(physical.compatibility_key)
 
+    def _process_prefetch_request_file(self, path: Path) -> None:
+        """Process one worker-side prefetch-request handoff file.
+
+        Extracted from the watcher loop so the handoff path is directly
+        testable: parse, mark seen, and dispatch invalidation/observation/
+        promotion for a single request file.
+        """
+        key = path.name
+        if key in self._prefetch_request_seen:
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            request_id = str(payload["request_id"])
+            token_ids = tuple(int(token) for token in payload["exact_token_ids"])
+            expires_at_ns = int(payload["expires_at_ns"])
+            request_configs = payload.get("request_configs")
+            promote = payload.get("promote") is True
+            invalidate_disk_backed_cpu = payload.get("invalidate_disk_backed_cpu") is True
+            if not isinstance(request_configs, dict):
+                request_configs = None
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            self._prefetch_request_seen.add(key)
+            return
+        self._prefetch_request_seen.add(key)
+        if expires_at_ns <= time.time_ns():
+            return
+        callbacks = self._callbacks()
+        if invalidate_disk_backed_cpu:
+            self._invalidate_disk_backed_cpu_prefix(
+                request_id=request_id,
+                token_ids=token_ids,
+                request_configs=request_configs,
+                reason="symmetric_cpu_cold_before_prefetch_lead",
+            )
+        self._publish_tier_observation(
+            request_id, token_ids, request_configs,
+        )
+        if promote and callbacks is not None and callbacks.mode is RuntimeMode.ACTIVE:
+            self._schedule_cpu_promotion(
+                request_id=request_id,
+                token_ids=token_ids,
+                request_configs=request_configs,
+            )
+
     def _start_prefetch_watcher_if_worker(self) -> None:
         if (
             self._state_dir is None
@@ -1167,41 +1211,7 @@ class VendorCallbackBridge:
                 try:
                     paths = tuple(directory.glob("*.json")) if directory.is_dir() else ()
                     for path in paths:
-                        key = path.name
-                        if key in self._prefetch_request_seen:
-                            continue
-                        try:
-                            payload = json.loads(path.read_text(encoding="utf-8"))
-                            request_id = str(payload["request_id"])
-                            token_ids = tuple(int(token) for token in payload["exact_token_ids"])
-                            expires_at_ns = int(payload["expires_at_ns"])
-                            request_configs = payload.get("request_configs")
-                            promote = payload.get("promote") is True
-                            invalidate_disk_backed_cpu = payload.get("invalidate_disk_backed_cpu") is True
-                            if not isinstance(request_configs, dict):
-                                request_configs = None
-                        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-                            self._prefetch_request_seen.add(key)
-                            continue
-                        self._prefetch_request_seen.add(key)
-                        if expires_at_ns <= time.time_ns():
-                            continue
-                        if invalidate_disk_backed_cpu:
-                            self._invalidate_disk_backed_cpu_prefix(
-                                request_id=request_id,
-                                token_ids=token_ids,
-                                request_configs=request_configs,
-                                reason="symmetric_cpu_cold_before_prefetch_lead",
-                            )
-                        self._publish_tier_observation(
-                            request_id, token_ids, request_configs,
-                        )
-                        if promote and callbacks.mode is RuntimeMode.ACTIVE:
-                            self._schedule_cpu_promotion(
-                                request_id=request_id,
-                                token_ids=token_ids,
-                                request_configs=request_configs,
-                            )
+                        self._process_prefetch_request_file(path)
                     for expired in callbacks.tickets.expire():
                         self._append_ticket(expired)
                         self._demote_prefetch_keys(expired.prefetch_id)

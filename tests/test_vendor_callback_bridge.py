@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import tempfile
@@ -91,6 +92,48 @@ class _CPU:
         self.hot_cache.pop(key)
         self.removed.append(key)
         return True
+
+
+class _MemoryObj:
+    def __init__(self, size: int = 1024) -> None:
+        self.is_pinned = False
+        self._size = size
+
+    def unpin(self) -> None:
+        self.is_pinned = False
+
+    def ref_count_down(self) -> None:
+        return None
+
+    def get_physical_size(self) -> int:
+        return self._size
+
+
+class _PromotionDisk(_SelectiveDisk):
+    def __init__(self, keys) -> None:
+        super().__init__(keys)
+        self.reads = []
+        self.unpins = []
+
+    async def batched_get_non_blocking(self, lookup_id, keys, transfer_spec=None):
+        del transfer_spec
+        self.reads.append((lookup_id, list(keys)))
+        return [_MemoryObj() for _ in keys]
+
+    def unpin(self, key) -> None:
+        self.unpins.append(key)
+
+
+class _PromotionCPU(_CPU):
+    def __init__(self) -> None:
+        super().__init__()
+        self.puts = []
+
+    def batched_submit_put_task(self, keys, memory_objs, transfer_spec=None, on_complete_callback=None):
+        del transfer_spec, on_complete_callback
+        self.puts.append((list(keys), list(memory_objs)))
+        for key, memory_obj in zip(keys, memory_objs):
+            self.hot_cache[key] = memory_obj
 
 
 def _connector() -> SimpleNamespace:
@@ -538,6 +581,228 @@ class VendorCallbackBridgeTests(unittest.TestCase):
             ]
             self.assertEqual(len(partial), 1)
             self.assertEqual(rejected, [])
+
+    @staticmethod
+    def _roomy_capability() -> TierCapabilitySnapshot:
+        return TierCapabilitySnapshot(
+            topology=TierTopology.GPU_CPU_SSD,
+            local_cpu_enabled=True,
+            local_disk_enabled=True,
+            uma_available_bytes=1 << 30,
+            cpu_prefetch_budget_fraction=0.5,
+            cpu_capacity_bytes=1 << 30,
+        )
+
+    def _promotion_connector(self, *, cpu, disk):
+        connector = _connector()
+        manager = SimpleNamespace(
+            storage_backends={"LocalCPUBackend": cpu, "LocalDiskBackend": disk},
+        )
+        connector.lmcache_engine.storage_manager = manager
+        return connector, manager
+
+    @staticmethod
+    def _chunk_keys(connector, tokens=(1, 2, 3, 4)):
+        return tuple(
+            key
+            for _start, _end, key in connector.lmcache_engine.token_database.process_tokens(
+                tokens=list(tokens),
+            )
+        )
+
+    def test_schedule_cpu_promotion_happy_path_submits_ticket_and_promotes(self) -> None:
+        callbacks = KVCoreConnectorCallbacks(
+            mode=RuntimeMode.ACTIVE,
+            capability=self._roomy_capability(),
+        )
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as raw_tmp, patch.dict(os.environ, {
+                "ASTRAKV_RUNTIME_CONTROL_STATE_DIR": raw_tmp,
+                "ASTRAKV_KV_CORE_CPU_PREFETCH_ENABLED": "true",
+            }, clear=False), patch(
+                "astrakv.runtime.vendor_callback_bridge.installed_kv_core_callbacks",
+                return_value=callbacks,
+            ), patch.object(
+                VendorCallbackBridge, "_runtime_capability", return_value=self._roomy_capability(),
+            ), patch.object(VendorCallbackBridge, "_start_prefetch_watcher_if_worker"):
+                cpu = _PromotionCPU()
+                disk = _PromotionDisk(())
+                connector, manager = self._promotion_connector(cpu=cpu, disk=disk)
+                keys = self._chunk_keys(connector)
+                disk.keys = set(keys)
+                for key in keys:
+                    disk.dict[key] = SimpleNamespace(size=1024)
+                manager.loop = loop
+                bridge = VendorCallbackBridge(connector)
+                bridge._schedule_cpu_promotion(
+                    request_id="target", token_ids=(1, 2, 3, 4), request_configs=None,
+                )
+                tickets = callbacks.tickets.snapshot()
+                self.assertEqual(len(tickets), 1)
+                ticket = tickets[0]
+                self.assertIs(ticket.status, PrefetchStatus.SUBMITTED)
+                future = bridge._prefetch_futures[ticket.prefetch_id]
+                self.assertEqual(future.result(timeout=5), 2048)
+                self.assertIs(
+                    callbacks.tickets.get(ticket.prefetch_id).status,
+                    PrefetchStatus.COMPLETED,
+                )
+                decisions = [
+                    json.loads(line)
+                    for line in (Path(raw_tmp) / "kv_core_policy_decisions.jsonl").read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                ]
+                self.assertEqual(decisions[-1]["action"], "prefetch_ssd_to_cpu")
+                self.assertEqual(decisions[-1]["status"], "submitted")
+                self.assertEqual(len(disk.reads), 1)
+                self.assertEqual(disk.reads[0][0], ticket.prefetch_id)
+                self.assertEqual(len(cpu.puts), 1)
+                self.assertEqual(cpu.puts[0][0], list(keys))
+                self.assertTrue(all(key in cpu.hot_cache for key in keys))
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5)
+            loop.close()
+
+    def test_prefetch_watcher_file_handoff_promotes_when_flag_set(self) -> None:
+        callbacks = KVCoreConnectorCallbacks(
+            mode=RuntimeMode.ACTIVE,
+            capability=self._roomy_capability(),
+        )
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as raw_tmp, patch.dict(os.environ, {
+                "ASTRAKV_RUNTIME_CONTROL_STATE_DIR": raw_tmp,
+            }, clear=False), patch(
+                "astrakv.runtime.vendor_callback_bridge.installed_kv_core_callbacks",
+                return_value=callbacks,
+            ), patch.object(
+                VendorCallbackBridge, "_runtime_capability", return_value=self._roomy_capability(),
+            ), patch.object(VendorCallbackBridge, "_start_prefetch_watcher_if_worker"):
+                cpu = _PromotionCPU()
+                disk = _PromotionDisk(())
+                connector, manager = self._promotion_connector(cpu=cpu, disk=disk)
+                keys = self._chunk_keys(connector)
+                disk.keys = set(keys)
+                for key in keys:
+                    disk.dict[key] = SimpleNamespace(size=1024)
+                manager.loop = loop
+                bridge = VendorCallbackBridge(connector)
+                bridge._write_prefetch_request("target", (1, 2, 3, 4), None, promote=True)
+                request_path = next((Path(raw_tmp) / "prefetch_requests").glob("*.json"))
+                bridge._process_prefetch_request_file(request_path)
+                tickets = callbacks.tickets.snapshot()
+                self.assertEqual(len(tickets), 1)
+                ticket = tickets[0]
+                future = bridge._prefetch_futures[ticket.prefetch_id]
+                self.assertEqual(future.result(timeout=5), 2048)
+                self.assertIs(
+                    callbacks.tickets.get(ticket.prefetch_id).status,
+                    PrefetchStatus.COMPLETED,
+                )
+                decisions = [
+                    json.loads(line)
+                    for line in (Path(raw_tmp) / "kv_core_policy_decisions.jsonl").read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                ]
+                self.assertEqual(decisions[-1]["action"], "prefetch_ssd_to_cpu")
+                self.assertEqual(decisions[-1]["status"], "submitted")
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5)
+            loop.close()
+
+    def test_prefetch_watcher_file_handoff_skips_promotion_when_flag_unset(self) -> None:
+        callbacks = KVCoreConnectorCallbacks(
+            mode=RuntimeMode.ACTIVE,
+            capability=self._roomy_capability(),
+        )
+        with tempfile.TemporaryDirectory() as raw_tmp, patch.dict(os.environ, {
+            "ASTRAKV_RUNTIME_CONTROL_STATE_DIR": raw_tmp,
+        }, clear=False), patch(
+            "astrakv.runtime.vendor_callback_bridge.installed_kv_core_callbacks",
+            return_value=callbacks,
+        ), patch.object(VendorCallbackBridge, "_start_prefetch_watcher_if_worker"):
+            cpu = _PromotionCPU()
+            disk = _PromotionDisk(())
+            connector, manager = self._promotion_connector(cpu=cpu, disk=disk)
+            keys = self._chunk_keys(connector)
+            disk.keys = set(keys)
+            for key in keys:
+                disk.dict[key] = SimpleNamespace(size=1024)
+            bridge = VendorCallbackBridge(connector)
+            bridge._write_prefetch_request("target", (1, 2, 3, 4), None, promote=False)
+            request_path = next((Path(raw_tmp) / "prefetch_requests").glob("*.json"))
+            bridge._process_prefetch_request_file(request_path)
+            self.assertEqual(callbacks.tickets.snapshot(), ())
+            self.assertEqual(cpu.puts, [])
+            decisions_path = Path(raw_tmp) / "kv_core_policy_decisions.jsonl"
+            self.assertFalse(
+                decisions_path.exists()
+                and any(
+                    "prefetch_ssd_to_cpu" in line
+                    for line in decisions_path.read_text(encoding="utf-8").splitlines()
+                )
+            )
+
+    def test_schedule_cpu_promotion_rejected_when_cpu_budget_insufficient(self) -> None:
+        callbacks = KVCoreConnectorCallbacks(
+            mode=RuntimeMode.ACTIVE,
+            capability=TierCapabilitySnapshot(
+                topology=TierTopology.GPU_CPU_SSD,
+                local_cpu_enabled=True,
+                local_disk_enabled=True,
+                uma_available_bytes=1,
+                cpu_prefetch_budget_fraction=0.01,
+                cpu_capacity_bytes=1,
+            ),
+        )
+        tight = callbacks.capability
+        with tempfile.TemporaryDirectory() as raw_tmp, patch.dict(os.environ, {
+            "ASTRAKV_RUNTIME_CONTROL_STATE_DIR": raw_tmp,
+        }, clear=False), patch(
+            "astrakv.runtime.vendor_callback_bridge.installed_kv_core_callbacks",
+            return_value=callbacks,
+        ), patch.object(VendorCallbackBridge, "_runtime_capability", return_value=tight), patch.object(
+            VendorCallbackBridge, "_start_prefetch_watcher_if_worker",
+        ):
+            cpu = _PromotionCPU()
+            disk = _PromotionDisk(())
+            connector, manager = self._promotion_connector(cpu=cpu, disk=disk)
+            keys = self._chunk_keys(connector)
+            disk.keys = set(keys)
+            for key in keys:
+                disk.dict[key] = SimpleNamespace(size=1024)
+            bridge = VendorCallbackBridge(connector)
+            bridge._schedule_cpu_promotion(
+                request_id="target", token_ids=(1, 2, 3, 4), request_configs=None,
+            )
+            self.assertEqual(callbacks.tickets.snapshot(), ())
+            decisions = [
+                json.loads(line)
+                for line in (Path(raw_tmp) / "kv_core_policy_decisions.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            last = decisions[-1]
+            self.assertEqual(last["action"], "prefetch_ssd_to_cpu")
+            self.assertEqual(last["status"], "rejected")
+            self.assertEqual(last["reason"], "cpu_prefetch_budget")
+            tickets = [
+                json.loads(line)
+                for line in (Path(raw_tmp) / "kv_core_prefetch_tickets.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            self.assertEqual(tickets[-1]["status"], PrefetchStatus.CANCELLED.value)
+            self.assertEqual(tickets[-1]["failure_reason"], "cpu_prefetch_budget")
 
 
 if __name__ == "__main__":

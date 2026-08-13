@@ -139,7 +139,12 @@ def collect_sample(
                     if constant is None
                     else ("issued" if _madvise_region(fd, 0, mapped, constant) else "failed")
                 )
-            mapping = mmap.mmap(fd, mapped, access=mmap.ACCESS_READ)
+            # A read-only mapping is not a writable ctypes buffer, and
+            # ``from_buffer`` on ACCESS_READ raises TypeError on every Linux
+            # host.  ACCESS_COPY keeps the file-backed pages (mincore sees the
+            # same residency) while providing the writable buffer the ctypes
+            # vector needs, without requiring write permission on the file.
+            mapping = mmap.mmap(fd, mapped, access=mmap.ACCESS_COPY)
             try:
                 resident = _mincore_resident(mapping, page_size)
                 mincore_status = "valid" if resident is not None else "unsupported"

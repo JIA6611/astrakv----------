@@ -257,7 +257,9 @@ class ColdReapTests(unittest.TestCase):
         }, clear=False), patch(
             "astrakv.runtime.vendor_callback_bridge.installed_kv_core_callbacks",
             return_value=callbacks,
-        ), patch.object(VendorCallbackBridge, "_start_prefetch_watcher_if_worker"):
+        ), patch.object(VendorCallbackBridge, "_start_prefetch_watcher_if_worker"), patch.object(
+            Path, "read_text", side_effect=OSError("unavailable"),
+        ):
             bridge = VendorCallbackBridge(_connector(cpu, disk))
             capability = bridge._runtime_capability(external_token_cap=0)
             self.assertAlmostEqual(capability.cpu_prefetch_budget_fraction, 0.2)

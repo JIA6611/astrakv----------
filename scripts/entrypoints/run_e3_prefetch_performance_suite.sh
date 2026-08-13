@@ -81,7 +81,7 @@ trap cleanup EXIT INT TERM
 
 wait_for_server() {
   local log_path="$1"
-  for _ in $(seq 1 120); do
+  for _ in $(seq 1 300); do
     curl --max-time 3 -fsS "http://${HOST}:${PORT}/v1/models" >/dev/null && return 0
     sleep 2
   done
@@ -160,7 +160,7 @@ EOF
   ASTRAKV_KV_CORE_PATCH_VERIFICATION="$OUTPUT_DIR/connector_patch_verification.json" \
   ASTRAKV_KV_CORE_EXTERNAL_TOKEN_CAP=8192 ASTRAKV_KV_CORE_BOOTSTRAP_LOADS=2 \
   ASTRAKV_KV_CORE_SSD_READ_GBPS=3.0 ASTRAKV_KV_CORE_PREFETCH_DEADLINE_NS=5000000000 \
-  ASTRAKV_KV_CORE_PREFETCH_TTL_NS=30000000000 \
+  ASTRAKV_KV_CORE_PREFETCH_TTL_NS=30000000000 VLLM_ENGINE_READY_TIMEOUT_S=1200 \
   nohup bash scripts/launch/launch_lmcache_vllm.sh cpu > "$log_path" 2>&1 < /dev/null &
   SERVER_PID="$!"
   wait_for_server "$log_path"

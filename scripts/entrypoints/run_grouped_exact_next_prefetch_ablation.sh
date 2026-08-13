@@ -83,7 +83,7 @@ trap cleanup EXIT INT TERM
 
 wait_for_endpoint() {
   local log_path="$1"
-  for _ in $(seq 1 120); do
+  for _ in $(seq 1 300); do
     if curl --max-time 3 -fsS "http://${HOST}:${PORT}/v1/models" >/dev/null; then
       return 0
     fi
@@ -115,6 +115,7 @@ start_server() {
   ASTRAKV_RUNTIME_CONTROL_CONTEXT_PORT="$CONTEXT_PORT" \
   LMCACHE_CONFIG_FILE="$state_dir/lmcache.yaml" \
   ASTRAKV_KV_TRANSFER_CONFIG='{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}' \
+  VLLM_ENGINE_READY_TIMEOUT_S=1200 \
   nohup bash scripts/launch/launch_lmcache_vllm.sh disk > "$log_path" 2>&1 < /dev/null &
   SERVER_PID="$!"
   wait_for_endpoint "$log_path"

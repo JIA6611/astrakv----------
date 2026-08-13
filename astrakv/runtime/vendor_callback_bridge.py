@@ -298,6 +298,7 @@ class VendorCallbackBridge:
                 )
                 self._consume_matching_prefetch(
                     logical_request_id, request_id, physical, native_keys, available_hit,
+                    token_prefix=candidate_tokens, request_configs=request_configs,
                 )
                 self._note_reap_reference(
                     physical=physical,
@@ -667,6 +668,8 @@ class VendorCallbackBridge:
             physical,
             native_keys,
             max(0, int(allocated_external_tokens)),
+            token_prefix=tokens[:prefix_tokens],
+            request_configs=request_configs,
         )
         self._record("native_load_start", {
             "request_id": request_id,
@@ -1376,10 +1379,19 @@ class VendorCallbackBridge:
             "timestamp_ns": time.time_ns(),
         })
 
-    def _write_consumed_prefetch_marker(self, *, prefetch_id: str, target_request_id: str) -> None:
+    def _write_consumed_prefetch_marker(
+        self,
+        *,
+        prefetch_id: str,
+        target_request_id: str,
+        token_ids: tuple[int, ...],
+        request_configs: dict[str, Any] | None,
+    ) -> None:
         if self._state_dir is None:
             return
         if not _env_flag("ASTRAKV_KV_CORE_RELEASE_CPU_STAGING_ON_CONSUME", True):
+            return
+        if not token_ids:
             return
         directory = self._state_dir / "consumed_prefetches"
         directory.mkdir(parents=True, exist_ok=True)
@@ -1390,16 +1402,20 @@ class VendorCallbackBridge:
             "schema": "astrakv-consumed-prefetch-v1",
             "prefetch_id": prefetch_id,
             "target_request_id": target_request_id,
+            "token_ids": list(token_ids),
+            "request_configs": request_configs,
             "consumed_at_ns": time.time_ns(),
-        }, sort_keys=True) + "\n", encoding="utf-8")
+        }, sort_keys=True, default=str) + "\n", encoding="utf-8")
         os.replace(temporary, path)
 
     def _release_consumed_prefetches(self) -> None:
         """Cross-process release of consumed CPU staging copies.
 
         Consumption is recorded in the scheduler-side bridge while the CPU
-        backend and ``_prefetch_keys`` live in the worker-side bridge.  A
-        state-dir marker bridges the two; release only runs after the target
+        backend lives in the worker-side bridge.  A state-dir marker carrying
+        the exact token prefix bridges the two; the worker re-derives the
+        native keys from its own connector, so release does not depend on any
+        in-memory ``_prefetch_keys`` state.  Release only runs after the target
         request's terminal marker exists, so the native load has already read
         the CPU copy.
         """
@@ -1423,17 +1439,23 @@ class VendorCallbackBridge:
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 prefetch_id = str(payload["prefetch_id"])
                 target_request_id = str(payload["target_request_id"] or "")
-            except (OSError, KeyError, TypeError, json.JSONDecodeError):
+                token_ids = tuple(int(token) for token in payload.get("token_ids") or ())
+                request_configs = payload.get("request_configs")
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
                 self._consumed_prefetch_seen.add(path.name)
                 continue
-            if not target_request_id:
+            if not target_request_id or not token_ids:
                 self._consumed_prefetch_seen.add(path.name)
                 continue
             terminal_digest = hashlib.sha256(target_request_id.encode("utf-8")).hexdigest()
             if not (terminals / f"{terminal_digest}.json").exists():
                 continue  # target still running; wait for the terminal marker
             self._consumed_prefetch_seen.add(path.name)
-            keys = self._prefetch_keys.pop(prefetch_id, ())
+            try:
+                chunks = self._token_chunks(self._connector, token_ids, request_configs)
+            except (TypeError, ValueError):
+                continue
+            keys = tuple(key for _start, _end, key in chunks)
             if not keys:
                 continue
             removed = 0
@@ -1789,6 +1811,8 @@ class VendorCallbackBridge:
         physical: PhysicalKVObject,
         native_keys: tuple[Any, ...],
         lookup_hit_tokens: int,
+        token_prefix: tuple[int, ...] = (),
+        request_configs: dict[str, Any] | None = None,
     ) -> None:
         callbacks = self._callbacks()
         manager = self._storage_manager()
@@ -1821,6 +1845,8 @@ class VendorCallbackBridge:
                 self._write_consumed_prefetch_marker(
                     prefetch_id=ticket.prefetch_id,
                     target_request_id=logical_request_id,
+                    token_ids=tuple(int(token) for token in token_prefix),
+                    request_configs=request_configs,
                 )
                 self._append_ticket(consumed)
                 return

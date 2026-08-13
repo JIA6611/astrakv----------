@@ -303,8 +303,7 @@ class ColdReapTests(unittest.TestCase):
             bridge = VendorCallbackBridge(_connector(cpu, disk))
             prefetch_id = "prefetch:p1"
             target = "request-1"
-            key = _Key("key-0")
-            bridge._prefetch_keys[prefetch_id] = (key,)
+            key, = [chunk_key for _start, _end, chunk_key in bridge._token_chunks(bridge._connector, (1, 2), None)]
             cpu.hot_cache[key] = SimpleNamespace(get_physical_size=lambda: 1024)
             consumed_dir = Path(raw_tmp) / "consumed_prefetches"
             consumed_dir.mkdir()
@@ -313,6 +312,8 @@ class ColdReapTests(unittest.TestCase):
                 "schema": "astrakv-consumed-prefetch-v1",
                 "prefetch_id": prefetch_id,
                 "target_request_id": target,
+                "token_ids": [1, 2],
+                "request_configs": None,
             }), encoding="utf-8")
             terminals = Path(raw_tmp) / "request_terminals"
             terminals.mkdir()
@@ -344,8 +345,7 @@ class ColdReapTests(unittest.TestCase):
         ), patch.object(VendorCallbackBridge, "_start_prefetch_watcher_if_worker"):
             bridge = VendorCallbackBridge(_connector(cpu, disk))
             prefetch_id = "prefetch:p1"
-            key = _Key("key-0")
-            bridge._prefetch_keys[prefetch_id] = (key,)
+            key, = [chunk_key for _start, _end, chunk_key in bridge._token_chunks(bridge._connector, (1, 2), None)]
             cpu.hot_cache[key] = SimpleNamespace(get_physical_size=lambda: 1024)
             consumed_dir = Path(raw_tmp) / "consumed_prefetches"
             consumed_dir.mkdir()
@@ -354,6 +354,8 @@ class ColdReapTests(unittest.TestCase):
                 "schema": "astrakv-consumed-prefetch-v1",
                 "prefetch_id": prefetch_id,
                 "target_request_id": "request-1",
+                "token_ids": [1, 2],
+                "request_configs": None,
             }), encoding="utf-8")
             # No request_terminals marker yet: release must wait.
             bridge._release_consumed_prefetches()

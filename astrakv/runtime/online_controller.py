@@ -59,6 +59,13 @@ class OnlinePolicyControllerConfig:
     # Direct controller users retain the historic active default. The service
     # host explicitly supplies off/shadow/active and defaults to off.
     kv_core_mode: RuntimeMode = RuntimeMode.ACTIVE
+    # When True (and kv_core_mode is OFF), a prefetch decision may bypass the
+    # mode=off short-circuit and dispatch through the normal bridge, while
+    # every other action stays gated by mode.  This lets Prefetch-B run as a
+    # standalone strategy without dragging in A/evict/offload.  Defaults to
+    # False so the fail-closed "mode=off means nothing executes" contract is
+    # preserved.
+    prefetch_dispatch_independent_of_mode: bool = False
 
 
 class OnlinePolicyController:
@@ -612,12 +619,22 @@ class OnlinePolicyController:
     def dispatch(self, decision: OfflineEvictionDecision) -> RuntimeActionResult:
         breaker = None if self.bridge.execution_gate is None else self.bridge.execution_gate.breaker
         if self.config.kv_core_mode is RuntimeMode.OFF:
-            result = RuntimeActionResult("kv_core_off", "KV-Core mode is off; no runtime command was issued")
-            self.profile_store.record_dispatch(
-                decision, result, execution_enabled=False, breaker_state=_breaker_snapshot(breaker),
+            prefetch_independent_channel = (
+                self.config.prefetch_dispatch_independent_of_mode
+                and decision.predicted_action == "prefetch"
+                and self.config.enable_prefetch_dispatch
+                and self.config.online_prefetch_mode != "disabled"
             )
-            self.profile_store.checkpoint()
-            return result
+            if not prefetch_independent_channel:
+                result = RuntimeActionResult("kv_core_off", "KV-Core mode is off; no runtime command was issued")
+                self.profile_store.record_dispatch(
+                    decision, result, execution_enabled=False, breaker_state=_breaker_snapshot(breaker),
+                )
+                self.profile_store.checkpoint()
+                return result
+            # Prefetch-only channel: fall through so the prefetch dispatch
+            # gates (execution_enabled, live revalidation, per-action config)
+            # decide; non-prefetch actions never reach here.
         if self.config.kv_core_mode is RuntimeMode.SHADOW:
             result = RuntimeActionResult("shadow_only", "KV-Core shadow mode recorded the decision without runtime execution")
             self.profile_store.record_dispatch(

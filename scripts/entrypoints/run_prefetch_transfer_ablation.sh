@@ -151,11 +151,10 @@ fi
 
 echo "=== [transfer] Test phase on $TEST_DATASET (Profile-B) ==="
 echo "=== [2x2] Run 1/2: A off (cells: A0B0, A0B1) ==="
-# KV-Core must be active for the online controller to dispatch B at all;
-# A stays off because CPU_PREFETCH_ENABLED is not exported here.
-ASTRAKV_KV_CORE_MODE=active ASTRAKV_KV_CORE_TOPOLOGY=gpu_cpu_ssd \
-ASTRAKV_KV_CORE_LOCAL_CPU=true \
-ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD=true \
+# KV-Core mode stays off (A and every other strategy remain inert); only the
+# prefetch decision/execution channel is unlocked through the independent
+# dispatch switch.
+ASTRAKV_PREFETCH_DISPATCH_INDEPENDENT_OF_MODE=true \
 bash scripts/entrypoints/run_grouped_exact_next_prefetch_ablation.sh \
   --grouped-root "$TEST_ROOT" --model "$MODEL" --limit "$LIMIT" \
   --datasets "$TEST_DATASET" \

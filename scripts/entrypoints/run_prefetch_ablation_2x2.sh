@@ -10,7 +10,8 @@ set -Eeuo pipefail
 # producing the three cells we report on (the A+B combined cell is
 # intentionally NOT run):
 #
-#   run 1: (A off, B off)  -> pure baseline   (mode=active so B can dispatch)
+#   run 1: (A off, B off)  -> pure baseline   (mode stays off; prefetch uses
+#                            its independent dispatch channel)
 #          (A off, B on)   -> B-only
 #   run 2: (A on,  B off)  -> A-only   (variant/both skipped)
 #
@@ -90,11 +91,10 @@ AOFF_DIR="$OUTPUT_ROOT/a-off"
 AON_DIR="$OUTPUT_ROOT/a-on"
 
 echo "=== [2x2] Run 1/2: A off (cells: A0B0, A0B1) ==="
-# KV-Core must be active for the online controller to dispatch B at all;
-# A stays off because CPU_PREFETCH_ENABLED is not exported here.
-ASTRAKV_KV_CORE_MODE=active ASTRAKV_KV_CORE_TOPOLOGY=gpu_cpu_ssd \
-ASTRAKV_KV_CORE_LOCAL_CPU=true \
-ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD=true \
+# KV-Core mode stays off (A and every other strategy remain inert); only the
+# prefetch decision/execution channel is unlocked through the independent
+# dispatch switch.
+ASTRAKV_PREFETCH_DISPATCH_INDEPENDENT_OF_MODE=true \
 bash scripts/entrypoints/run_grouped_exact_next_prefetch_ablation.sh \
   --grouped-root "$GROUPED_ROOT" \
   --model "$MODEL" \

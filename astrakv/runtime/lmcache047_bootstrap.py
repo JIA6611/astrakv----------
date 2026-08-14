@@ -150,6 +150,9 @@ def install_from_environment(
                     os.environ.get("ASTRAKV_ENABLE_ONLINE_PREFETCH_DISPATCH", "true") == "true"
                 ),
                 online_prefetch_mode=os.environ.get("ASTRAKV_ONLINE_PREFETCH_MODE", "disabled"),
+                prefetch_dispatch_independent_of_mode=(
+                    os.environ.get("ASTRAKV_PREFETCH_DISPATCH_INDEPENDENT_OF_MODE", "false") == "true"
+                ),
                 online_evict_dispatch_enabled=(
                     os.environ.get("ASTRAKV_ONLINE_EVICT_DISPATCH_ENABLED", "true") == "true"
                 ),

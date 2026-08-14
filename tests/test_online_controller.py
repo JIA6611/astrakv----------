@@ -13,6 +13,7 @@ from astrakv.runtime.backend_hook import (
     HookAction,
 )
 from astrakv.runtime.eviction import ObjectLevel, OfflineEvictionDecision, RuntimeActionResult
+from astrakv.runtime.kv_runtime_core import RuntimeMode
 from astrakv.runtime.offline_safety import OfflineSafetyGate
 from astrakv.runtime.online_controller import OnlinePolicyController, OnlinePolicyControllerConfig
 from astrakv.runtime.online_profile import OnlineProfileStore
@@ -34,6 +35,69 @@ def gate():
 
 
 class OnlineControllerTests(unittest.TestCase):
+    def test_prefetch_dispatch_independent_of_mode_only_unlocks_prefetch(self):
+        bridge = OnlineBackendBridge(
+            run_id="run",
+            bindings=[],
+            hook_client=object(),
+            hook_url="http://127.0.0.1:7900/actions",
+            gate=gate(),
+        )
+        prefetch = OfflineEvictionDecision(
+            run_id="run",
+            decision_id="decision-independent-prefetch",
+            request_id="req",
+            object_key="prefix",
+            object_level=ObjectLevel.PREFIX,
+            predicted_action="prefetch",
+        )
+        keep = replace(prefetch, decision_id="decision-independent-keep", predicted_action="keep")
+
+        # Fail-closed default: mode=off blocks even prefetch.
+        closed = OnlinePolicyController(
+            run_id="run",
+            workload_id="w",
+            bridge=bridge,
+            config=OnlinePolicyControllerConfig(
+                kv_core_mode=RuntimeMode.OFF,
+                enable_prefetch_dispatch=True,
+                online_prefetch_mode="hybrid",
+            ),
+        )
+        self.assertEqual(closed.dispatch(prefetch).status, "kv_core_off")
+        self.assertEqual(closed.dispatch(keep).status, "kv_core_off")
+
+        # Independent channel: prefetch bypasses the mode=off gate (and then
+        # hits the execution_enabled gate -> advisory_only, proving the
+        # short-circuit was skipped), while non-prefetch stays gated.
+        independent = OnlinePolicyController(
+            run_id="run",
+            workload_id="w",
+            bridge=bridge,
+            config=OnlinePolicyControllerConfig(
+                kv_core_mode=RuntimeMode.OFF,
+                enable_prefetch_dispatch=True,
+                online_prefetch_mode="hybrid",
+                prefetch_dispatch_independent_of_mode=True,
+            ),
+        )
+        self.assertEqual(independent.dispatch(prefetch).status, "advisory_only")
+        self.assertEqual(independent.dispatch(keep).status, "kv_core_off")
+
+        # The channel is inert when prefetch execution itself is disabled.
+        inert = OnlinePolicyController(
+            run_id="run",
+            workload_id="w",
+            bridge=bridge,
+            config=OnlinePolicyControllerConfig(
+                kv_core_mode=RuntimeMode.OFF,
+                enable_prefetch_dispatch=False,
+                online_prefetch_mode="hybrid",
+                prefetch_dispatch_independent_of_mode=True,
+            ),
+        )
+        self.assertEqual(inert.dispatch(prefetch).status, "kv_core_off")
+
     def test_online_event_stays_advisory_without_runtime_capability_preflight(self):
         binding = BackendObjectBinding("run", "req", "prefix", ObjectLevel.PREFIX, "block-7", "bind")
         class Client:

@@ -76,6 +76,7 @@ class RuntimeControlHostConfig:
     scheduler_hints_path: Path | None = None
     online_prefetch_dispatch_enabled: bool = True
     online_prefetch_mode: str = "disabled"
+    prefetch_dispatch_independent_of_mode: bool = False
     online_evict_dispatch_enabled: bool = True
     evict_pressure_gate_enabled: bool = True
     evict_pressure_trigger: float = 0.8
@@ -483,6 +484,7 @@ class RuntimeControlHost:
                 global_evict_scan_min_interval_s=self.config.global_evict_scan_min_interval_s,
                 global_evict_scan_max_victims=self.config.global_evict_scan_max_victims,
                 kv_core_mode=self.config.kv_core_mode,
+                prefetch_dispatch_independent_of_mode=self.config.prefetch_dispatch_independent_of_mode,
             ),
             prediction_source=prediction_source,
             profile_db=profile_db,

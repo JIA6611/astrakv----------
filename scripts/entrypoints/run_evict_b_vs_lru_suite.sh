@@ -128,7 +128,6 @@ if [[ "$KV_CORE_MODE" == "on" ]]; then
   }
   KV_CORE_ENV+=(
     "ASTRAKV_KV_CORE_MODE=active"
-    "ASTRAKV_KV_CORE_VENDOR_PATCH=true"
     "ASTRAKV_KV_CORE_TOPOLOGY=gpu_cpu_ssd"
     "ASTRAKV_KV_CORE_LOCAL_CPU=true"
     "ASTRAKV_KV_CORE_CPU_PREFETCH_ENABLED=true"
@@ -170,6 +169,12 @@ run_arm() {
   cpu_gb="$("$PYTHON" -c "print(round($cpu_bytes / 2**30, 3))")"
   ssd_gb="$("$PYTHON" -c "print(round($ssd_bytes / 2**30, 3))")"
   echo "=== [$arm_name] rep $rep dataset=$dataset evict_dispatch=$evict_dispatch cpu=${cpu_gb}GB ssd=${ssd_gb}GB ==="
+  # launch_vllm_server.sh defaults VENDOR_PATCH to true; legacy-hooks mode
+  # (evict-B online policy) must explicitly disable it so hook events flow.
+  local vendor_patch_env="ASTRAKV_KV_CORE_VENDOR_PATCH=false"
+  if [[ "$KV_CORE_MODE" == "on" ]]; then
+    vendor_patch_env="ASTRAKV_KV_CORE_VENDOR_PATCH=true"
+  fi
   local -a periodic_env=()
   if [[ "$evict_dispatch" == "true" ]]; then
     # evict-B mirrors LMCache's native watermark loop: periodic pressure scan.
@@ -191,6 +196,7 @@ run_arm() {
     "ASTRAKV_EVICT_GLOBAL_SCAN_MIN_INTERVAL_S=$GLOBAL_SCAN_INTERVAL_S" \
     "ASTRAKV_EVICT_GLOBAL_SCAN_MAX_VICTIMS=$GLOBAL_SCAN_MAX_VICTIMS" \
     "${periodic_env[@]}" \
+    "$vendor_patch_env" \
     "ASTRAKV_ABLATION_WARMUP_PASSES=$WARMUP_PASSES" \
     "ASTRAKV_ABLATION_WARMUP_LIMIT=$WARMUP_LIMIT" \
     "ASTRAKV_LOCAL_CPU_SIZE_GB=$cpu_gb" \

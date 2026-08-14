@@ -498,7 +498,13 @@ class OnlineBackendBridge:
             self.binding_registry.complete_action(reservation_lease, command_id=command.command_id, status=receipt.status)
         if self.execution_gate is not None:
             self.execution_gate.complete(command.command_id)
-            if receipt.status not in {"completed", "ok", "executed"} and self.execution_gate.breaker is not None:
+            # not_found is a benign race (the object was already evicted by the
+            # backend before the command ran); only genuine execution failures
+            # should feed the circuit breaker.
+            if (
+                receipt.status not in {"completed", "ok", "executed", "not_found"}
+                and self.execution_gate.breaker is not None
+            ):
                 self.execution_gate.breaker.record_failure(now_ns=time.time_ns())
 
         event = RuntimeEvictionEvent(

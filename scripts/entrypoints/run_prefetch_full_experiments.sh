@@ -117,6 +117,33 @@ stage "4/7 strong-overlap split (qasper train/test)"
   --output-root "$TRANSFER_SPLIT" \
   --dataset qasper --train-ratio 0.6 --seed 0
 
+stage "4b/7 train trace -> history profile (Profile-B)"
+TRAIN_TRACE_DIR="$RESULTS_ROOT/train-trace-$TS"
+# Real run on the TRAIN split with Prefetch-B active (interleaved so the
+# trace carries prefetch hits), producing the runtime artifacts the profile
+# converter joins onto canonical chunk identities.
+ASTRAKV_PREFETCH_DISPATCH_INDEPENDENT_OF_MODE=true \
+  bash scripts/entrypoints/run_grouped_exact_next_prefetch_ablation.sh \
+    --grouped-root "$TRANSFER_SPLIT/train" \
+    --datasets qasper \
+    --limit "$TRAIN_LIMIT" \
+    --model "$MODEL" \
+    --roles variant \
+    --interleave \
+    --prefetch-lead-s "$ASTRAKV_ABLATION_PREFETCH_LEAD_S" \
+    --output-dir "$TRAIN_TRACE_DIR"
+TRAIN_CANONICAL="$TRAIN_TRACE_DIR/qasper/materialized/qasper_grouped_exact_next_canonical_workload.jsonl"
+"$PYTHON" scripts/policy/build_profile_from_runtime_events.py \
+  --native-callbacks "$TRAIN_TRACE_DIR/qasper/variant-state/kv_core_native_callbacks.jsonl" \
+  --associations "$TRAIN_TRACE_DIR/qasper/variant-state/request_context_associations.jsonl" \
+  --workload-manifest "$TRAIN_CANONICAL" \
+  --binding-events "$TRAIN_TRACE_DIR/qasper/variant-state/backend_binding_events.jsonl" \
+  --prefetch-receipts "$TRAIN_TRACE_DIR/qasper/variant-state/runtime_command_receipts.jsonl" \
+  --run-id "train-trace-qasper" \
+  --output "$TRAIN_TRACE_DIR/train_trace.jsonl"
+TRAIN_TRACE="$TRAIN_TRACE_DIR/train_trace.jsonl"
+[[ -s "$TRAIN_TRACE" ]] || { echo "train trace is empty: $TRAIN_TRACE" >&2; exit 2; }
+
 stage "5/7 transfer Profile-B (prefix_only)"
 bash scripts/entrypoints/run_prefetch_transfer_ablation.sh \
   --output-root "$TRANSFER_PROFILE" \
@@ -124,6 +151,7 @@ bash scripts/entrypoints/run_prefetch_transfer_ablation.sh \
   --test-grouped-root "$TRANSFER_SPLIT/test" \
   --train-dataset qasper --test-dataset qasper \
   --model "$MODEL" --train-limit "$TRAIN_LIMIT" --limit "$LIMIT" \
+  --train-trace "$TRAIN_TRACE" \
   --interleave
 TRANSFER_PROFILE_VALIDATION="$TRANSFER_PROFILE/prefetch_2x2_validation.json"
 
@@ -134,6 +162,7 @@ bash scripts/entrypoints/run_prefetch_transfer_ablation.sh \
   --test-grouped-root "$TRANSFER_SPLIT/test" \
   --train-dataset qasper --test-dataset qasper \
   --model "$MODEL" --train-limit "$TRAIN_LIMIT" --limit "$LIMIT" \
+  --train-trace "$TRAIN_TRACE" \
   --interleave \
   --prefetch-mode hybrid
 for role in baseline variant; do

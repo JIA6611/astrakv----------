@@ -136,9 +136,13 @@ if [[ -n "$TRAIN_TRACE" ]]; then
     --trace-events "$TRAIN_TRACE" --workload-id "train-$TRAIN_DATASET" \
     --output-dir "$OUTPUT_ROOT/train/profile"
   export ASTRAKV_ONLINE_PROFILE_DB_PATH="$OUTPUT_ROOT/train/profile/profile_db.json"
-  export ASTRAKV_KV_CORE_OFFLINE_PROFILE="$OUTPUT_ROOT/train/profile/profile_db.json"
+  export ASTRAKV_OFFLINE_PROFILE_WORKLOAD_ID="train-$TRAIN_DATASET"
+  # NOTE: do NOT point ASTRAKV_KV_CORE_OFFLINE_PROFILE at profile_db.json --
+  # the vendor bridge expects the research profiler's
+  # astrakv-kv-core-offline-profile-v2 schema and would reject ProfileDB.
+  unset ASTRAKV_KV_CORE_OFFLINE_PROFILE
 else
-  unset ASTRAKV_ONLINE_PROFILE_DB_PATH ASTRAKV_KV_CORE_OFFLINE_PROFILE
+  unset ASTRAKV_ONLINE_PROFILE_DB_PATH ASTRAKV_OFFLINE_PROFILE_WORKLOAD_ID ASTRAKV_KV_CORE_OFFLINE_PROFILE
 fi
 
 if [[ -n "$SIDECAR_PATH" ]]; then

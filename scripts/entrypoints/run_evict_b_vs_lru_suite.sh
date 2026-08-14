@@ -172,8 +172,17 @@ run_arm() {
   # launch_vllm_server.sh defaults VENDOR_PATCH to true; legacy-hooks mode
   # (evict-B online policy) must explicitly disable it so hook events flow.
   local vendor_patch_env="ASTRAKV_KV_CORE_VENDOR_PATCH=false"
+  local -a scope_env=()
   if [[ "$KV_CORE_MODE" == "on" ]]; then
     vendor_patch_env="ASTRAKV_KV_CORE_VENDOR_PATCH=true"
+  else
+    # Legacy-hooks mode needs install_from_environment() to run in the vLLM
+    # EngineCore process only.  prepend scripts/runtime (sitecustomize) and
+    # scope host creation to the engine child.
+    scope_env+=(
+      "ASTRAKV_RUNTIME_CONTROL_PROCESS_SCOPE=engine_child"
+      "PYTHONPATH=$ROOT/scripts/runtime${PYTHONPATH:+:$PYTHONPATH}"
+    )
   fi
   local -a periodic_env=()
   if [[ "$evict_dispatch" == "true" ]]; then
@@ -197,6 +206,7 @@ run_arm() {
     "ASTRAKV_EVICT_GLOBAL_SCAN_MAX_VICTIMS=$GLOBAL_SCAN_MAX_VICTIMS" \
     "${periodic_env[@]}" \
     "$vendor_patch_env" \
+    "${scope_env[@]}" \
     "ASTRAKV_ABLATION_WARMUP_PASSES=$WARMUP_PASSES" \
     "ASTRAKV_ABLATION_WARMUP_LIMIT=$WARMUP_LIMIT" \
     "ASTRAKV_LOCAL_CPU_SIZE_GB=$cpu_gb" \

@@ -77,6 +77,7 @@ class RuntimeControlHostConfig:
     online_prefetch_dispatch_enabled: bool = True
     online_prefetch_mode: str = "disabled"
     prefetch_dispatch_independent_of_mode: bool = False
+    offline_profile_workload_id: str = ""
     online_evict_dispatch_enabled: bool = True
     evict_pressure_gate_enabled: bool = True
     evict_pressure_trigger: float = 0.8
@@ -485,6 +486,7 @@ class RuntimeControlHost:
                 global_evict_scan_max_victims=self.config.global_evict_scan_max_victims,
                 kv_core_mode=self.config.kv_core_mode,
                 prefetch_dispatch_independent_of_mode=self.config.prefetch_dispatch_independent_of_mode,
+                offline_profile_workload_id=self.config.offline_profile_workload_id,
             ),
             prediction_source=prediction_source,
             profile_db=profile_db,

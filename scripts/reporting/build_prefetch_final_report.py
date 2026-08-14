@@ -70,6 +70,26 @@ def _markdown_table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
+def _adaptation_table(adaptation: dict[str, Any]) -> str:
+    rows: list[list[str]] = []
+    for window in adaptation.get("windows", []):
+        a = window.get("prefetch_a") or {}
+        b = window.get("prefetch_b") or {}
+        rows.append([
+            str(window.get("window")),
+            "-".join(str(v) for v in window.get("arrival_range", [])),
+            str(window.get("request_count")),
+            _fmt(window.get("ttft_p50_ms")),
+            _fmt(window.get("ttft_p95_ms")),
+            str(a.get("decision_count")),
+            str(b.get("completed_with_bytes")),
+        ])
+    return _markdown_table(
+        ["window", "arrival", "requests", "TTFT P50(ms)", "TTFT P95(ms)", "A decisions", "B completed"],
+        rows,
+    )
+
+
 def build_report(
     *,
     e3: dict[str, Any] | None,
@@ -126,23 +146,7 @@ def build_report(
     if adaptation is None:
         sections.append("未提供 adaptation JSON。")
     else:
-        rows: list[list[str]] = []
-        for window in adaptation.get("windows", []):
-            a = window.get("prefetch_a") or {}
-            b = window.get("prefetch_b") or {}
-            rows.append([
-                str(window.get("window")),
-                "-".join(str(v) for v in window.get("arrival_range", [])),
-                str(window.get("request_count")),
-                _fmt(window.get("ttft_p50_ms")),
-                _fmt(window.get("ttft_p95_ms")),
-                str(a.get("decision_count")),
-                str(b.get("completed_with_bytes")),
-            ])
-        sections.append(_markdown_table(
-            ["window", "arrival", "requests", "TTFT P50(ms)", "TTFT P95(ms)", "A decisions", "B completed"],
-            rows,
-        ))
+        sections.append(_adaptation_table(adaptation))
 
     sections.append("## 5. A/B 叠加（both 格）")
     sections.append(

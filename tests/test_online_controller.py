@@ -17,7 +17,7 @@ from astrakv.runtime.kv_runtime_core import RuntimeMode
 from astrakv.runtime.offline_safety import OfflineSafetyGate
 from astrakv.runtime.online_controller import OnlinePolicyController, OnlinePolicyControllerConfig
 from astrakv.runtime.online_profile import OnlineProfileStore
-from astrakv.runtime.profile_db import LayerSensitivityRecord, ProfileDB, QualityGuardRecord
+from astrakv.runtime.profile_db import ChunkProfile, LayerSensitivityRecord, ProfileDB, QualityGuardRecord
 from astrakv.runtime.scheduler_hints import SchedulerHintIndex
 from astrakv.scheduler.hints import SchedulerHint
 
@@ -35,6 +35,47 @@ def gate():
 
 
 class OnlineControllerTests(unittest.TestCase):
+    def test_offline_profile_lookup_uses_stable_prefix_key_and_workload_id(self):
+        bridge = OnlineBackendBridge(
+            run_id="run",
+            bindings=[],
+            hook_client=object(),
+            hook_url="http://127.0.0.1:7900/actions",
+            gate=gate(),
+        )
+        db = ProfileDB()
+        chunk = ChunkProfile(
+            chunk_id="sha256:prefix-23ff",
+            workload_id="train-qasper",
+            request_count=7,
+            cache_hits=5,
+        )
+        db.chunks["train-qasper:sha256:prefix-23ff"] = chunk
+        binding = BackendObjectBinding(
+            "run", "req", "sha256:prefix-23ff", ObjectLevel.PREFIX,
+            "lmcache:live-run-engine:worker-0:abc", "bind",
+            metadata={"prefix_id": "sha256:prefix-23ff"},
+        )
+
+        controller = OnlinePolicyController(
+            run_id="run",
+            workload_id="live-run",
+            bridge=bridge,
+            profile_db=db,
+            config=OnlinePolicyControllerConfig(offline_profile_workload_id="train-qasper"),
+        )
+        self.assertIs(controller._offline_profile_for(binding, {}), chunk)
+
+        # Without the workload override the offline profile is out of reach
+        # (backend_object_id embeds the live run id).
+        controller2 = OnlinePolicyController(
+            run_id="run",
+            workload_id="live-run",
+            bridge=bridge,
+            profile_db=db,
+        )
+        self.assertIsNone(controller2._offline_profile_for(binding, {}))
+
     def test_prefetch_dispatch_independent_of_mode_only_unlocks_prefetch(self):
         bridge = OnlineBackendBridge(
             run_id="run",

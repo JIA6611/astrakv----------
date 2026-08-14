@@ -153,6 +153,7 @@ def install_from_environment(
                 prefetch_dispatch_independent_of_mode=(
                     os.environ.get("ASTRAKV_PREFETCH_DISPATCH_INDEPENDENT_OF_MODE", "false") == "true"
                 ),
+                offline_profile_workload_id=os.environ.get("ASTRAKV_OFFLINE_PROFILE_WORKLOAD_ID", ""),
                 online_evict_dispatch_enabled=(
                     os.environ.get("ASTRAKV_ONLINE_EVICT_DISPATCH_ENABLED", "true") == "true"
                 ),

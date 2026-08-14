@@ -66,6 +66,11 @@ class OnlinePolicyControllerConfig:
     # False so the fail-closed "mode=off means nothing executes" contract is
     # preserved.
     prefetch_dispatch_independent_of_mode: bool = False
+    # Offline ProfileDB workload id for cross-run profile lookups.  The
+    # controller's own workload_id is the live run id, but a train-phase
+    # profile is keyed by its own workload id (e.g. "train-qasper"); without
+    # this override the offline history profile would never be found.
+    offline_profile_workload_id: str = ""
 
 
 class OnlinePolicyController:
@@ -99,6 +104,29 @@ class OnlinePolicyController:
             )
         )
         self._last_global_evict_scan_ns = 0
+
+    def _offline_profile_for(
+        self,
+        binding: Any,
+        object_state: dict[str, Any],
+    ) -> ChunkProfile | None:
+        """Resolve the offline history profile by a cross-run stable key.
+
+        ``binding.backend_object_id`` embeds the live run id, so an offline
+        profile built from a train run can never match it.  The prefix key
+        (canonical object identity) is stable across runs; the optional
+        ``offline_profile_workload_id`` aligns the train profile's workload
+        bucket with this controller.
+        """
+        if not self.config.offline_profile_workload_id:
+            return None
+        workload_id = self.config.offline_profile_workload_id
+        prefix_key = prefix_key_from_binding(binding, object_state)
+        if prefix_key:
+            chunk = self.profile_db.get_chunk(prefix_key, workload_id=workload_id)
+            if chunk is not None:
+                return chunk
+        return self.profile_db.get_chunk(binding.backend_object_id, workload_id=workload_id)
 
     def ingest(self, event: BackendHookEvent) -> bool:
         if event.run_id != self.run_id or not self.bridge.observe_event(event):
@@ -150,7 +178,7 @@ class OnlinePolicyController:
         current_tier = _resolve_current_tier(object_state, binding)
         profile = (
             self.observed_profile_db.get_chunk(binding.backend_object_id, workload_id=self.workload_id)
-            or self.profile_db.get_chunk(binding.backend_object_id, workload_id=self.workload_id)
+            or self._offline_profile_for(binding, object_state)
         )
         prefix_key = prefix_key_from_binding(binding, object_state)
         runtime_prefix_profile = None if not prefix_key else self.profile_store.prefix_profile(prefix_key)
@@ -844,7 +872,7 @@ class OnlinePolicyController:
                 continue
             profile = (
                 self.observed_profile_db.get_chunk(binding.backend_object_id, workload_id=self.workload_id)
-                or self.profile_db.get_chunk(binding.backend_object_id, workload_id=self.workload_id)
+                or self._offline_profile_for(binding, object_state)
             )
             reuse = _reuse_frequency(profile, state)
             policy_reuse = _policy_reuse_frequency(profile, state, reuse)

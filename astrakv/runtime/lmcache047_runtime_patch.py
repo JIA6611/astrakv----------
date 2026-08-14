@@ -1568,7 +1568,7 @@ class LMCache047ActionEndpoint:
                 "status": "blocked",
                 "blocked_reason": blocked_reason,
             }
-        if target_tier not in {"unknown", "", "ssd"}:
+        if target_tier not in {"unknown", "", "cpu", "ssd", "none"}:
             assert reservation_lease is not None and command_id is not None
             self.binding_registry.cancel_action_reservation(reservation_lease, command_id=command_id)
             return {
@@ -1577,55 +1577,64 @@ class LMCache047ActionEndpoint:
                 "status": "blocked",
                 "blocked_reason": f"unsupported_evict_target_tier:{target_tier}",
             }
-        if not _manager_contains(manager, key, location=_LOCAL_DISK_BACKEND):
+        cpu_present = _manager_contains(manager, key, location=_LOCAL_CPU_BACKEND)
+        disk_present = _manager_contains(manager, key, location=_LOCAL_DISK_BACKEND)
+        # Layered eviction matches LMCache native behavior: a CPU-layer evict
+        # removes only the CPU hot-cache copy (SSD copy preserved); an SSD-layer
+        # evict removes only the SSD copy (CPU copy preserved, if present).
+        remove_cpu = target_tier in {"unknown", "", "cpu", "none"}
+        remove_disk = target_tier in {"ssd", "none"}
+        if remove_cpu and not remove_disk:
+            if not cpu_present:
+                assert reservation_lease is not None and command_id is not None
+                self.binding_registry.complete_action(
+                    reservation_lease, command_id=command_id, status="not_found", preserve_lifecycle=disk_present,
+                )
+                return {
+                    "action": "evict",
+                    "backend_object_id": backend_object_id,
+                    "status": "not_found",
+                    "tier_before": "ssd" if disk_present else "unknown",
+                    "tier_after": "ssd" if disk_present else "unknown",
+                    "bytes": 0,
+                    "evicted": 0,
+                    "source_location": _LOCAL_CPU_BACKEND,
+                    "target_location": _LOCAL_DISK_BACKEND,
+                    "locations": [_LOCAL_CPU_BACKEND],
+                    "reservation_lease": reservation_lease,
+                }
+        elif not disk_present:
             assert reservation_lease is not None and command_id is not None
             self.binding_registry.complete_action(
                 reservation_lease,
                 command_id=command_id,
                 status="not_found",
-                preserve_lifecycle=True,
+                preserve_lifecycle=cpu_present,
             )
             return {
                 "action": "evict",
                 "backend_object_id": backend_object_id,
                 "status": "not_found",
-                "tier_before": "ssd",
-                "tier_after": "ssd",
+                "tier_before": "cpu" if cpu_present else "unknown",
+                "tier_after": "cpu" if cpu_present else "unknown",
                 "bytes": 0,
                 "evicted": 0,
-                "source_location": _LOCAL_CPU_BACKEND,
-                "target_location": _LOCAL_DISK_BACKEND,
-                "locations": [_LOCAL_CPU_BACKEND],
-                "reservation_lease": reservation_lease,
-            }
-        if not _manager_contains(manager, key, location=_LOCAL_CPU_BACKEND):
-            assert reservation_lease is not None and command_id is not None
-            self.binding_registry.complete_action(
-                reservation_lease,
-                command_id=command_id,
-                status="not_found",
-                preserve_lifecycle=True,
-            )
-            return {
-                "action": "evict",
-                "backend_object_id": backend_object_id,
-                "status": "not_found",
-                "tier_before": "ssd",
-                "tier_after": "ssd",
-                "bytes": 0,
-                "evicted": 0,
-                "source_location": _LOCAL_CPU_BACKEND,
-                "target_location": _LOCAL_DISK_BACKEND,
-                "locations": [_LOCAL_CPU_BACKEND],
+                "source_location": _LOCAL_DISK_BACKEND,
+                "target_location": "none",
+                "locations": [_LOCAL_DISK_BACKEND],
                 "reservation_lease": reservation_lease,
             }
         try:
-            memory_objs = _owner_action_batched_get(manager, key, location=_LOCAL_CPU_BACKEND)
-            bytes_evicted = sum(_memory_obj_size_bytes(item) for item in memory_objs if item is not None)
-            # evict-B semantics: demote CPU -> SSD.  Only the CPU hot-cache copy
-            # is removed; the SSD copy is preserved so a later revisit pays a
-            # disk read instead of a full recompute.
-            removed = int(manager.batched_remove([key], locations=[_LOCAL_CPU_BACKEND]) or 0)
+            removed = 0
+            bytes_evicted = 0
+            if remove_cpu:
+                memory_objs = _owner_action_batched_get(manager, key, location=_LOCAL_CPU_BACKEND)
+                bytes_evicted += sum(_memory_obj_size_bytes(item) for item in memory_objs if item is not None)
+                removed += int(manager.batched_remove([key], locations=[_LOCAL_CPU_BACKEND]) or 0)
+            if remove_disk:
+                memory_objs = _owner_action_batched_get(manager, key, location=_LOCAL_DISK_BACKEND)
+                bytes_evicted += sum(_memory_obj_size_bytes(item) for item in memory_objs if item is not None)
+                removed += int(manager.batched_remove([key], locations=[_LOCAL_DISK_BACKEND]) or 0)
         except Exception:
             assert reservation_lease is not None and command_id is not None
             self.binding_registry.cancel_action_reservation(reservation_lease, command_id=command_id)
@@ -1636,19 +1645,24 @@ class LMCache047ActionEndpoint:
             reservation_lease,
             command_id=command_id,
             status=status,
-            preserve_lifecycle=True,
+            preserve_lifecycle=(
+                disk_present
+                if (remove_cpu and not remove_disk)
+                else (cpu_present if (remove_disk and not remove_cpu) else False)
+            ),
         )
+        tier_after = "ssd" if (remove_cpu and disk_present) else ("cpu" if (remove_disk and cpu_present) else "none")
         return {
             "action": "evict",
             "backend_object_id": backend_object_id,
             "status": status,
-            "tier_before": "cpu",
-            "tier_after": "ssd",
+            "tier_before": "cpu" if remove_cpu else "ssd",
+            "tier_after": tier_after,
             "bytes": bytes_evicted if status == "completed" else 0,
             "evicted": removed,
-            "source_location": _LOCAL_CPU_BACKEND,
-            "target_location": _LOCAL_DISK_BACKEND,
-            "locations": [_LOCAL_CPU_BACKEND],
+            "source_location": _LOCAL_CPU_BACKEND if remove_cpu else _LOCAL_DISK_BACKEND,
+            "target_location": _LOCAL_DISK_BACKEND if (remove_cpu and not remove_disk) else "none",
+            "locations": [_LOCAL_CPU_BACKEND] if remove_cpu else ([_LOCAL_DISK_BACKEND] if remove_disk else []),
             "reservation_lease": reservation_lease,
         }
 

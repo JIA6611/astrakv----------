@@ -163,6 +163,12 @@ class OnlinePolicyController:
                 pressure_snapshot["available"]
                 and pressure_snapshot["cpu_usage_fraction"] >= float(pressure_snapshot["trigger"])
             )
+        ssd_pressure_over = True
+        if self.config.evict_pressure_gate_enabled:
+            ssd_pressure_over = bool(
+                pressure_snapshot["available"]
+                and pressure_snapshot["ssd_usage_fraction"] >= float(pressure_snapshot["trigger"])
+            )
         runtime_confidence = (
             float(runtime_prefix_profile.get("runtime_confidence") or 0.0)
             if runtime_prefix_profile is not None
@@ -326,10 +332,10 @@ class OnlinePolicyController:
                 evict_cold_score >= float(self.config.evict_cold_score_threshold)
             ):
                 action = "evict"
-                target_tier = "ssd"
+                target_tier = "cpu"
                 reason = (
-                    "evict-B: CPU-resident cold object demoted to SSD "
-                    f"(data preserved, cold_score={evict_cold_score:.3f})"
+                    "evict-B: CPU-layer eviction removes the CPU copy only (SSD preserved), "
+                    f"(cold_score={evict_cold_score:.3f})"
                 )
             else:
                 action = "keep"
@@ -369,6 +375,16 @@ class OnlinePolicyController:
                 action = "load"
                 target_tier = "gpu"
                 reason = "online profile: SSD-resident object has a dynamic load target and load is more valuable than waiting for recompute"
+            elif active_refs == 0 and evict_ready and ssd_pressure_over and (
+                evict_cold_score >= float(self.config.evict_cold_score_threshold)
+                or prefetch_waste > 0
+            ):
+                action = "evict"
+                target_tier = "ssd"
+                reason = (
+                    "evict-B: SSD-layer eviction removes the SSD copy only "
+                    f"(cold_score={evict_cold_score:.3f})"
+                )
             elif prefetch_mode != "prefix_only" and prediction_gate_reason is None and prediction is not None:
                 action = "prefetch"
                 target_tier = "cpu"
@@ -491,6 +507,7 @@ class OnlinePolicyController:
                 "evict_pressure_snapshot": dict(pressure_snapshot),
                 "evict_pressure_over": bool(pressure_over),
                 "evict_cpu_pressure_over": bool(cpu_pressure_over),
+                "evict_ssd_pressure_over": bool(ssd_pressure_over),
                 "runtime_confidence": runtime_confidence,
                 "evict_cold_score": evict_cold_score,
                 "load_is_worthwhile": load_is_worthwhile,
@@ -777,15 +794,19 @@ class OnlinePolicyController:
         if not self.config.evict_pressure_gate_enabled:
             return []
         pressure = self._pressure_snapshot()
-        if not (
-            pressure["available"]
-            and pressure["cpu_usage_fraction"] >= float(pressure["trigger"])
-        ):
+        trigger = float(pressure["trigger"])
+        cpu_pressure_over = pressure["available"] and pressure["cpu_usage_fraction"] >= trigger
+        ssd_pressure_over = pressure["available"] and pressure["ssd_usage_fraction"] >= trigger
+        if not (cpu_pressure_over or ssd_pressure_over):
             return []
         candidates: list[tuple[float, str, Any]] = []
         for backend_object_id, state in self.profile_store.objects().items():
             tier = str(state.get("current_tier") or "")
-            if tier != "cpu":
+            if tier == "cpu" and not cpu_pressure_over:
+                continue
+            if tier == "ssd" and not ssd_pressure_over:
+                continue
+            if tier not in {"cpu", "ssd"}:
                 continue
             if _as_int(state.get("active_reference_count")) > 0:
                 continue
@@ -831,14 +852,20 @@ class OnlinePolicyController:
                 (
                     score,
                     backend_object_id,
-                    (state, binding, object_level, object_key, request_id, policy_reuse, confidence, prefetch_waste),
+                    (
+                        state, binding, object_level, object_key, request_id,
+                        policy_reuse, confidence, prefetch_waste, "cpu" if tier == "cpu" else "ssd",
+                    ),
                 )
             )
         candidates.sort(key=lambda item: (-item[0], item[1]))
         results: list[tuple[OfflineEvictionDecision, RuntimeActionResult]] = []
         max_victims = max(0, int(self.config.global_evict_scan_max_victims))
         for score, backend_object_id, payload in candidates[:max_victims]:
-            state, binding, object_level, object_key, request_id, policy_reuse, confidence, prefetch_waste = payload
+            (
+                state, binding, object_level, object_key, request_id,
+                policy_reuse, confidence, prefetch_waste, target_tier,
+            ) = payload
             decision = OfflineEvictionDecision(
                 run_id=self.run_id,
                 decision_id=f"online-global-evict-{len(self.decisions)}-{binding.binding_id}",
@@ -846,7 +873,7 @@ class OnlinePolicyController:
                 object_key=object_key,
                 object_level=object_level,
                 predicted_action="evict",
-                target_tier="ssd",
+                target_tier=target_tier,
                 decision_time_ns=now,
                 decision_index=_as_int(state.get("last_arrival_index")) or None,
                 reason=(

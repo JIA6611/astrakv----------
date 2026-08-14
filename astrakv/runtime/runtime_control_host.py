@@ -85,6 +85,8 @@ class RuntimeControlHostConfig:
     global_evict_scan_enabled: bool = True
     global_evict_scan_min_interval_s: float = 5.0
     global_evict_scan_max_victims: int = 4
+    evict_periodic_scan_enabled: bool = False
+    evict_periodic_scan_interval_s: float = 1.0
     kv_core_mode: RuntimeMode = RuntimeMode.OFF
 
     def __post_init__(self) -> None:
@@ -155,6 +157,9 @@ class RuntimeControlHost:
         self._online_policy_queue: queue.Queue[_OnlinePolicyTask] = queue.Queue(config.online_policy_queue_size)
         self._online_policy_stop = threading.Event()
         self._online_policy_thread: threading.Thread | None = None
+        self._evict_scan_stop = threading.Event()
+        self._evict_scan_thread: threading.Thread | None = None
+        self._evict_scan_lock = threading.Lock()
         socket_id = hashlib.sha256(f"{config.run_id}:{self.session_id}".encode("utf-8")).hexdigest()[:24]
         self.action_socket_path = Path(tempfile.gettempdir()) / f"astrakv-{socket_id}.sock"
 
@@ -278,6 +283,10 @@ class RuntimeControlHost:
         if self._online_policy_thread is not None:
             self._online_policy_thread.join(timeout=1)
             self._online_policy_thread = None
+        self._evict_scan_stop.set()
+        if self._evict_scan_thread is not None:
+            self._evict_scan_thread.join(timeout=1)
+            self._evict_scan_thread = None
         if self.action_server is not None:
             self.action_server.close()
             self.action_server = None
@@ -487,6 +496,14 @@ class RuntimeControlHost:
             daemon=True,
         )
         self._online_policy_thread.start()
+        if self.config.evict_periodic_scan_enabled:
+            self._evict_scan_stop.clear()
+            self._evict_scan_thread = threading.Thread(
+                target=self._run_evict_scan_loop,
+                name="astrakv-evict-scan",
+                daemon=True,
+            )
+            self._evict_scan_thread.start()
 
     def _event_sink(self, record: dict[str, Any]) -> None:
         if str(record.get("run_id") or "") != self.config.run_id:
@@ -572,16 +589,42 @@ class RuntimeControlHost:
                         continue
                     self._write_online_policy_rejection(task.event, result.status, deadline_ns=task.deadline_ns)
                     continue
-                if task.event.action is HookAction.RELEASE and task.event.status == "completed":
-                    for _decision, _result in controller.global_evict_scan():
-                        if _result.receipt is not None:
-                            self._write_receipt(_result.receipt)
+                with self._evict_scan_lock:
+                    if task.event.action is HookAction.RELEASE and task.event.status == "completed":
+                        for _decision, _result in controller.global_evict_scan():
+                            if _result.receipt is not None:
+                                self._write_receipt(_result.receipt)
+                    for command in bridge.commands:
+                        self._write_command(command)
+                    for receipt in bridge.receipts:
+                        self._write_receipt(receipt)
+            finally:
+                self._online_policy_queue.task_done()
+
+    def _run_evict_scan_loop(self) -> None:
+        """Periodic watermark-style eviction scan (mirrors LMCache's loop).
+
+        When enabled, checks pressure on a fixed interval and dispatches
+        evict-B decisions through the normal receipt-backed chain.
+        """
+        interval = max(0.1, float(self.config.evict_periodic_scan_interval_s))
+        while not self._evict_scan_stop.wait(interval):
+            controller = self.online_controller
+            bridge = self.online_bridge
+            if controller is None or bridge is None or not controller.execution_enabled:
+                continue
+            with self._evict_scan_lock:
+                try:
+                    results = controller.global_evict_scan()
+                except Exception:
+                    continue
+                for _decision, _result in results:
+                    if _result.receipt is not None:
+                        self._write_receipt(_result.receipt)
                 for command in bridge.commands:
                     self._write_command(command)
                 for receipt in bridge.receipts:
                     self._write_receipt(receipt)
-            finally:
-                self._online_policy_queue.task_done()
 
     def _write_online_policy_rejection(
         self, event: BackendHookEvent, reason: str, *, action: HookAction = HookAction.DROP, deadline_ns: int | None = None,

@@ -71,7 +71,11 @@ done
 [[ ! -e "$OUTPUT_DIR" ]] || { echo "refusing to overwrite output directory: $OUTPUT_DIR" >&2; exit 2; }
 
 cleanup() {
-  if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+  if [[ -n "$SERVER_PID" ]]; then
+    # Kill the whole process group (APIServer + EngineCore + workers), not
+    # just the launcher wrapper, so roles do not leak engines into the next
+    # stage and trip earlyoom under UMA memory pressure.
+    kill -TERM -- "-$SERVER_PID" 2>/dev/null || true
     kill -TERM "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
@@ -161,7 +165,7 @@ EOF
   ASTRAKV_KV_CORE_EXTERNAL_TOKEN_CAP=8192 ASTRAKV_KV_CORE_BOOTSTRAP_LOADS=2 \
   ASTRAKV_KV_CORE_SSD_READ_GBPS=3.0 ASTRAKV_KV_CORE_PREFETCH_DEADLINE_NS=5000000000 \
   ASTRAKV_KV_CORE_PREFETCH_TTL_NS=30000000000 VLLM_ENGINE_READY_TIMEOUT_S=1200 \
-  nohup bash scripts/launch/launch_lmcache_vllm.sh cpu > "$log_path" 2>&1 < /dev/null &
+  setsid nohup bash scripts/launch/launch_lmcache_vllm.sh cpu > "$log_path" 2>&1 < /dev/null &
   SERVER_PID="$!"
   wait_for_server "$log_path"
   assert_lmcache_healthy "$log_path"

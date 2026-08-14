@@ -75,7 +75,8 @@ for dataset in "${SELECTED_DATASETS[@]}"; do
 done
 
 cleanup() {
-  if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+  if [[ -n "$SERVER_PID" ]]; then
+    kill -TERM -- "-$SERVER_PID" 2>/dev/null || true
     kill -TERM "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
@@ -125,7 +126,7 @@ start_server() {
   LMCACHE_CONFIG_FILE="$state_dir/lmcache.yaml" \
   ASTRAKV_KV_TRANSFER_CONFIG='{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}' \
   VLLM_ENGINE_READY_TIMEOUT_S=1200 \
-  nohup bash scripts/launch/launch_lmcache_vllm.sh disk > "$log_path" 2>&1 < /dev/null &
+  setsid nohup bash scripts/launch/launch_lmcache_vllm.sh disk > "$log_path" 2>&1 < /dev/null &
   SERVER_PID="$!"
   wait_for_endpoint "$log_path"
 }

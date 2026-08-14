@@ -33,6 +33,7 @@ GROUPED_ROOT="${ASTRAKV_GROUPED_ROOT:-/home/zyx/astrakv-W/results/dgx_prefetch_v
 RESULTS_ROOT="${ASTRAKV_RESULTS_ROOT:-/home/zyx/astrakv-W/results}"
 LIMIT="${ASTRAKV_LIMIT:-50}"
 TRAIN_LIMIT="${ASTRAKV_TRAIN_LIMIT:-50}"
+RESUME="${ASTRAKV_RESUME:-0}"
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 E3_OUT="$RESULTS_ROOT/e3-prefetch-fixed-$TS"
@@ -41,6 +42,17 @@ TRANSFER_SPLIT="$RESULTS_ROOT/transfer-split-qasper-$TS"
 TRANSFER_PROFILE="$RESULTS_ROOT/prefetch-transfer-profile-$TS"
 TRANSFER_HYBRID="$RESULTS_ROOT/prefetch-transfer-hybrid-$TS"
 BUNDLE="$RESULTS_ROOT/prefetch-pipeline-bundle-$TS"
+
+if [[ "$RESUME" == "1" ]]; then
+  E3_OUT="$(for d in "$RESULTS_ROOT"/e3-prefetch-fixed-*; do
+    [[ -d "$d" && -f "$d/e3_prefetch_acceptance.json" ]] && echo "$d"
+  done | sort | tail -n 1)"
+  if [[ -z "$E3_OUT" ]]; then
+    echo "resume requested but no completed E3 dir with e3_prefetch_acceptance.json found under $RESULTS_ROOT" >&2
+    exit 2
+  fi
+  echo "==> RESUME=1: reusing E3 output $E3_OUT (stages 1-2 skipped)"
+fi
 
 CURRENT_STAGE=""
 stage() {
@@ -64,22 +76,25 @@ echo "==> env: MODEL=$MODEL"
 echo "==> env: MANIFEST=$MANIFEST"
 echo "==> env: SMOKE=$SMOKE"
 echo "==> env: LIMIT=$LIMIT TRAIN_LIMIT=$TRAIN_LIMIT"
+echo "==> env: RESUME=$RESUME E3_OUT=$E3_OUT"
 
-stage "1/7 E3 source materialize"
-mkdir -p "$RESULTS_ROOT/e3-source-$TS"
-"$PYTHON" scripts/benchmark/materialize_grouped_exact_next_workload.py \
-  --grouped-prompts-jsonl "$GROUPED_ROOT/qasper/grouped_prompts.jsonl" \
-  --output-dir "$RESULTS_ROOT/e3-source-$TS" \
-  --dataset qasper --task qasper --limit "$TRAIN_LIMIT"
-E3_SOURCE="$RESULTS_ROOT/e3-source-$TS/qasper_grouped_exact_next_canonical_workload.jsonl"
+if [[ "$RESUME" != "1" ]]; then
+  stage "1/7 E3 source materialize"
+  mkdir -p "$RESULTS_ROOT/e3-source-$TS"
+  "$PYTHON" scripts/benchmark/materialize_grouped_exact_next_workload.py \
+    --grouped-prompts-jsonl "$GROUPED_ROOT/qasper/grouped_prompts.jsonl" \
+    --output-dir "$RESULTS_ROOT/e3-source-$TS" \
+    --dataset qasper --task qasper --limit "$TRAIN_LIMIT"
+  E3_SOURCE="$RESULTS_ROOT/e3-source-$TS/qasper_grouped_exact_next_canonical_workload.jsonl"
 
-stage "2/7 E3 rerun"
-ASTRAKV_PYTHON="$PYTHON" bash scripts/entrypoints/run_e3_prefetch_performance_suite.sh \
-  --source-workload "$E3_SOURCE" \
-  --patch-manifest "$MANIFEST" --callback-smoke "$SMOKE" \
-  --model "$MODEL" --output-dir "$E3_OUT"
-"$PYTHON" scripts/reporting/validate_e3_prefetch_acceptance.py \
-  --e3-root "$E3_OUT" --output "$E3_OUT/e3_prefetch_acceptance.json"
+  stage "2/7 E3 rerun"
+  ASTRAKV_PYTHON="$PYTHON" bash scripts/entrypoints/run_e3_prefetch_performance_suite.sh \
+    --source-workload "$E3_SOURCE" \
+    --patch-manifest "$MANIFEST" --callback-smoke "$SMOKE" \
+    --model "$MODEL" --output-dir "$E3_OUT"
+  "$PYTHON" scripts/reporting/validate_e3_prefetch_acceptance.py \
+    --e3-root "$E3_OUT" --output "$E3_OUT/e3_prefetch_acceptance.json"
+fi
 
 stage "3/7 standard 2x2 (Sidecar-B upper bound)"
 bash scripts/entrypoints/run_prefetch_ablation_2x2.sh \

@@ -279,11 +279,11 @@ class RuntimeActionExecutorTests(unittest.TestCase):
         self.assertEqual(load_result["loaded"], 2)
         self.assertEqual(load_result["runtime_reqmeta_id"], "reqmeta-1")
         self.assertEqual(evict_result["status"], "completed")
-        self.assertEqual(evict_result["tier_before"], "cpu")
-        self.assertEqual(evict_result["tier_after"], "ssd")
+        self.assertEqual(evict_result["tier_before"], "ssd")
+        self.assertEqual(evict_result["tier_after"], "cpu")
         self.assertEqual(evict_result["bytes"], 4096)
         self.assertEqual(evict_result["evicted"], 1)
-        self.assertEqual(manager.prefetch_reads, [(["physical-key"], "LocalDiskBackend"), (["physical-key"], "LocalCPUBackend")])
+        self.assertEqual(manager.prefetch_reads, [(["physical-key"], "LocalDiskBackend"), (["physical-key"], "LocalDiskBackend")])
         self.assertEqual(manager.load_requests, [{
             "tokens": [101, 102, 103, 104],
             "slot_mapping": [0, 1, 2, 3],

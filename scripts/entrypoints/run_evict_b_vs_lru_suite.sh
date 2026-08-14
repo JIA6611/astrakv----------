@@ -155,6 +155,15 @@ run_arm() {
   cpu_gb="$("$PYTHON" -c "print(round($cpu_bytes / 2**30, 3))")"
   ssd_gb="$("$PYTHON" -c "print(round($ssd_bytes / 2**30, 3))")"
   echo "=== [$arm_name] rep $rep dataset=$dataset evict_dispatch=$evict_dispatch cpu=${cpu_gb}GB ssd=${ssd_gb}GB ==="
+  local -a periodic_env=()
+  if [[ "$evict_dispatch" == "true" ]]; then
+    # evict-B mirrors LMCache's native watermark loop: periodic pressure scan.
+    periodic_env+=(
+      "ASTRAKV_EVICT_PERIODIC_SCAN_ENABLED=true"
+      "ASTRAKV_EVICT_PERIODIC_SCAN_INTERVAL_S=1.0"
+      "ASTRAKV_EVICT_GLOBAL_SCAN_MIN_INTERVAL_S=1.0"
+    )
+  fi
   env \
     "ASTRAKV_ENABLE_ONLINE_POLICY=true" \
     "ASTRAKV_ONLINE_EVICT_DISPATCH_ENABLED=$evict_dispatch" \
@@ -166,6 +175,7 @@ run_arm() {
     "ASTRAKV_EVICT_GLOBAL_SCAN_ENABLED=true" \
     "ASTRAKV_EVICT_GLOBAL_SCAN_MIN_INTERVAL_S=$GLOBAL_SCAN_INTERVAL_S" \
     "ASTRAKV_EVICT_GLOBAL_SCAN_MAX_VICTIMS=$GLOBAL_SCAN_MAX_VICTIMS" \
+    "${periodic_env[@]}" \
     "ASTRAKV_ABLATION_WARMUP_PASSES=$WARMUP_PASSES" \
     "ASTRAKV_ABLATION_WARMUP_LIMIT=$WARMUP_LIMIT" \
     "ASTRAKV_LOCAL_CPU_SIZE_GB=$cpu_gb" \

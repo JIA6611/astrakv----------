@@ -375,12 +375,12 @@ class ProtectedRuntimeActionServiceTests(unittest.TestCase):
             challenge, proof = self.proof(service, value)
             receipt = service.submit(value, challenge, proof)
         self.assertEqual(receipt.status, "completed")
-        self.assertEqual(receipt.tier_before, "cpu")
-        self.assertEqual(receipt.tier_after, "ssd")
+        self.assertEqual(receipt.tier_before, "ssd")
+        self.assertEqual(receipt.tier_after, "cpu")
         self.assertEqual(receipt.bytes, 2048)
         self.assertEqual(receipt.metadata["evicted"], 1)
-        self.assertEqual(receipt.metadata["source_location"], "LocalCPUBackend")
-        self.assertEqual(receipt.metadata["target_location"], "LocalDiskBackend")
+        self.assertEqual(receipt.metadata["source_location"], "LocalDiskBackend")
+        self.assertEqual(receipt.metadata["target_location"], "none")
 
     @unittest.skipUnless(os.name == "posix", "Unix-domain socket permissions require POSIX")
     def test_unix_socket_is_owner_only(self):

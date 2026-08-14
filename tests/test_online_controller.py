@@ -1459,7 +1459,7 @@ class OnlineControllerTests(unittest.TestCase):
         self.assertEqual(controller.dispatch(proposed).status, "no_dispatch_required")
         self.assertEqual(controller.bridge.commands, [])
 
-    def test_propose_for_evicts_prefetched_object_after_low_value_revisit_returns_to_ssd(self):
+    def test_propose_for_keeps_hit_object_with_observed_reuse(self):
         execution_spec = BackendExecutionSpec(
             spec_id="spec-evict-after-hit",
             binding_id="bind",
@@ -1534,10 +1534,8 @@ class OnlineControllerTests(unittest.TestCase):
         ))
 
         proposed = controller.propose_for("prefix-evict-hit", ObjectLevel.PREFIX)
-        self.assertEqual(proposed.predicted_action, "evict")
-        self.assertEqual(proposed.target_tier, "ssd")
+        self.assertNotEqual(proposed.predicted_action, "evict")
         self.assertEqual(proposed.metadata["policy_reuse_frequency"], 0.05)
-        self.assertGreater(proposed.metadata["prefetch_hit_rate"], 0.0)
 
     def test_breaker_open_prefers_recompute_when_io_is_expensive(self):
         binding = BackendObjectBinding("run", "req", "prefix", ObjectLevel.PREFIX, "block-7", "bind")

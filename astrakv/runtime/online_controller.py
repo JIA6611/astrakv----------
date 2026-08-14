@@ -213,7 +213,11 @@ class OnlinePolicyController:
             else 0.0
         )
         evict_cold_score = _evict_cold_score(
-            policy_reuse_frequency=policy_reuse_frequency,
+            # evict-B coldness uses the runtime-observed reuse, not the
+            # workload-supplied reuse_ratio hint: an exact-next workload's
+            # hint is structurally high, which would otherwise keep every
+            # object "warm" forever and eviction would never fire.
+            policy_reuse_frequency=reuse_frequency,
             runtime_confidence=runtime_confidence,
             prefetch_waste=prefetch_waste,
             cold_reuse_threshold=self.config.cold_reuse_threshold,
@@ -893,7 +897,7 @@ class OnlinePolicyController:
                 else 0.0
             )
             score = _evict_cold_score(
-                policy_reuse_frequency=policy_reuse,
+                policy_reuse_frequency=reuse,
                 runtime_confidence=confidence,
                 prefetch_waste=prefetch_waste,
                 cold_reuse_threshold=self.config.cold_reuse_threshold,

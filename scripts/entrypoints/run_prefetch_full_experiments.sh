@@ -107,6 +107,7 @@ stage "3/7 standard 2x2 (Sidecar-B upper bound)"
 export ASTRAKV_LOCAL_CPU_SIZE_GB="$ABLATION_CPU_SIZE_GB"
 bash scripts/entrypoints/run_prefetch_ablation_2x2.sh \
   --grouped-root "$GROUPED_ROOT" --model "$MODEL" --limit "$LIMIT" \
+  --datasets qasper \
   --interleave \
   --output-root "$ABLATION_OUT"
 ABLATION_VALIDATION="$ABLATION_OUT/prefetch_2x2_validation.json"

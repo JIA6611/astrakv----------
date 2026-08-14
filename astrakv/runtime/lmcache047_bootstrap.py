@@ -183,12 +183,13 @@ def install_from_environment(
             raise RuntimeError("invalid ASTRAKV_RUNTIME_CONTROL_* configuration") from exc
         try:
             host.start()
-            if vendor_patch:
-                # The vendor patch consumes these callbacks.  Do not install the
-                # legacy monkey patch, which can issue lifecycle-external I/O.
-                _KV_CORE_CALLBACKS = KVCoreConnectorCallbacks(mode=mode, capability=_environment_capability())
-            else:
-                host.install_hooks(installer)
+            # Always install the control plane.  The vendor bridge consumes the
+            # KVCoreConnectorCallbacks (A: arrival promotion, admission), while
+            # the legacy hook layer supplies the binding/event stream that
+            # drives the online policy worker (B: predictive prefetch).  Both
+            # are required for the 2x2/transfer mainline.
+            _KV_CORE_CALLBACKS = KVCoreConnectorCallbacks(mode=mode, capability=_environment_capability())
+            host.install_hooks(installer)
         except Exception:
             host.close()
             raise

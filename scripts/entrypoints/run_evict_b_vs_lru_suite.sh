@@ -131,7 +131,7 @@ materialize_dataset() {
     --output-dir "$prepare_dir" \
     --dataset "$dataset" \
     --task "$dataset" \
-    --limit "$LIMIT"
+    --limit "$LIMIT" >&2
   printf '%s\n' "$prepare_dir/${dataset}_grouped_exact_next_canonical_workload.jsonl"
 }
 

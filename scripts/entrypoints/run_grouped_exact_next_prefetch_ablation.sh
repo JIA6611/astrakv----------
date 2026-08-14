@@ -123,6 +123,7 @@ start_server() {
   ASTRAKV_RUNTIME_CONTROL_RUN_ID="$run_id" \
   ASTRAKV_RUNTIME_CONTROL_STATE_DIR="$state_dir" \
   ASTRAKV_RUNTIME_CONTROL_CONTEXT_PORT="$CONTEXT_PORT" \
+  ASTRAKV_REQUIRE_EXACT_TOKEN_IDS=true \
   LMCACHE_CONFIG_FILE="$state_dir/lmcache.yaml" \
   ASTRAKV_KV_TRANSFER_CONFIG='{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}' \
   VLLM_ENGINE_READY_TIMEOUT_S=1200 \
@@ -266,7 +267,7 @@ PY
   "$PYTHON" scripts/benchmark/run_real_benchmark.py \
     --base-url "http://${HOST}:${PORT}/v1" \
     --model "$MODEL" \
-    --backend "vllm-lmcache047" \
+    --backend "vllm-lmcache-kv-core" \
     --output-dir "$run_dir" \
     --workload-jsonl "$canonical" \
     --run-id "$run_id" \
@@ -280,8 +281,10 @@ PY
     --connector-version "lmcache-vllm-v1-0.4.7" \
     --pair-id "$pair_id" \
     --pair-role "$role" \
-    --claim-scope online_control \
+    --claim-scope kv_core \
     --runtime-state-dir "$state_dir" \
+    --tokenizer-path "$MODEL" \
+    --chat-template-revision qwen3-default \
     --request-context-url "http://${HOST}:${CONTEXT_PORT}/request-context" \
     --request-context-session-id "${run_id}-session" \
     --request-context-secret-hex "$secret" \

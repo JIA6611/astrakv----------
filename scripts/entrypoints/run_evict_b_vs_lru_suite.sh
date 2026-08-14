@@ -38,6 +38,7 @@ GLOBAL_SCAN_INTERVAL_S="5.0"
 GLOBAL_SCAN_MAX_VICTIMS="4"
 WARMUP_PASSES="1"
 WARMUP_LIMIT="8"
+PATCH_VERIFICATION="${ASTRAKV_KV_CORE_PATCH_VERIFICATION:-}"
 EXTERNAL_SIDECAR=""
 KV_CORE_MODE="on"
 SKIP_AGGREGATE="false"
@@ -63,6 +64,9 @@ Options:
   --warmup-passes N           Warmup passes before the measured run
                               (same server/cache, builds online profile; default 1)
   --warmup-limit N            Warmup request count per pass (default 8)
+  --patch-verification PATH   KV-Core connector patch verification JSON
+                              (required when --no-kv-core is not set; defaults
+                              to $ASTRAKV_KV_CORE_PATCH_VERIFICATION)
   --sidecar-path PATH         Reuse an external sidecar instead of building
   --no-kv-core                Disable KV-core prefetch-A flags
   --skip-aggregate            Skip aggregation and mainline reports
@@ -87,6 +91,7 @@ while [[ $# -gt 0 ]]; do
     --global-scan-max-victims) GLOBAL_SCAN_MAX_VICTIMS="$2"; shift 2 ;;
     --warmup-passes) WARMUP_PASSES="$2"; shift 2 ;;
     --warmup-limit) WARMUP_LIMIT="$2"; shift 2 ;;
+    --patch-verification) PATCH_VERIFICATION="$2"; shift 2 ;;
     --sidecar-path) EXTERNAL_SIDECAR="$2"; shift 2 ;;
     --no-kv-core) KV_CORE_MODE="off"; shift ;;
     --skip-aggregate) SKIP_AGGREGATE="true"; shift ;;
@@ -113,12 +118,22 @@ fi
 
 KV_CORE_ENV=()
 if [[ "$KV_CORE_MODE" == "on" ]]; then
+  [[ -n "$PATCH_VERIFICATION" ]] || {
+    echo "KV-Core active mode requires --patch-verification (or ASTRAKV_KV_CORE_PATCH_VERIFICATION)" >&2
+    exit 2
+  }
+  [[ -f "$PATCH_VERIFICATION" ]] || {
+    echo "patch verification file missing: $PATCH_VERIFICATION" >&2
+    exit 2
+  }
   KV_CORE_ENV+=(
     "ASTRAKV_KV_CORE_MODE=active"
+    "ASTRAKV_KV_CORE_VENDOR_PATCH=true"
     "ASTRAKV_KV_CORE_TOPOLOGY=gpu_cpu_ssd"
     "ASTRAKV_KV_CORE_LOCAL_CPU=true"
     "ASTRAKV_KV_CORE_CPU_PREFETCH_ENABLED=true"
     "ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD=true"
+    "ASTRAKV_KV_CORE_PATCH_VERIFICATION=$PATCH_VERIFICATION"
   )
 fi
 

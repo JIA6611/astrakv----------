@@ -30,6 +30,18 @@ def parse_args() -> argparse.Namespace:
             "visits of an object are consecutive and neither strategy fires."
         ),
     )
+    parser.add_argument(
+        "--prefetch-lead-s",
+        type=float,
+        default=0.0,
+        help=(
+            "Stamp prefetch_lead_s on every workload row.  With the KV-Core "
+            "invalidate-on-lead flag this frees the request's own CPU copy at "
+            "ingress so Prefetch-A (arrival fill) can repopulate it from SSD "
+            "during the lead window without needing free capacity in a full "
+            "CPU pool."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -86,6 +98,7 @@ def main() -> int:
                 expected_output_tokens=int(row.get("max_tokens") or 128),
                 batch_size=1,
                 case=f"{dataset}_grouped_exact_next",
+                prefetch_lead_s=max(0.0, args.prefetch_lead_s),
                 metadata={key: value for key, value in metadata.items() if value is not None},
             )
         )

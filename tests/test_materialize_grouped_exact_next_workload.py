@@ -74,6 +74,7 @@ class InterleaveGroupsTests(unittest.TestCase):
                     "--task", "qasper",
                     "--limit", "6",
                     "--interleave",
+                    "--prefetch-lead-s", "0.25",
                 ],
                 capture_output=True,
                 text=True,
@@ -89,6 +90,9 @@ class InterleaveGroupsTests(unittest.TestCase):
                 self.assertNotEqual(previous, current)
             # arrival_index follows the new execution order.
             self.assertEqual([r["arrival_index"] for r in rows], list(range(6)))
+            # prefetch_lead_s is stamped on every row for the A invalidate+fill
+            # window.
+            self.assertTrue(all(abs(r["prefetch_lead_s"] - 0.25) < 1e-9 for r in rows))
 
 
 if __name__ == "__main__":

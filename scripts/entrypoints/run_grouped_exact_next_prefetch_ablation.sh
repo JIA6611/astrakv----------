@@ -44,6 +44,7 @@ WARMUP_PASSES="${ASTRAKV_ABLATION_WARMUP_PASSES:-0}"
 WARMUP_LIMIT="${ASTRAKV_ABLATION_WARMUP_LIMIT:-8}"
 INTERLEAVE="false"
 ROLES="${ASTRAKV_ABLATION_ROLES:-baseline,variant}"
+PREFETCH_LEAD_S="${ASTRAKV_ABLATION_PREFETCH_LEAD_S:-0.0}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -62,6 +63,7 @@ while [[ $# -gt 0 ]]; do
     --timeout) TIMEOUT="$2"; shift 2 ;;
     --interleave) INTERLEAVE="true"; shift ;;
     --roles) ROLES="$2"; shift 2 ;;
+    --prefetch-lead-s) PREFETCH_LEAD_S="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -185,6 +187,7 @@ materialize_dataset() {
     --dataset "$dataset" \
     --task "$dataset" \
     --limit "$LIMIT" \
+    --prefetch-lead-s "$PREFETCH_LEAD_S" \
     $([ "$INTERLEAVE" == "true" ] && echo --interleave)
 }
 

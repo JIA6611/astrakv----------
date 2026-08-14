@@ -30,9 +30,10 @@ PATCH_VERIFICATION="${ASTRAKV_KV_CORE_PATCH_VERIFICATION:-/home/zyx/astrakv-W/re
 OUTPUT_DIR="${ASTRAKV_SMOKE_OUT:-/home/zyx/astrakv-W/results/prefetch-integration-smoke-$(date -u +%Y%m%dT%H%M%SZ)}"
 LIMIT="${ASTRAKV_SMOKE_LIMIT:-16}"
 # Small CPU hot pool so earlier objects are fully evicted before their
-# interleaved revisit.  Each qasper object is ~0.6 GiB; 1.0 GiB keeps the
-# pool below the working set while leaving enough room for disk staging.
-CPU_GB="${ASTRAKV_SMOKE_CPU_GB:-1.0}"
+# interleaved revisit (B needs SSD-resident objects at release).  Each qasper
+# object is ~0.6 GiB and the limit-16 working set is ~3.6 GiB; 2.0 GiB keeps
+# pressure without the allocator-failure noise seen at 1.0 GiB.
+CPU_GB="${ASTRAKV_SMOKE_CPU_GB:-2.0}"
 
 [[ -d "$MODEL" ]] || { echo "model dir missing: $MODEL" >&2; exit 2; }
 [[ -f "$PATCH_VERIFICATION" ]] || { echo "patch verification missing: $PATCH_VERIFICATION" >&2; exit 2; }
@@ -43,6 +44,7 @@ export ASTRAKV_KV_CORE_PATCH_VERIFICATION="$PATCH_VERIFICATION"
 export ASTRAKV_LOCAL_CPU_SIZE_GB="$CPU_GB"
 export ASTRAKV_KV_CORE_CPU_PREFETCH_BUDGET_FRACTION="${ASTRAKV_KV_CORE_CPU_PREFETCH_BUDGET_FRACTION:-1.0}"
 export ASTRAKV_ONLINE_PREFETCH_MODE="${ASTRAKV_ONLINE_PREFETCH_MODE:-hybrid}"
+export ASTRAKV_ABLATION_PREFETCH_LEAD_S="${ASTRAKV_ABLATION_PREFETCH_LEAD_S:-0.25}"
 
 echo "== integration smoke: limit=$LIMIT cpu_gb=$CPU_GB model=$MODEL"
 echo "== output: $OUTPUT_DIR"

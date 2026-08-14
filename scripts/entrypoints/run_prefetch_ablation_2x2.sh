@@ -5,11 +5,12 @@ set -Eeuo pipefail
 #
 # The existing grouped exact-next ablation script toggles B
 # (ASTRAKV_ENABLE_ONLINE_PREFETCH_DISPATCH) per arm and leaves A off by
-# default.  This wrapper runs that script twice -- once with the KV-Core A
-# flags absent, once with them exported -- producing the three cells we
-# report on (the A+B combined cell is intentionally NOT run):
+# default.  This wrapper runs that script twice -- once with the KV-Core mode
+# active but A's CPU prefetch flag off, once with A's flag exported --
+# producing the three cells we report on (the A+B combined cell is
+# intentionally NOT run):
 #
-#   run 1: (A off, B off)  -> pure baseline
+#   run 1: (A off, B off)  -> pure baseline   (mode=active so B can dispatch)
 #          (A off, B on)   -> B-only
 #   run 2: (A on,  B off)  -> A-only   (variant/both skipped)
 #
@@ -29,6 +30,7 @@ SKIP_VALIDATE="false"
 DATASETS="qasper,multifieldqa_en"
 PATCH_VERIFICATION="${ASTRAKV_KV_CORE_PATCH_VERIFICATION:-}"
 INTERLEAVE="false"
+PREFETCH_LEAD_S="${ASTRAKV_ABLATION_PREFETCH_LEAD_S:-0.25}"
 
 usage() {
   cat <<'EOF'
@@ -42,6 +44,9 @@ Options:
   --limit N            Per-dataset request limit for both runs (default 50).
   --datasets LIST      Comma-separated datasets (default qasper,multifieldqa_en).
   --patch-verification PATH  connector_patch_verification.json for active (A-on) servers.
+  --prefetch-lead-s SECONDS  Lead window before each HTTP submit; with the
+                             invalidate-on-lead flag Prefetch-A frees then
+                             repopulates the request's CPU copy from SSD.
   --interleave               Round-robin reuse groups so A/B can actually fire
                              (objects become SSD-resident-but-CPU-evicted between
                              visits).  Without it every object's visits are
@@ -85,12 +90,18 @@ AOFF_DIR="$OUTPUT_ROOT/a-off"
 AON_DIR="$OUTPUT_ROOT/a-on"
 
 echo "=== [2x2] Run 1/2: A off (cells: A0B0, A0B1) ==="
+# KV-Core must be active for the online controller to dispatch B at all;
+# A stays off because CPU_PREFETCH_ENABLED is not exported here.
+ASTRAKV_KV_CORE_MODE=active ASTRAKV_KV_CORE_TOPOLOGY=gpu_cpu_ssd \
+ASTRAKV_KV_CORE_LOCAL_CPU=true \
+ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD=true \
 bash scripts/entrypoints/run_grouped_exact_next_prefetch_ablation.sh \
   --grouped-root "$GROUPED_ROOT" \
   --model "$MODEL" \
   --limit "$LIMIT" \
   --datasets "$DATASETS" \
   $([ "$INTERLEAVE" == "true" ] && echo --interleave) \
+  --prefetch-lead-s "$PREFETCH_LEAD_S" \
   --output-dir "$AOFF_DIR"
 
 echo "=== [2x2] Run 2/2: A on (cells: A1B0, A1B1) ==="
@@ -103,6 +114,7 @@ ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD=true \
   --limit "$LIMIT" \
   --datasets "$DATASETS" \
   $([ "$INTERLEAVE" == "true" ] && echo --interleave) \
+  --prefetch-lead-s "$PREFETCH_LEAD_S" \
   --roles baseline \
   --output-dir "$AON_DIR"
 

@@ -151,10 +151,16 @@ fi
 
 echo "=== [transfer] Test phase on $TEST_DATASET (Profile-B) ==="
 echo "=== [2x2] Run 1/2: A off (cells: A0B0, A0B1) ==="
+# KV-Core must be active for the online controller to dispatch B at all;
+# A stays off because CPU_PREFETCH_ENABLED is not exported here.
+ASTRAKV_KV_CORE_MODE=active ASTRAKV_KV_CORE_TOPOLOGY=gpu_cpu_ssd \
+ASTRAKV_KV_CORE_LOCAL_CPU=true \
+ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD=true \
 bash scripts/entrypoints/run_grouped_exact_next_prefetch_ablation.sh \
   --grouped-root "$TEST_ROOT" --model "$MODEL" --limit "$LIMIT" \
   --datasets "$TEST_DATASET" \
   $([ "$INTERLEAVE" == "true" ] && echo --interleave) \
+  --prefetch-lead-s "${ASTRAKV_ABLATION_PREFETCH_LEAD_S:-0.25}" \
   --output-dir "$OUTPUT_ROOT/test-a-off" "${SIDECAR_ARGS[@]}"
 
 echo "=== [2x2] Run 2/2: A on (cells: A1B0, A1B1) ==="
@@ -165,6 +171,7 @@ ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD=true \
   --grouped-root "$TEST_ROOT" --model "$MODEL" --limit "$LIMIT" \
   --datasets "$TEST_DATASET" \
   $([ "$INTERLEAVE" == "true" ] && echo --interleave) \
+  --prefetch-lead-s "${ASTRAKV_ABLATION_PREFETCH_LEAD_S:-0.25}" \
   --roles baseline \
   --output-dir "$OUTPUT_ROOT/test-a-on" "${SIDECAR_ARGS[@]}"
 

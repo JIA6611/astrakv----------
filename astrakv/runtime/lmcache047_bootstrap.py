@@ -166,6 +166,9 @@ def install_from_environment(
                 evict_cold_score_threshold=float(
                     os.environ.get("ASTRAKV_EVICT_COLD_SCORE_THRESHOLD", "0.35")
                 ),
+                evict_min_request_count=int(
+                    os.environ.get("ASTRAKV_EVICT_MIN_REQUEST_COUNT", "2")
+                ),
                 global_evict_scan_enabled=(
                     os.environ.get("ASTRAKV_EVICT_GLOBAL_SCAN_ENABLED", "true") == "true"
                 ),

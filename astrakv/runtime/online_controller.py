@@ -53,6 +53,11 @@ class OnlinePolicyControllerConfig:
     evict_cpu_capacity_bytes: int = 0
     evict_ssd_capacity_bytes: int = 0
     evict_cold_score_threshold: float = 0.35
+    # Observation sufficiency for eviction: objects seen by fewer requests
+    # are protected from single-object (release) eviction and ranked behind
+    # better-observed victims in the global scan, so a just-stored object is
+    # not evicted before it had a chance to be reused.
+    evict_min_request_count: int = 2
     global_evict_scan_enabled: bool = True
     global_evict_scan_min_interval_s: float = 5.0
     global_evict_scan_max_victims: int = 4
@@ -370,15 +375,6 @@ class OnlinePolicyController:
             elif scheduler_hint is not None and scheduler_action == "defer":
                 action = "defer"
                 reason = f"online policy: scheduler hint requested defer ({scheduler_hint.reason})"
-            elif active_refs == 0 and evict_ready and cpu_pressure_over and (
-                evict_cold_score >= float(self.config.evict_cold_score_threshold)
-            ):
-                action = "evict"
-                target_tier = "cpu"
-                reason = (
-                    "evict-B: CPU-layer eviction removes the CPU copy only (SSD preserved), "
-                    f"(cold_score={evict_cold_score:.3f})"
-                )
             else:
                 action = "keep"
                 target_tier = "cpu"
@@ -417,16 +413,6 @@ class OnlinePolicyController:
                 action = "load"
                 target_tier = "gpu"
                 reason = "online profile: SSD-resident object has a dynamic load target and load is more valuable than waiting for recompute"
-            elif active_refs == 0 and evict_ready and ssd_pressure_over and (
-                evict_cold_score >= float(self.config.evict_cold_score_threshold)
-                or prefetch_waste > 0
-            ):
-                action = "evict"
-                target_tier = "ssd"
-                reason = (
-                    "evict-B: SSD-layer eviction removes the SSD copy only "
-                    f"(cold_score={evict_cold_score:.3f})"
-                )
             elif prefetch_mode != "prefix_only" and prediction_gate_reason is None and prediction is not None:
                 action = "prefetch"
                 target_tier = "cpu"
@@ -905,13 +891,20 @@ class OnlinePolicyController:
             )
             if score < float(self.config.evict_cold_score_threshold):
                 continue
+            request_count = _as_int(state.get("request_count"))
+            observation_weight = min(
+                1.0,
+                request_count / max(1, int(self.config.evict_min_request_count)),
+            )
+            effective_score = round(score * observation_weight, 6)
             candidates.append(
                 (
-                    score,
+                    effective_score,
                     backend_object_id,
                     (
                         state, binding, object_level, object_key, request_id,
                         policy_reuse, confidence, prefetch_waste, "cpu" if tier == "cpu" else "ssd",
+                        score, observation_weight, request_count,
                     ),
                 )
             )
@@ -922,6 +915,7 @@ class OnlinePolicyController:
             (
                 state, binding, object_level, object_key, request_id,
                 policy_reuse, confidence, prefetch_waste, target_tier,
+                score_original, observation_weight, request_count,
             ) = payload
             decision = OfflineEvictionDecision(
                 run_id=self.run_id,
@@ -937,7 +931,7 @@ class OnlinePolicyController:
                     "global pressure scan: "
                     f"cpu_frac={pressure['cpu_usage_fraction']:.3f} "
                     f"ssd_frac={pressure['ssd_usage_fraction']:.3f} "
-                    f"cold_score={score:.3f}"
+                    f"cold_score={score_original:.3f} weight={observation_weight:.3f}"
                 ),
                 metadata={
                     "binding_id": binding.binding_id,
@@ -948,7 +942,9 @@ class OnlinePolicyController:
                     "policy_reuse_frequency": policy_reuse,
                     "runtime_confidence": confidence,
                     "prefetch_waste_count": prefetch_waste,
-                    "evict_cold_score": score,
+                    "evict_cold_score": score_original,
+                    "evict_observation_weight": observation_weight,
+                    "request_count": request_count,
                     "evict_pressure_snapshot": dict(pressure),
                     "current_tier": str(state.get("current_tier") or "unknown"),
                     "active_reference_count": _as_int(state.get("active_reference_count")),

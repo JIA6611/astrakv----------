@@ -84,6 +84,7 @@ class RuntimeControlHostConfig:
     evict_cpu_capacity_bytes: int = 0
     evict_ssd_capacity_bytes: int = 0
     evict_cold_score_threshold: float = 0.35
+    evict_min_request_count: int = 2
     global_evict_scan_enabled: bool = True
     global_evict_scan_min_interval_s: float = 5.0
     global_evict_scan_max_victims: int = 4
@@ -482,6 +483,7 @@ class RuntimeControlHost:
                 evict_cpu_capacity_bytes=self.config.evict_cpu_capacity_bytes,
                 evict_ssd_capacity_bytes=self.config.evict_ssd_capacity_bytes,
                 evict_cold_score_threshold=self.config.evict_cold_score_threshold,
+                evict_min_request_count=self.config.evict_min_request_count,
                 global_evict_scan_enabled=self.config.global_evict_scan_enabled,
                 global_evict_scan_min_interval_s=self.config.global_evict_scan_min_interval_s,
                 global_evict_scan_max_victims=self.config.global_evict_scan_max_victims,

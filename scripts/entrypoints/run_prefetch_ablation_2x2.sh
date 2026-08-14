@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Run the Prefetch-A / Prefetch-B 2x2 ablation in one invocation.
+# Run the Prefetch-A / Prefetch-B ablation in one invocation.
 #
 # The existing grouped exact-next ablation script toggles B
 # (ASTRAKV_ENABLE_ONLINE_PREFETCH_DISPATCH) per arm and leaves A off by
 # default.  This wrapper runs that script twice -- once with the KV-Core A
-# flags absent, once with them exported -- producing all four cells:
+# flags absent, once with them exported -- producing the three cells we
+# report on (the A+B combined cell is intentionally NOT run):
 #
-#   run 1: (A off, B off) + (A off, B on)
-#   run 2: (A on,  B off) + (A on,  B on)
+#   run 1: (A off, B off)  -> pure baseline
+#          (A off, B on)   -> B-only
+#   run 2: (A on,  B off)  -> A-only   (variant/both skipped)
 #
 # It then aggregates receipts/tickets/decisions per cell with
 # scripts/reporting/validate_prefetch_2x2_ablation.py.
@@ -26,6 +28,7 @@ LIMIT="50"
 SKIP_VALIDATE="false"
 DATASETS="qasper,multifieldqa_en"
 PATCH_VERIFICATION="${ASTRAKV_KV_CORE_PATCH_VERIFICATION:-}"
+INTERLEAVE="false"
 
 usage() {
   cat <<'EOF'
@@ -39,6 +42,10 @@ Options:
   --limit N            Per-dataset request limit for both runs (default 50).
   --datasets LIST      Comma-separated datasets (default qasper,multifieldqa_en).
   --patch-verification PATH  connector_patch_verification.json for active (A-on) servers.
+  --interleave               Round-robin reuse groups so A/B can actually fire
+                             (objects become SSD-resident-but-CPU-evicted between
+                             visits).  Without it every object's visits are
+                             consecutive and neither prefetch fires.
   --skip-validate      Skip the final 4-cell aggregation step.
 EOF
 }
@@ -51,6 +58,7 @@ while [[ $# -gt 0 ]]; do
     --limit) LIMIT="$2"; shift 2 ;;
     --datasets) DATASETS="$2"; shift 2 ;;
     --patch-verification) PATCH_VERIFICATION="$2"; shift 2 ;;
+    --interleave) INTERLEAVE="true"; shift ;;
     --skip-validate) SKIP_VALIDATE="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -82,6 +90,7 @@ bash scripts/entrypoints/run_grouped_exact_next_prefetch_ablation.sh \
   --model "$MODEL" \
   --limit "$LIMIT" \
   --datasets "$DATASETS" \
+  $([ "$INTERLEAVE" == "true" ] && echo --interleave) \
   --output-dir "$AOFF_DIR"
 
 echo "=== [2x2] Run 2/2: A on (cells: A1B0, A1B1) ==="
@@ -93,6 +102,8 @@ ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD=true \
   --model "$MODEL" \
   --limit "$LIMIT" \
   --datasets "$DATASETS" \
+  $([ "$INTERLEAVE" == "true" ] && echo --interleave) \
+  --roles baseline \
   --output-dir "$AON_DIR"
 
 if [[ "$SKIP_VALIDATE" == "true" ]]; then

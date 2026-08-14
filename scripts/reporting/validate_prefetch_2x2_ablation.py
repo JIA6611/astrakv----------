@@ -1,4 +1,4 @@
-"""Aggregate the Prefetch-A / Prefetch-B 2x2 ablation evidence.
+"""Aggregate the Prefetch-A / Prefetch-B ablation evidence.
 
 The grouped exact-next ablation produces, per dataset and per role
 (baseline = B off, variant = B on), two artifact families:
@@ -8,9 +8,10 @@ The grouped exact-next ablation produces, per dataset and per role
 - state dir (``<root>/<dataset>/<role>-state/``): ``kv_core_policy_decisions.jsonl``
   and ``kv_core_prefetch_tickets.jsonl`` (Prefetch-A decisions/tickets).
 
-This validator folds the two wrapper runs (A off / A on) into the four cells,
-counts B receipts, A decisions and tickets, and emits the conflict counters
-that feed the Phase-2 mitigation decision.
+This validator folds the two wrapper runs (A off / A on) into the reported
+cells, counts B receipts, A decisions and tickets.  Per the current scope the
+A+B combined cell (A1B1) is intentionally not run; only pure baseline (A0B0),
+B-only (A0B1) and A-only (A1B0) are reported.
 """
 
 from __future__ import annotations
@@ -203,7 +204,12 @@ def main() -> int:
     for a_enabled, root in ((False, a_off), (True, a_on)):
         for dataset in datasets:
             for role in ROLES:
+                if a_enabled and role == "variant":
+                    # A+B combined cell is out of scope by decision.
+                    continue
                 cell = _aggregate_cell(root, dataset, role)
+                if not (root / dataset / role).is_dir() and not (root / dataset / f"{role}-state").is_dir():
+                    continue
                 cell["a_enabled"] = a_enabled
                 cell["b_enabled"] = role == "variant"
                 cell["cell"] = f"A{int(a_enabled)}B{int(role == 'variant')}"
@@ -211,21 +217,7 @@ def main() -> int:
 
     b_only_cells = [cell for cell in cells if cell["cell"] == "A0B1"]
     a_only_cells = [cell for cell in cells if cell["cell"] == "A1B0"]
-    both_cells = [cell for cell in cells if cell["cell"] == "A1B1"]
-    conflict_totals = {
-        "invalidate_removed_chunk_count": sum(
-            cell["conflict_signals"]["invalidate_removed_chunk_count"]
-            for cell in both_cells
-        ),
-        "b_noop_when_a_resident": sum(
-            cell["conflict_signals"]["b_noop_when_a_resident"]
-            for cell in both_cells
-        ),
-        "dual_accounting_cells": sum(
-            1 for cell in both_cells
-            if cell["conflict_signals"]["dual_accounting_ticket_consumed_and_b_completed"]
-        ),
-    }
+    expected_cells = 3 * len(datasets)  # A0B0, A0B1, A1B0
 
     summary = {
         "schema": SCHEMA,
@@ -233,7 +225,7 @@ def main() -> int:
         "a_on_root": str(a_on),
         "cells": cells,
         "acceptance": {
-            "cells_present": len(cells) == 4 * len(datasets),
+            "cells_present": len(cells) == expected_cells,
             "b_only_completed_receipt": any(
                 cell["prefetch_b"]["completed_with_bytes"] > 0
                 for cell in b_only_cells
@@ -243,11 +235,10 @@ def main() -> int:
                 for cell in a_only_cells
             ),
         },
-        "both_cell_conflict_totals": conflict_totals,
+        "both_cell_conflict_totals": None,
         "note": (
-            "both-cell conflict totals are Phase-2 input evidence; nonzero "
-            "values are expected until the unified accounting/invalidate "
-            "mitigation lands."
+            "A+B combined (A1B1) is intentionally not verified; scope is pure "
+            "baseline, A-only and B-only performance."
         ),
     }
     payload = json.dumps(summary, indent=2, sort_keys=True)

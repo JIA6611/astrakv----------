@@ -20,6 +20,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", default="")
     parser.add_argument("--task", default="")
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument(
+        "--interleave",
+        action="store_true",
+        help=(
+            "Round-robin across reuse groups so the same object's visits are "
+            "spaced apart. This creates SSD-resident-but-CPU-evicted revisit "
+            "windows that Prefetch-A/B can actually act on; without it, all "
+            "visits of an object are consecutive and neither strategy fires."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -30,6 +40,8 @@ def main() -> int:
     ordered = sorted(rows, key=lambda row: int(row.get("order") or 0))
     if args.limit > 0:
         ordered = ordered[: args.limit]
+    if args.interleave:
+        ordered = interleave_groups(ordered)
     dataset = args.dataset or input_path.parent.name
     task = args.task or dataset
     group_sizes = reuse_group_sizes(ordered)
@@ -42,7 +54,9 @@ def main() -> int:
         reuse_group = str(row.get("reuse_group") or "")
         request_id = str(row.get("request_id") or f"{dataset}-grouped-{index:06d}")
         group_size = group_sizes.get(reuse_group, 1)
-        arrival_index = int(row.get("order") or index)
+        # In interleave mode the row's original ``order`` no longer reflects
+        # the execution sequence; the new enumeration index is authoritative.
+        arrival_index = index if args.interleave else int(row.get("order") or index)
         reuse_ratio = 0.0 if group_size <= 1 else (group_size - 1) / group_size
         reuse_bucket = "none" if group_size == 1 else ("medium" if group_size == 2 else "high")
         metadata = {
@@ -144,6 +158,38 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     if not rows:
         raise ValueError(f"grouped prompt file is empty: {path}")
     return rows
+
+
+def interleave_groups(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Round-robin rows across reuse groups, preserving intra-group order.
+
+    The grouped source orders every visit of an object consecutively.  A/B
+    prefetch need the object to be fully evicted from the CPU hot cache before
+    its next visit; interleaving different groups in between creates that
+    eviction window while keeping the exact same prompt/object set.
+    """
+    buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        buckets[str(row.get("reuse_group") or "")].append(row)
+    # Deterministic group order: first appearance in the original workload.
+    group_order: list[str] = []
+    for row in rows:
+        group = str(row.get("reuse_group") or "")
+        if group not in group_order:
+            group_order.append(group)
+    result: list[dict[str, Any]] = []
+    cursor: dict[str, int] = {}
+    pending = True
+    while pending:
+        pending = False
+        for group in group_order:
+            bucket = buckets[group]
+            position = cursor.get(group, 0)
+            if position < len(bucket):
+                result.append(bucket[position])
+                cursor[group] = position + 1
+                pending = True
+    return result
 
 
 def reuse_group_sizes(rows: list[dict[str, Any]]) -> dict[str, int]:

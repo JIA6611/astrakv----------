@@ -72,7 +72,7 @@ class BuildPrefetchFinalReportTests(unittest.TestCase):
         self.assertIn("## 2. 四格对比表", report)
         self.assertIn("## 3. B 泛化（Profile-B", report)
         self.assertIn("## 4. 在线学习自适应", report)
-        self.assertIn("## 5. 阶段二冲突计数", report)
+        self.assertIn("## 5. A/B 叠加（both 格）", report)
         self.assertIn("80.0", report)
         self.assertIn("80.0%", report)  # A hit rate 8/(8+2)
 

@@ -24,6 +24,10 @@ export ASTRAKV_PYTHON="$PYTHON"
 # to 0.45 so the GPU KV cache lands near the CPU tier size.  Override via env.
 LOCAL_CPU_SIZE_GB="${ASTRAKV_LOCAL_CPU_SIZE_GB:-36}"
 export ASTRAKV_LOCAL_CPU_SIZE_GB="$LOCAL_CPU_SIZE_GB"
+# The grouped ablation stages need CPU pressure so objects are evicted from
+# the hot layer between interleaved visits; the E3 stage keeps the larger
+# CPU==GPU pool above.  Override via env.
+ABLATION_CPU_SIZE_GB="${ASTRAKV_ABLATION_CPU_SIZE_GB:-4.0}"
 export ASTRAKV_KV_CORE_CPU_PREFETCH_BUDGET_FRACTION="${ASTRAKV_KV_CORE_CPU_PREFETCH_BUDGET_FRACTION:-1.0}"
 export ASTRAKV_GPU_MEMORY_UTILIZATION="${ASTRAKV_GPU_MEMORY_UTILIZATION:-0.45}"
 MODEL="${ASTRAKV_MODEL:-/home/zyx/astrakv2/models/Qwen3-8B}"
@@ -99,8 +103,10 @@ if [[ "$RESUME" != "1" ]]; then
 fi
 
 stage "3/7 standard 2x2 (Sidecar-B upper bound)"
+export ASTRAKV_LOCAL_CPU_SIZE_GB="$ABLATION_CPU_SIZE_GB"
 bash scripts/entrypoints/run_prefetch_ablation_2x2.sh \
   --grouped-root "$GROUPED_ROOT" --model "$MODEL" --limit "$LIMIT" \
+  --interleave \
   --output-root "$ABLATION_OUT"
 ABLATION_VALIDATION="$ABLATION_OUT/prefetch_2x2_validation.json"
 
@@ -116,7 +122,8 @@ bash scripts/entrypoints/run_prefetch_transfer_ablation.sh \
   --train-grouped-root "$TRANSFER_SPLIT/train" \
   --test-grouped-root "$TRANSFER_SPLIT/test" \
   --train-dataset qasper --test-dataset qasper \
-  --model "$MODEL" --train-limit "$TRAIN_LIMIT" --limit "$LIMIT"
+  --model "$MODEL" --train-limit "$TRAIN_LIMIT" --limit "$LIMIT" \
+  --interleave
 TRANSFER_PROFILE_VALIDATION="$TRANSFER_PROFILE/prefetch_2x2_validation.json"
 
 stage "6/7 transfer hybrid (online adaptation)"
@@ -126,6 +133,7 @@ bash scripts/entrypoints/run_prefetch_transfer_ablation.sh \
   --test-grouped-root "$TRANSFER_SPLIT/test" \
   --train-dataset qasper --test-dataset qasper \
   --model "$MODEL" --train-limit "$TRAIN_LIMIT" --limit "$LIMIT" \
+  --interleave \
   --prefetch-mode hybrid
 for role in baseline variant; do
   "$PYTHON" scripts/reporting/analyze_prefetch_adaptation.py \

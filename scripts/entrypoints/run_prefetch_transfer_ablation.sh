@@ -37,6 +37,7 @@ TRAIN_TRACE=""
 SIDECAR_PATH=""
 PREFETCH_MODE="prefix_only"
 PATCH_VERIFICATION="${ASTRAKV_KV_CORE_PATCH_VERIFICATION:-}"
+INTERLEAVE="false"
 
 usage() {
   cat <<'EOF'
@@ -62,6 +63,9 @@ Options:
                              builds the offline profile DB.
   --sidecar-path FILE        Optional train-derived exact-next sidecar (upper bound).
   --patch-verification PATH  connector_patch_verification.json for active (A-on) servers.
+  --interleave               Round-robin the TEST workload's reuse groups so
+                             objects become SSD-resident-but-CPU-evicted
+                             between visits (required for A/B to fire).
   --prefetch-mode MODE       Online prefetch mode for the test phase:
                              prefix_only (default, Profile-B via hints/profile),
                              hybrid (adds online RuntimePrefixIndex adaptation),
@@ -82,6 +86,7 @@ while [[ $# -gt 0 ]]; do
     --train-trace) TRAIN_TRACE="$2"; shift 2 ;;
     --sidecar-path) SIDECAR_PATH="$2"; shift 2 ;;
     --patch-verification) PATCH_VERIFICATION="$2"; shift 2 ;;
+    --interleave) INTERLEAVE="true"; shift ;;
     --prefetch-mode) PREFETCH_MODE="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -149,6 +154,7 @@ echo "=== [2x2] Run 1/2: A off (cells: A0B0, A0B1) ==="
 bash scripts/entrypoints/run_grouped_exact_next_prefetch_ablation.sh \
   --grouped-root "$TEST_ROOT" --model "$MODEL" --limit "$LIMIT" \
   --datasets "$TEST_DATASET" \
+  $([ "$INTERLEAVE" == "true" ] && echo --interleave) \
   --output-dir "$OUTPUT_ROOT/test-a-off" "${SIDECAR_ARGS[@]}"
 
 echo "=== [2x2] Run 2/2: A on (cells: A1B0, A1B1) ==="
@@ -158,6 +164,8 @@ ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD=true \
   bash scripts/entrypoints/run_grouped_exact_next_prefetch_ablation.sh \
   --grouped-root "$TEST_ROOT" --model "$MODEL" --limit "$LIMIT" \
   --datasets "$TEST_DATASET" \
+  $([ "$INTERLEAVE" == "true" ] && echo --interleave) \
+  --roles baseline \
   --output-dir "$OUTPUT_ROOT/test-a-on" "${SIDECAR_ARGS[@]}"
 
 "$PYTHON" scripts/reporting/validate_prefetch_2x2_ablation.py \

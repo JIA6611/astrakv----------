@@ -42,6 +42,8 @@ EXTERNAL_SIDECAR=""
 DATASETS="qasper,multifieldqa_en"
 WARMUP_PASSES="${ASTRAKV_ABLATION_WARMUP_PASSES:-0}"
 WARMUP_LIMIT="${ASTRAKV_ABLATION_WARMUP_LIMIT:-8}"
+INTERLEAVE="false"
+ROLES="${ASTRAKV_ABLATION_ROLES:-baseline,variant}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -58,6 +60,8 @@ while [[ $# -gt 0 ]]; do
     --sidecar-path) EXTERNAL_SIDECAR="$2"; shift 2 ;;
     --datasets) DATASETS="$2"; shift 2 ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
+    --interleave) INTERLEAVE="true"; shift ;;
+    --roles) ROLES="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -69,6 +73,13 @@ done
 [[ -n "$GROUPED_ROOT" ]] || { echo "--grouped-root is required" >&2; exit 2; }
 IFS=',' read -r -a SELECTED_DATASETS <<< "$DATASETS"
 [[ "${#SELECTED_DATASETS[@]}" -gt 0 ]] || { echo "--datasets must not be empty" >&2; exit 2; }
+IFS=',' read -r -a SELECTED_ROLES <<< "$ROLES"
+for role in "${SELECTED_ROLES[@]}"; do
+  case "$role" in
+    baseline|variant) ;;
+    *) echo "invalid --roles entry: $role (expected baseline|variant)" >&2; exit 2 ;;
+  esac
+done
 for dataset in "${SELECTED_DATASETS[@]}"; do
   [[ -f "$GROUPED_ROOT/$dataset/grouped_prompts.jsonl" ]] || {
     echo "missing $GROUPED_ROOT/$dataset/grouped_prompts.jsonl" >&2; exit 2; }
@@ -151,6 +162,12 @@ EOF
   else
     printf 'ASTRAKV_ENABLE_ONLINE_PREFETCH_DISPATCH=true\nASTRAKV_ONLINE_OFFLINE_GATE_PATH=%s\n' \
       "$state_dir/offline_gate.json" >> "$runtime_env"
+    # B (predictive prefetch) also requires a prefetch mode; the bootstrap
+    # default is "disabled", which gates out every prefetch decision even when
+    # dispatch is enabled.  Honoring the environment lets the 2x2/transfer
+    # wrappers set prefix_only/hybrid per cell.
+    printf 'ASTRAKV_ONLINE_PREFETCH_MODE=%s\n' \
+      "${ASTRAKV_ONLINE_PREFETCH_MODE:-hybrid}" >> "$runtime_env"
     if [[ -n "$sidecar_path" ]]; then
       printf 'ASTRAKV_ONLINE_PREDICTION_SIDECAR_PATH=%s\n' "$sidecar_path" >> "$runtime_env"
     fi
@@ -167,7 +184,8 @@ materialize_dataset() {
     --output-dir "$materialized_dir" \
     --dataset "$dataset" \
     --task "$dataset" \
-    --limit "$LIMIT"
+    --limit "$LIMIT" \
+    $([ "$INTERLEAVE" == "true" ] && echo --interleave)
 }
 
 build_analysis_artifacts() {
@@ -303,8 +321,9 @@ for dataset in "${SELECTED_DATASETS[@]}"; do
   canonical="$OUTPUT_DIR/$dataset/materialized/${dataset}_grouped_exact_next_canonical_workload.jsonl"
   candidate_report="$OUTPUT_DIR/$dataset/analysis/candidates/predictor_candidate_report.jsonl"
   pair_id="grouped-exact-next-prefetch-${dataset}-$TIMESTAMP"
-  run_condition "$dataset" baseline "$canonical" "$pair_id" "$candidate_report"
-  run_condition "$dataset" variant "$canonical" "$pair_id" "$candidate_report"
+  for role in "${SELECTED_ROLES[@]}"; do
+    run_condition "$dataset" "$role" "$canonical" "$pair_id" "$candidate_report"
+  done
 done
 
 echo "Prefetch ablation suite completed: $OUTPUT_DIR"

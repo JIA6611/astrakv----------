@@ -74,10 +74,30 @@ def event_key(row: dict[str, Any]) -> str:
 
 
 def aggregate_run(state_dir: Path, run_dir: Path | None, *, reaccess_window_ms: int) -> dict[str, Any]:
-    receipts = load_jsonl(state_dir / "runtime_command_receipts.jsonl")
-    commands = load_jsonl(state_dir / "astrakv_runtime_commands.jsonl")
-    tickets = load_jsonl(state_dir / "kv_core_prefetch_tickets.jsonl")
-    decisions = load_jsonl(state_dir / "kv_core_policy_decisions.jsonl")
+    def load_first(*candidates: Path) -> list[dict[str, Any]]:
+        for path in candidates:
+            if path.exists():
+                return load_jsonl(path)
+        return []
+
+    # The ablation copies control-plane artifacts from the *-state dir into the
+    # run dir (baseline|variant); prefer the run dir, fall back to state dir.
+    receipts = load_first(
+        run_dir / "runtime_command_receipts.jsonl" if run_dir is not None else state_dir,
+        state_dir / "runtime_command_receipts.jsonl",
+    )
+    commands = load_first(
+        run_dir / "astrakv_runtime_commands.jsonl" if run_dir is not None else state_dir,
+        state_dir / "astrakv_runtime_commands.jsonl",
+    )
+    tickets = load_first(
+        run_dir / "kv_core_prefetch_tickets.jsonl" if run_dir is not None else state_dir,
+        state_dir / "kv_core_prefetch_tickets.jsonl",
+    )
+    decisions = load_first(
+        run_dir / "kv_core_policy_decisions.jsonl" if run_dir is not None else state_dir,
+        state_dir / "kv_core_policy_decisions.jsonl",
+    )
 
     receipt_counts: Counter[str] = Counter()
     evict_completed: list[dict[str, Any]] = []
@@ -116,7 +136,12 @@ def aggregate_run(state_dir: Path, run_dir: Path | None, *, reaccess_window_ms: 
             evicted_at[key] = max(evicted_at.get(key, 0), ts)
     reaccess_after_evict: set[str] = set()
     if evicted_at:
-        for path in (state_dir / "runtime_structured_events.jsonl", state_dir / "hook_raw.jsonl"):
+        for path in (
+            run_dir / "runtime_structured_events.jsonl" if run_dir is not None else state_dir,
+            state_dir / "runtime_structured_events.jsonl",
+            run_dir / "hook_raw.jsonl" if run_dir is not None else state_dir,
+            state_dir / "hook_raw.jsonl",
+        ):
             for row in load_jsonl(path):
                 action = as_str(row.get("action"))
                 if action not in {"cache_hit", "cache_load", "load", "hit"}:

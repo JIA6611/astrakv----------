@@ -144,20 +144,11 @@ def build_report(
             rows,
         ))
 
-    sections.append("## 5. 阶段二冲突计数（both 格）")
-    conflict: dict[str, Any] = {}
-    for payload in (ablation, transfer):
-        if payload is None:
-            continue
-        totals = payload.get("both_cell_conflict_totals") or {}
-        for key, value in totals.items():
-            conflict[key] = int(conflict.get(key, 0)) + int(value or 0)
-    if not conflict:
-        sections.append("未提供冲突计数。")
-    else:
-        for key, value in sorted(conflict.items()):
-            sections.append(f"- {key}: {value}")
-        sections.append("> 归零或有明确解释后，both 模式方可宣称生产可用。")
+    sections.append("## 5. A/B 叠加（both 格）")
+    sections.append(
+        "> 按当前实验决策，A+B 叠加格不单独验证；报告范围仅覆盖纯 baseline、"
+        "A-only 与 B-only 的独立性能。"
+    )
 
     return "\n\n".join(sections) + "\n"
 

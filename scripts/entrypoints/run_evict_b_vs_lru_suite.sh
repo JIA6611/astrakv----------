@@ -211,8 +211,10 @@ mkdir -p "$OUTPUT_ROOT"
 for dataset in "${SELECTED_DATASETS[@]}"; do
   canonical="$(materialize_dataset "$dataset")"
   footprint="$(footprint_bytes "$canonical")"
-  cpu_bytes="$("$PYTHON" -c "print(max(int($footprint * $CPU_FRACTION), 33554432))")"
-  ssd_bytes="$("$PYTHON" -c "print(max(int($footprint * $SSD_FRACTION), 33554432))")"
+  # Floor at 128 MiB so the pool can hold several KV chunks (Qwen3-8B chunk
+  # ~36 MiB); a pool smaller than one chunk makes LMCache store 0 chunks.
+  cpu_bytes="$("$PYTHON" -c "print(max(int($footprint * $CPU_FRACTION), 134217728))")"
+  ssd_bytes="$("$PYTHON" -c "print(max(int($footprint * $SSD_FRACTION), 134217728))")"
   echo "[$dataset] footprint=$footprint cpu_bytes=$cpu_bytes ssd_bytes=$ssd_bytes"
   for rep in $(seq 1 "$REPEATS"); do
     run_arm "arm-evict-b" "true" "$dataset" "$rep" "$cpu_bytes" "$ssd_bytes"
@@ -227,9 +229,11 @@ fi
 
 for arm in arm-evict-b arm-lru; do
   for rep in $(seq 1 "$REPEATS"); do
-    for state_dir in "$OUTPUT_ROOT/$arm/rep-$rep"/*/*-state; do
-      [[ -d "$state_dir" ]] || continue
-      "$PYTHON" scripts/reporting/build_evict_mainline_report.py --state-dir "$state_dir" >/dev/null || true
+    # Artifacts (receipts/commands/tickets) live in the run dir (baseline|variant),
+    # not the *-state dir; the ablation copies them over during run_condition.
+    for run_dir in "$OUTPUT_ROOT/$arm/rep-$rep"/*/{baseline,variant}; do
+      [[ -d "$run_dir" ]] || continue
+      "$PYTHON" scripts/reporting/build_evict_mainline_report.py --state-dir "$run_dir" >/dev/null || true
     done
   done
   "$PYTHON" scripts/reporting/aggregate_evict_ablation.py \

@@ -1,38 +1,40 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# P3a: a single vLLM engine first writes an exact prefix, then compares its
-# request-owned native external load with a one-shot scheduler-declined native
-# recompute of the same complete token sequence. This is a correctness probe,
-# not a latency or capacity benchmark.
+# Load-vs-recompute decision-correctness probe (P3b).
+#
+# A single exact prefix is written once, then revisited under five controlled
+# scenarios (fast IO -> load, tight deadline -> recompute, memory pressure ->
+# recompute, slow IO -> recompute, forced recompute).  Per-request decision
+# overrides are published through the request context and honored only under
+# the ASTRAKV_KV_CORE_EQUIVALENCE_TEST gate, so the production path is
+# untouched.  The suite validates that every runtime decision reason matches
+# its locked label and that native accounting confirms the executed arm.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 PYTHON="${ASTRAKV_PYTHON:-python3}"
 MODEL="${ASTRAKV_MODEL:-/opt/models/Qwen3-8B}"
-SOURCE_WORKLOAD=""
 PROMPTS_FILE=""
-OUTPUT_DIR="$ROOT/results/kv-equivalence-$(date -u +%Y%m%dT%H%M%SZ)"
+OUTPUT_DIR="$ROOT/results/decision-probe-$(date -u +%Y%m%dT%H%M%SZ)"
 PATCH_MANIFEST=""
 CALLBACK_SMOKE=""
 HOST="127.0.0.1"
-PORT="18100"
-CONTEXT_PORT="18090"
+PORT="18110"
+CONTEXT_PORT="18095"
 TIMEOUT="900"
 GPU_MEMORY_UTILIZATION="0.72"
 SERVER_PID=""
 
 usage() {
   cat <<'EOF'
-Usage: bash scripts/entrypoints/run_kv_equivalence_suite.sh \
-  (--source-workload FILE | --prompts-file FILE) \
-  --patch-manifest FILE --callback-smoke FILE [options]
+Usage: bash scripts/entrypoints/run_decision_probe_suite.sh \
+  --prompts-file FILE --patch-manifest FILE --callback-smoke FILE [options]
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --source-workload) SOURCE_WORKLOAD="$2"; shift 2 ;;
     --prompts-file) PROMPTS_FILE="$2"; shift 2 ;;
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
     --patch-manifest) PATCH_MANIFEST="$2"; shift 2 ;;
@@ -48,16 +50,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -n "$SOURCE_WORKLOAD" && -n "$PROMPTS_FILE" ]]; then
-  echo "choose exactly one of --source-workload or --prompts-file" >&2; exit 2
-fi
-if [[ -n "$SOURCE_WORKLOAD" ]]; then
-  [[ -f "$SOURCE_WORKLOAD" ]] || { echo "--source-workload not found: $SOURCE_WORKLOAD" >&2; exit 2; }
-elif [[ -n "$PROMPTS_FILE" ]]; then
-  [[ -f "$PROMPTS_FILE" ]] || { echo "--prompts-file not found: $PROMPTS_FILE" >&2; exit 2; }
-else
-  echo "--source-workload or --prompts-file is required" >&2; exit 2
-fi
+[[ -f "$PROMPTS_FILE" ]] || { echo "--prompts-file is required" >&2; exit 2; }
 [[ -f "$PATCH_MANIFEST" ]] || { echo "--patch-manifest is required" >&2; exit 2; }
 [[ -f "$CALLBACK_SMOKE" ]] || { echo "--callback-smoke is required" >&2; exit 2; }
 [[ "$HOST" == "127.0.0.1" || "$HOST" == "localhost" ]] || { echo "only loopback host is supported" >&2; exit 2; }
@@ -79,41 +72,12 @@ wait_for_server() {
 }
 
 mkdir -p "$OUTPUT_DIR/workload" "$OUTPUT_DIR/state" "$OUTPUT_DIR/lmcache-store"
-export ASTRAKV_EQUIVALENCE_OUTPUT_DIR="$OUTPUT_DIR"
-"$PYTHON" - <<'PY'
-import hashlib
-import json
-import os
-from pathlib import Path
-
-root = Path.cwd()
-paths = [
-    root / "astrakv/runtime/vendor_callback_bridge.py",
-    root / "scripts/benchmark/run_real_benchmark.py",
-    root / "scripts/benchmark/materialize_kv_equivalence_workload.py",
-    root / "scripts/reporting/validate_kv_equivalence.py",
-    root / "scripts/entrypoints/run_kv_equivalence_suite.sh",
-]
-payload = {
-    "schema": "astrakv-kv-equivalence-runtime-source-v1",
-    "files": [{"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()} for path in paths],
-}
-(Path(os.environ["ASTRAKV_EQUIVALENCE_OUTPUT_DIR"]) / "runtime_source_manifest.json").write_text(
-    json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-)
-PY
 "$PYTHON" scripts/runtime/verify_kv_core_connector_patch.py \
   --deployment-manifest "$PATCH_MANIFEST" --callback-smoke "$CALLBACK_SMOKE" \
   --output "$OUTPUT_DIR/connector_patch_verification.json"
-if [[ -n "$PROMPTS_FILE" ]]; then
-  "$PYTHON" scripts/benchmark/materialize_kv_equivalence_workload.py \
-    --prompts-file "$PROMPTS_FILE" --output-dir "$OUTPUT_DIR/workload" \
-    > "$OUTPUT_DIR/workload_materialization.json"
-else
-  "$PYTHON" scripts/benchmark/materialize_kv_equivalence_workload.py \
-    --source-workload "$SOURCE_WORKLOAD" --output-dir "$OUTPUT_DIR/workload" \
-    > "$OUTPUT_DIR/workload_materialization.json"
-fi
+"$PYTHON" scripts/benchmark/materialize_decision_probe_workload.py \
+  --prompts-file "$PROMPTS_FILE" --output-dir "$OUTPUT_DIR/workload" \
+  > "$OUTPUT_DIR/workload_materialization.json"
 
 cat > "$OUTPUT_DIR/lmcache.yaml" <<EOF
 local_cpu: false
@@ -122,7 +86,7 @@ local_disk: $OUTPUT_DIR/lmcache-store
 max_local_disk_size: 80.0
 EOF
 SECRET_HEX="$($PYTHON -c 'import secrets; print(secrets.token_hex(32))')"
-RUN_ID="kv-equivalence-$(date -u +%Y%m%dT%H%M%SZ)"
+RUN_ID="decision-probe-$(date -u +%Y%m%dT%H%M%SZ)"
 ASTRAKV_PYTHON="$PYTHON" \
 ASTRAKV_MODEL="$MODEL" ASTRAKV_HOST="$HOST" ASTRAKV_PORT="$PORT" \
 PYTHONHASHSEED=0 ASTRAKV_VLLM_SEED=0 ASTRAKV_GPU_MEMORY_UTILIZATION="$GPU_MEMORY_UTILIZATION" \
@@ -139,7 +103,8 @@ ASTRAKV_KV_CORE_MODE=active ASTRAKV_KV_CORE_TOPOLOGY=gpu_ssd ASTRAKV_KV_CORE_LOC
 ASTRAKV_KV_CORE_PATCH_VERIFICATION="$OUTPUT_DIR/connector_patch_verification.json" \
 ASTRAKV_KV_CORE_ADMISSION_ENABLED=true ASTRAKV_KV_CORE_CPU_PREFETCH_ENABLED=false \
 ASTRAKV_KV_CORE_EXTERNAL_TOKEN_CAP=8192 ASTRAKV_KV_CORE_BOOTSTRAP_LOADS=2 \
-ASTRAKV_KV_CORE_SSD_READ_GBPS=3.0 ASTRAKV_KV_CORE_EQUIVALENCE_TEST=true \
+ASTRAKV_KV_CORE_SSD_READ_GBPS=3.0 ASTRAKV_KV_CORE_PREFILL_MS_PER_TOKEN=0.08 \
+ASTRAKV_KV_CORE_EQUIVALENCE_TEST=true \
 VLLM_ENGINE_READY_TIMEOUT_S=1200 \
 nohup bash scripts/launch/launch_lmcache_vllm.sh disk > "$OUTPUT_DIR/server.log" 2>&1 < /dev/null &
 SERVER_PID="$!"
@@ -153,8 +118,8 @@ ASTRAKV_MAX_MODEL_LEN=32768 ASTRAKV_PREFIX_CACHING=false \
 ASTRAKV_KV_TRANSFER_CONFIG='{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}' \
 LMCACHE_CONFIG_FILE="$OUTPUT_DIR/lmcache.yaml" "$PYTHON" scripts/benchmark/run_real_benchmark.py \
   --base-url "http://${HOST}:${PORT}/v1" --model "$MODEL" --backend vllm-lmcache-kv-core \
-  --output-dir "$OUTPUT_DIR/run" --workload-jsonl "$OUTPUT_DIR/workload/kv_equivalence_single_prefix.jsonl" \
-  --run-id "$RUN_ID" --workload-id kv_equivalence_single_prefix \
+  --output-dir "$OUTPUT_DIR/run" --workload-jsonl "$OUTPUT_DIR/workload/decision_probe_single_prefix.jsonl" \
+  --run-id "$RUN_ID" --workload-id decision_probe_single_prefix \
   --model-revision local-qwen3-8b --tokenizer-revision local-qwen3-8b --dtype bfloat16 \
   --quantization unquantized --tokenizer-path "$MODEL" --chat-template-revision qwen3-default \
   --random-seed 0 --cache-state cold --connector-version lmcache-vllm-v1-0.4.7 \
@@ -165,6 +130,7 @@ LMCACHE_CONFIG_FILE="$OUTPUT_DIR/lmcache.yaml" "$PYTHON" scripts/benchmark/run_r
 for artifact in callback-smoke.json kv_core_native_callbacks.jsonl kv_core_native_receipts.jsonl kv_core_request_accounting.jsonl request_context_associations.jsonl kv_core_policy_decisions.jsonl kv_core_run_metadata.json; do
   [[ -f "$OUTPUT_DIR/state/$artifact" ]] && cp "$OUTPUT_DIR/state/$artifact" "$OUTPUT_DIR/run/$artifact"
 done
-"$PYTHON" scripts/reporting/validate_kv_equivalence.py \
-  --run-dir "$OUTPUT_DIR/run" --output "$OUTPUT_DIR/kv_equivalence.json"
-echo "KV equivalence suite completed: $OUTPUT_DIR"
+cp "$OUTPUT_DIR/workload/decision_probe_workload.manifest.json" "$OUTPUT_DIR/run/decision_probe_workload.manifest.json"
+"$PYTHON" scripts/reporting/validate_decision_probe.py \
+  --run-dir "$OUTPUT_DIR/run" --output "$OUTPUT_DIR/decision_probe_acceptance.json"
+echo "Decision probe suite completed: $OUTPUT_DIR"

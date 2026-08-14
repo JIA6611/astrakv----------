@@ -98,6 +98,11 @@ class VendorCallbackBridge:
         self._keys_by_request: dict[str, tuple[Any, ...]] = {}
         self._prefetch_by_request: dict[str, str] = {}
         self._ingress_started_ns: dict[str, int] = {}
+        # Test-only per-request decision overrides (memory pressure, deadline,
+        # IO bandwidth, forced recompute) published through the authenticated
+        # request context.  Populated only when the equivalence test gate is
+        # enabled; the production path never reads this dict.
+        self._decision_probe_by_request: dict[str, dict[str, Any]] = {}
         # In-memory fallback for the same-process equivalence probe. The
         # authoritative cross-process handoff is an atomic state-dir record.
         self._equivalence_force_recompute_token_hashes: set[str] = set()
@@ -172,6 +177,10 @@ class VendorCallbackBridge:
         if not request_id:
             return
         self._ingress_started_ns[request_id] = time.time_ns()
+        if _env_flag("ASTRAKV_KV_CORE_EQUIVALENCE_TEST"):
+            probe = metadata.get("kv_core_decision_probe")
+            if isinstance(probe, dict) and probe:
+                self._decision_probe_by_request[request_id] = dict(probe)
         if (
             _env_flag("ASTRAKV_KV_CORE_EQUIVALENCE_TEST")
             and str(metadata.get("kv_core_equivalence_mode") or "") == "force_recompute"
@@ -279,9 +288,7 @@ class VendorCallbackBridge:
                         requested_prefix_tokens=requested,
                         deadline_ns=self._ingress_started_ns.get(
                             logical_request_id, time.time_ns(),
-                        ) + _env_int(
-                            "ASTRAKV_KV_CORE_LOAD_DEADLINE_NS", 60_000_000_000,
-                        ),
+                        ) + self._probe_deadline_offset_ns(logical_request_id),
                         priority=int(priority),
                         cancellation_token=logical_request_id,
                     ))
@@ -810,6 +817,24 @@ class VendorCallbackBridge:
         available = max(0, int(available_external_tokens))
         if not self._active_admission() or available == 0:
             return available
+        probe = self._decision_probe_by_request.get(logical_request_id)
+        if probe is not None:
+            probe = dict(probe)
+        if probe is not None and probe.get("force_recompute") is True:
+            self._append("kv_core_policy_decisions.jsonl", {
+                "request_id": logical_request_id,
+                "physical_object_id": physical.physical_object_id,
+                "binding_generation": physical.binding_generation,
+                "action": "recompute",
+                "reason": "equivalence_probe_force_recompute",
+                "requested_prefix_tokens": int(requested_tokens),
+                "exact_token_sequence_hash": token_sequence_hash,
+                "candidate_external_tokens": 0,
+                "test_only": True,
+                "decision_probe": probe,
+                "timestamp_ns": time.time_ns(),
+            })
+            return 0
         if self._consume_equivalence_force_recompute(
             logical_request_id, requested_tokens, token_sequence_hash,
         ):
@@ -849,9 +874,7 @@ class VendorCallbackBridge:
             physical_object=physical,
             max_external_tokens=cap,
             requested_prefix_tokens=requested_tokens,
-            deadline_ns=ingress_ns + _env_int(
-                "ASTRAKV_KV_CORE_LOAD_DEADLINE_NS", 60_000_000_000,
-            ),
+            deadline_ns=ingress_ns + self._probe_deadline_offset_ns(logical_request_id),
             priority=priority + (
                 profile_hint.admission_priority_boost if profile_hint is not None else 0
             ),
@@ -860,10 +883,21 @@ class VendorCallbackBridge:
         ingress = self._ingress_started_ns.get(logical_request_id)
         if ingress is not None:
             queue_delay_ms = max(0.0, (time.time_ns() - ingress) / 1_000_000.0)
-        bandwidth = self._ssd_bytes_per_ms_ema
-        if bandwidth <= 0:
-            seed_gbps = _env_float("ASTRAKV_KV_CORE_SSD_READ_GBPS", 0.0)
-            bandwidth = seed_gbps * 1_000_000.0 if seed_gbps > 0 else 0.0
+        probe_ssd_gbps = None
+        if probe is not None:
+            raw_gbps = probe.get("ssd_gbps")
+            if raw_gbps not in (None, ""):
+                try:
+                    probe_ssd_gbps = float(raw_gbps)
+                except (TypeError, ValueError):
+                    probe_ssd_gbps = None
+        if probe_ssd_gbps is not None:
+            bandwidth = probe_ssd_gbps * 1_000_000.0
+        else:
+            bandwidth = self._ssd_bytes_per_ms_ema
+            if bandwidth <= 0:
+                seed_gbps = _env_float("ASTRAKV_KV_CORE_SSD_READ_GBPS", 0.0)
+                bandwidth = seed_gbps * 1_000_000.0 if seed_gbps > 0 else 0.0
         prefill = self._prefill_ms_per_token_ema
         bootstrap_limit = max(0, _env_int("ASTRAKV_KV_CORE_BOOTSTRAP_LOADS", 1))
         if bandwidth <= 0 or prefill <= 0:
@@ -877,14 +911,40 @@ class VendorCallbackBridge:
             else 0
         )
         read_ms = candidate_bytes / bandwidth if bandwidth > 0 else 0.0
+        transfer_ms = _env_float("ASTRAKV_KV_CORE_TRANSFER_MS", 0.0)
+        materialization_ms = _env_float("ASTRAKV_KV_CORE_MATERIALIZATION_MS", 0.0)
+        contention_ms = _env_float("ASTRAKV_KV_CORE_CONTENTION_MS", 0.0)
+        if probe is not None:
+            for key in ("transfer_ms", "materialization_ms", "contention_ms"):
+                value = probe.get(key)
+                if value not in (None, ""):
+                    try:
+                        if key == "transfer_ms":
+                            transfer_ms = float(value)
+                        elif key == "materialization_ms":
+                            materialization_ms = float(value)
+                        else:
+                            contention_ms = float(value)
+                    except (TypeError, ValueError):
+                        pass
+        pressure_override = None
+        if probe is not None:
+            raw_pressure = probe.get("memory_pressure")
+            if raw_pressure not in (None, ""):
+                try:
+                    pressure_override = min(1.0, max(0.0, float(raw_pressure)))
+                except (TypeError, ValueError):
+                    pressure_override = None
+        if pressure_override is not None:
+            capability = replace(capability, memory_pressure=pressure_override)
         decision = choose_load_vs_recompute(
             intent=intent,
             capability=capability,
             queue_delay_ms=queue_delay_ms,
             tier_read_ms=read_ms,
-            transfer_ms=_env_float("ASTRAKV_KV_CORE_TRANSFER_MS", 0.0),
-            materialization_ms=_env_float("ASTRAKV_KV_CORE_MATERIALIZATION_MS", 0.0),
-            contention_ms=_env_float("ASTRAKV_KV_CORE_CONTENTION_MS", 0.0),
+            transfer_ms=transfer_ms,
+            materialization_ms=materialization_ms,
+            contention_ms=contention_ms,
             prefill_ms_per_token=prefill,
         )
         self._append("kv_core_policy_decisions.jsonl", {
@@ -907,9 +967,23 @@ class VendorCallbackBridge:
             "profile_admission_priority_boost": (
                 profile_hint.admission_priority_boost if profile_hint is not None else 0
             ),
+            "decision_probe": probe,
             "timestamp_ns": time.time_ns(),
         })
         return cap if decision.action == "admit_external_prefix" else 0
+
+    def _probe_deadline_offset_ns(self, logical_request_id: str) -> int:
+        """Test-only per-request load deadline; falls back to the env knob."""
+
+        probe = self._decision_probe_by_request.get(logical_request_id)
+        if probe is not None:
+            value = probe.get("deadline_ns")
+            if value not in (None, ""):
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    pass
+        return _env_int("ASTRAKV_KV_CORE_LOAD_DEADLINE_NS", 60_000_000_000)
 
     def _consume_equivalence_force_recompute(
         self,

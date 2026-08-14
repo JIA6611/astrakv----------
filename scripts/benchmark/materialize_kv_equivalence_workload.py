@@ -23,7 +23,12 @@ WORKLOAD_NAME = "kv_equivalence_single_prefix"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-workload", required=True)
+    parser.add_argument("--source-workload", default="", help="Existing runtime workload JSONL with exact-prefix source rows.")
+    parser.add_argument(
+        "--prompts-file",
+        default="",
+        help="Audited grouped_prompts.jsonl (workload_prompts/<dataset>/) used to synthesize an exact-prefix source row.",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--source-request-id", default="")
     parser.add_argument("--output-tokens", type=int, default=8)
@@ -34,8 +39,16 @@ def main() -> int:
     args = parse_args()
     if args.output_tokens < 1:
         raise SystemExit("--output-tokens must be positive")
-    source_path = Path(args.source_workload)
-    source = select_source(source_path, args.source_request_id)
+    source_path = Path(args.source_workload) if args.source_workload else None
+    prompts_path = Path(args.prompts_file) if args.prompts_file else None
+    if (source_path is None) == (prompts_path is None):
+        raise SystemExit("exactly one of --source-workload or --prompts-file is required")
+    if prompts_path is not None:
+        source = select_prompt_source(prompts_path, args.source_request_id)
+        source_path = prompts_path
+    else:
+        assert source_path is not None
+        source = select_source(source_path, args.source_request_id)
     rows = materialize(source, output_tokens=args.output_tokens)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -76,6 +89,71 @@ def select_source(path: Path, requested_id: str) -> RuntimeWorkloadRow:
     if not candidates:
         raise ValueError("no eligible exact-prefix source row with messages and cache identity")
     return min(candidates, key=lambda row: row.arrival_index)
+
+
+def select_prompt_source(path: Path, requested_id: str) -> RuntimeWorkloadRow:
+    """Synthesize an exact-prefix source row from an audited grouped prompt.
+
+    The equivalence probe needs the exact token sequence and a real chat
+    message so the benchmark can compute deterministic token ids.  Grouped
+    prompts carry the full context plus question, so we wrap the prompt as a
+    single user message and derive cache identity from the prompt digest.
+    """
+
+    candidates: list[tuple[dict[str, Any], str, int, int]] = []
+    for line_number, line in enumerate(path.open("r", encoding="utf-8"), start=1):
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"Invalid JSONL at {path}:{line_number}: {exc}") from exc
+        if not isinstance(item, dict):
+            continue
+        prompt = item.get("prompt")
+        if not isinstance(prompt, str) or not prompt:
+            continue
+        if item.get("shared_context") is not True:
+            continue
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        estimated = int(metadata.get("estimated_prompt_tokens") or 0)
+        if estimated <= 0:
+            estimated = max(1, len(prompt) // 4)
+        candidates.append((item, prompt, estimated, line_number))
+    if requested_id:
+        candidates = [
+            candidate for candidate in candidates
+            if str(candidate[0].get("request_id") or "") == requested_id
+            or str(candidate[0].get("sample_id") or "") == requested_id
+        ]
+    if not candidates:
+        raise ValueError("no eligible grouped prompt source with shared_context and prompt text")
+    item, prompt, estimated, _ = min(candidates, key=lambda candidate: (
+        int(candidate[0].get("order") or 0), candidate[3],
+    ))
+    digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    metadata = dict(item.get("metadata") if isinstance(item.get("metadata"), dict) else {})
+    metadata.update({
+        "exact_prefix": True,
+        "messages": [{"role": "user", "content": prompt}],
+    })
+    return RuntimeWorkloadRow(
+        request_id=str(item.get("request_id") or f"equivalence-source-{digest[:12]}"),
+        prompt=prompt,
+        prefix_id=str(item.get("reuse_group") or f"prompt:{digest[:16]}"),
+        prefix_hash=f"sha256:{digest}",
+        cache_key=f"sha256:{digest}",
+        arrival_index=0,
+        reuse_ratio=1.0,
+        reuse_bucket="high",
+        context_length=estimated,
+        expected_output_tokens=128,
+        batch_size=1,
+        sleep_before_s=0.0,
+        prefetch_lead_s=0.0,
+        case="kv_equivalence_source",
+        metadata=metadata,
+    )
 
 
 def materialize(source: RuntimeWorkloadRow, *, output_tokens: int) -> list[RuntimeWorkloadRow]:

@@ -614,6 +614,14 @@ def run_one_request(
                         or request_metadata.get("kv_core_equivalence_mode")
                         or ""
                     ),
+                    # Test-only per-request decision overrides for the
+                    # load-vs-recompute probe suite. The runtime ignores it
+                    # unless the dedicated test environment flag is enabled.
+                    "kv_core_decision_probe": (
+                        task_metadata.get("kv_core_decision_probe")
+                        or request_metadata.get("kv_core_decision_probe")
+                        or {}
+                    ),
                     "workload_case": str(request_metadata.get("case") or ""),
                     "cache_state": str(request_metadata.get("cache_state") or ""),
                     "object_key": str(

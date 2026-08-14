@@ -74,8 +74,8 @@ IFS=',' read -r -a SELECTED_PHASES <<< "$PHASES"
 [[ "${#SELECTED_PHASES[@]}" -gt 0 ]] || { echo "--phases must not be empty" >&2; exit 2; }
 ACTIVE_PHASE_SELECTED=false
 for phase in "${SELECTED_PHASES[@]}"; do
-  [[ "$phase" =~ ^E([1-5]|3C|5C)$ ]] || { echo "invalid phase: $phase" >&2; exit 2; }
-  [[ "$phase" == E1 ]] || ACTIVE_PHASE_SELECTED=true
+  [[ "$phase" =~ ^(E0|E1|E2|E2R|E3|E3C|E4|E5|E5C)$ ]] || { echo "invalid phase: $phase" >&2; exit 2; }
+  [[ "$phase" == E1 || "$phase" == E0 ]] || ACTIVE_PHASE_SELECTED=true
 done
 if [[ "$ACTIVE_PHASE_SELECTED" == true ]]; then
   [[ -f "$PATCH_MANIFEST" && -f "$CALLBACK_SMOKE" ]] || { echo "verified deployment inputs are required for E2-E4 and E3C" >&2; exit 2; }
@@ -156,6 +156,11 @@ run_one() {
     E0) mode="off" ;;
     E1) mode="shadow" ;;
     E2) mode="active"; admission="true" ;;
+    # E2R: active admission with every revisit forced to scheduler-declined
+    # native recompute (test-only per-request override). Seed rows still write
+    # the LMCache object; the arm is the clean "recompute-only" baseline for
+    # the load-vs-recompute regime matrix.
+    E2R) mode="active"; admission="true" ;;
     E3) mode="active"; admission="true"; prefetch="true"; topology="gpu_cpu_ssd"; backend="cpu" ;;
     # A/A control for CPU-tier correctness. Both members use active native
     # admission and demand load/recompute, but no SSD->CPU prefetch is allowed.
@@ -197,6 +202,7 @@ run_one() {
   ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD="$([[ "$topology" == gpu_cpu_ssd ]] && echo true || echo false)" \
   ASTRAKV_KV_CORE_PATCH_VERIFICATION="$OUTPUT_DIR/connector_patch_verification.json" \
   ASTRAKV_KV_CORE_ADMISSION_ENABLED="$admission" ASTRAKV_KV_CORE_CPU_PREFETCH_ENABLED="$prefetch" \
+  ASTRAKV_KV_CORE_EQUIVALENCE_TEST="$([[ "$phase" == E2R ]] && echo true || echo false)" \
   ASTRAKV_KV_CORE_PARTIAL_PREFIX_UPPER_BOUND_ENABLED="$partial" \
   ASTRAKV_KV_CORE_COLD_REAP_ENABLED="$reap" \
   ASTRAKV_KV_CORE_EXTERNAL_TOKEN_CAP="8192" ASTRAKV_KV_CORE_PARTIAL_PREFIX_TOKENS="2048" \
@@ -250,7 +256,7 @@ run_one() {
   for artifact in callback-smoke.json kv_core_native_callbacks.jsonl kv_core_native_receipts.jsonl kv_core_request_accounting.jsonl request_context_associations.jsonl kv_core_prefetch_tickets.jsonl kv_core_policy_decisions.jsonl kv_core_cost_observations.jsonl uma_resource_samples.jsonl kv_core_external_reaps.jsonl kv_core_run_metadata.json; do
     if [[ -f "$state_dir/$artifact" ]]; then
       cp "$state_dir/$artifact" "$run_dir/$artifact"
-    elif [[ "$phase" =~ ^E([2-5]|3C|5C)$ && "$artifact" == kv_core_request_accounting.jsonl ]]; then
+    elif [[ "$phase" =~ ^(E[2-5]R?|E3C|E5C)$ && "$artifact" == kv_core_request_accounting.jsonl ]]; then
       echo "Missing required active-phase accounting artifact: $state_dir/$artifact" >&2
       return 1
     fi
@@ -308,6 +314,11 @@ EOF
   # TTFT includes queueing and I/O and would violate the paired control.
   ASTRAKV_CONTROL_TOPOLOGY="$control_topology" \
     LMCACHE_CONFIG_FILE="$variant_cache_config" run_one "$label" "$variant_phase" variant "$workload" "$cache_state" "$label"
+  if [[ "$variant_phase" == E0 ]]; then
+    # E0 is a raw off-mode baseline cell for the regime matrix (TTFT/UMA
+    # reference only); it carries no phase-level eligibility claim.
+    return 0
+  fi
   if ! "$PYTHON" scripts/reporting/validate_kv_core_acceptance.py \
       --baseline "$OUTPUT_DIR/$label/$workload/$cache_state/baseline" \
       --variant "$OUTPUT_DIR/$label/$workload/$cache_state/variant" \
@@ -320,8 +331,10 @@ for workload in "${SELECTED_WORKLOADS[@]}"; do
   for cache_state in "${SELECTED_CACHE_STATES[@]}"; do
     for phase in "${SELECTED_PHASES[@]}"; do
       case "$phase" in
+        E0) run_pair E0 E0 E0 "$workload" "$cache_state" ;;
         E1) run_pair E1 E0 E1 "$workload" "$cache_state" ;;
         E2) run_pair E2 E0 E2 "$workload" "$cache_state" ;;
+        E2R) run_pair E2R E0 E2R "$workload" "$cache_state" ;;
         # Keep the CPU tier, request-scoped native admission, and the
         # symmetric disk-backed CPU invalidation fixed. E3 then isolates only
         # the SSD->CPU prefetch switch instead of conflating it with E2's

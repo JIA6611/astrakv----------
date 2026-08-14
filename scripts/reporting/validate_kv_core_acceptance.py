@@ -27,7 +27,7 @@ from astrakv.runtime.kv_core_connector import native_key_prefix_ok
 
 
 SCHEMA = "astrakv-kv-core-acceptance-v2"
-PHASES = {"E1", "E2", "E3", "E3C", "E4", "E5", "E5C"}
+PHASES = {"E1", "E2", "E2R", "E3", "E3C", "E4", "E5", "E5C"}
 PREFETCH_BENEFIT_WORKLOADS = {"repeated_long_prefix", "queued_concurrency"}
 PARTIAL_LOAD_WORKLOADS = {"repeated_long_prefix", "constrained_kv_churn"}
 
@@ -741,11 +741,12 @@ def main() -> int:
         "prefetch_benefit_eligible": prefetch_benefit_eligible and args.phase != "E3C",
         "partial_load_benefit_eligible": partial_benefit_eligible and args.phase != "E3C",
         "external_reap_evidence": reap_evidence,
-        "control_mode": (
-            "cpu_tier_aa_no_prefetch"
-            if args.phase == "E3C"
-            else ("cold_reap_aa" if args.phase == "E5C" else ("cold_reap_active" if args.phase == "E5" else ""))
-        ),
+        "control_mode": {
+            "E2R": "recompute_only_force",
+            "E3C": "cpu_tier_aa_no_prefetch",
+            "E5C": "cold_reap_aa",
+            "E5": "cold_reap_active",
+        }.get(args.phase, ""),
         "request_accounting_count": len(accounting),
         "uma_measurement": {
             "baseline": baseline_uma_status,

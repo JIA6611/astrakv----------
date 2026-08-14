@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from astrakv.benchmarks.runtime_workload import RuntimeWorkloadRow
 from astrakv.runtime.vendor_callback_bridge import VendorCallbackBridge, _exact_token_sequence_hash
-from scripts.benchmark.materialize_kv_equivalence_workload import materialize
+from scripts.benchmark.materialize_kv_equivalence_workload import materialize, select_prompt_source
 
 
 def source() -> RuntimeWorkloadRow:
@@ -21,6 +21,33 @@ def source() -> RuntimeWorkloadRow:
 
 
 class KVEquivalenceTests(unittest.TestCase):
+    def test_prompt_source_synthesizes_exact_prefix_row(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            prompts_path = Path(raw_tmp) / "grouped_prompts.jsonl"
+            prompts_path.write_text(json.dumps({
+                "schema": "astra-workload-prompt-v1",
+                "request_id": "qasper-grouped-000000",
+                "sample_id": "sample-1",
+                "workload_type": "grouped",
+                "order": 0,
+                "reuse_group": "group-1",
+                "shared_context": True,
+                "prompt": "shared context question",
+                "metadata": {"estimated_prompt_tokens": 1024},
+            }) + "\n", encoding="utf-8")
+            source = select_prompt_source(prompts_path, "")
+            self.assertTrue(source.metadata["exact_prefix"])
+            self.assertEqual(
+                source.metadata["messages"],
+                [{"role": "user", "content": "shared context question"}],
+            )
+            self.assertEqual(source.cache_key, source.prefix_hash)
+            self.assertTrue(source.cache_key.startswith("sha256:"))
+            self.assertGreater(source.context_length, 0)
+            rows = materialize(source, output_tokens=8)
+            self.assertEqual(rows[-1].metadata["kv_core_equivalence_mode"], "force_recompute")
+            self.assertEqual(rows[0].metadata["exact_prefix"], True)
+
     def test_workload_preserves_exact_input_and_only_recompute_has_test_mode(self):
         rows = materialize(source(), output_tokens=8)
         self.assertEqual([row.case for row in rows], [

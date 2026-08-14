@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Load-vs-recompute regime matrix (P3c).
+#
+# Phase 1 runs the two decisive workloads across their arms:
+#   repeated_long_prefix   x {E3 full-load, E4 partial, E2R recompute-only}
+#   constrained_kv_churn   x {E0 off, E3 full-load, E4 partial, E2R recompute-only}
+# Every arm reuses the identical canonical workload file (same request ids),
+# so cells pair by sample_id.  The recompute-only arm (E2R) is a per-request
+# forced scheduler-decline; E0 is the off-mode TTFT/UMA reference.
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT"
+PYTHON="${ASTRAKV_PYTHON:-python3}"
+MODEL="${ASTRAKV_MODEL:-/opt/models/Qwen3-8B}"
+WORKLOAD_DIR=""
+OUTPUT_DIR="$ROOT/results/load-recompute-regime-$(date -u +%Y%m%dT%H%M%SZ)"
+PATCH_MANIFEST=""
+CALLBACK_SMOKE=""
+PHASE="1"
+HOST="127.0.0.1"
+PORT="18200"
+CONTEXT_PORT="18190"
+TIMEOUT="900"
+GPU_MEMORY_UTILIZATION="0.72"
+
+usage() {
+  cat <<'EOF'
+Usage: bash scripts/entrypoints/run_load_recompute_regime_suite.sh \
+  --workload-dir DIR --patch-manifest FILE --callback-smoke FILE [options]
+
+DIR must contain the canonical repeated_long_prefix.jsonl and
+constrained_kv_churn.jsonl (phase 1) or queued_concurrency.jsonl and
+random_no_reuse.jsonl (phase 2).
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --workload-dir) WORKLOAD_DIR="$2"; shift 2 ;;
+    --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+    --patch-manifest) PATCH_MANIFEST="$2"; shift 2 ;;
+    --callback-smoke) CALLBACK_SMOKE="$2"; shift 2 ;;
+    --model) MODEL="$2"; shift 2 ;;
+    --phase) PHASE="$2"; shift 2 ;;
+    --host) HOST="$2"; shift 2 ;;
+    --port) PORT="$2"; shift 2 ;;
+    --context-port) CONTEXT_PORT="$2"; shift 2 ;;
+    --timeout) TIMEOUT="$2"; shift 2 ;;
+    --gpu-memory-utilization) GPU_MEMORY_UTILIZATION="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+[[ -n "$WORKLOAD_DIR" && -d "$WORKLOAD_DIR" ]] || { echo "--workload-dir is required" >&2; exit 2; }
+[[ -f "$PATCH_MANIFEST" && -f "$CALLBACK_SMOKE" ]] || { echo "--patch-manifest and --callback-smoke are required" >&2; exit 2; }
+[[ "$PHASE" == "1" || "$PHASE" == "2" ]] || { echo "--phase must be 1 or 2" >&2; exit 2; }
+[[ "$HOST" == "127.0.0.1" || "$HOST" == "localhost" ]] || { echo "only loopback host is supported" >&2; exit 2; }
+
+if [[ "$PHASE" == "1" ]]; then
+  WORKLOADS="repeated_long_prefix constrained_kv_churn"
+else
+  WORKLOADS="queued_concurrency random_no_reuse"
+fi
+for workload in $WORKLOADS; do
+  [[ -f "$WORKLOAD_DIR/$workload.jsonl" ]] || { echo "Missing $WORKLOAD_DIR/$workload.jsonl" >&2; exit 2; }
+done
+
+mkdir -p "$OUTPUT_DIR"
+CELLS_FILE="$OUTPUT_DIR/regime_cells.jsonl"
+: > "$CELLS_FILE"
+
+run_cell() {
+  local workload="$1" phase="$2" arm="$3"
+  local cell_dir="$OUTPUT_DIR/cells/$workload/$arm"
+  local cell_workload_dir="$cell_dir/workload"
+  local cell_run_dir="$cell_dir/run"
+  local label="$workload-$arm"
+  mkdir -p "$cell_workload_dir"
+  cp "$WORKLOAD_DIR/$workload.jsonl" "$cell_workload_dir/$workload.jsonl"
+  if [[ "$phase" == E2R ]]; then
+    "$PYTHON" scripts/benchmark/materialize_recompute_only_workload.py \
+      --source-workload "$cell_workload_dir/$workload.jsonl" \
+      --output-dir "$cell_workload_dir" > "$cell_dir/materialization.json"
+  fi
+  bash scripts/entrypoints/run_kv_core_controlled_suite.sh \
+    --workload-dir "$cell_workload_dir" --workloads "$workload" --phases "$phase" \
+    --output-dir "$cell_run_dir" --patch-manifest "$PATCH_MANIFEST" \
+    --callback-smoke "$CALLBACK_SMOKE" --model "$MODEL" --host "$HOST" \
+    --port "$PORT" --context-port "$CONTEXT_PORT" --timeout "$TIMEOUT" \
+    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
+  local baseline_dir="$cell_run_dir/$phase/$workload/cold/baseline"
+  local variant_dir="$cell_run_dir/$phase/$workload/cold/variant"
+  [[ -d "$baseline_dir" && -d "$variant_dir" ]] || { echo "missing cell runs: $label" >&2; return 1; }
+  echo "{\"workload\": \"$workload\", \"arm\": \"$arm\", \"phase\": \"$phase\", \"baseline_dir\": \"$baseline_dir\", \"variant_dir\": \"$variant_dir\"}" >> "$CELLS_FILE"
+}
+
+if [[ "$PHASE" == "1" ]]; then
+  run_cell repeated_long_prefix E3 full
+  run_cell repeated_long_prefix E4 partial
+  run_cell repeated_long_prefix E2R recompute_only
+  run_cell constrained_kv_churn E0 off
+  run_cell constrained_kv_churn E3 full
+  run_cell constrained_kv_churn E4 partial
+  run_cell constrained_kv_churn E2R recompute_only
+else
+  run_cell queued_concurrency E3 full
+  run_cell queued_concurrency E4 partial
+  run_cell queued_concurrency E2R recompute_only
+  run_cell random_no_reuse E0 off
+  run_cell random_no_reuse E3 full
+  run_cell random_no_reuse E4 partial
+  run_cell random_no_reuse E2R recompute_only
+fi
+
+"$PYTHON" scripts/reporting/build_load_recompute_regime_report.py \
+  --cells "$CELLS_FILE" --output "$OUTPUT_DIR/load_recompute_regime_report.md"
+echo "Load-vs-recompute regime suite completed: $OUTPUT_DIR"

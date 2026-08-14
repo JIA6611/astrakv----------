@@ -19,6 +19,8 @@ OUTPUT_DIR="$ROOT/results/load-recompute-regime-$(date -u +%Y%m%dT%H%M%SZ)"
 PATCH_MANIFEST=""
 CALLBACK_SMOKE=""
 PHASE="1"
+SMOKE=false
+WORKLOADS_FILTER=""
 HOST="127.0.0.1"
 PORT="18200"
 CONTEXT_PORT="18190"
@@ -44,6 +46,8 @@ while [[ $# -gt 0 ]]; do
     --callback-smoke) CALLBACK_SMOKE="$2"; shift 2 ;;
     --model) MODEL="$2"; shift 2 ;;
     --phase) PHASE="$2"; shift 2 ;;
+    --smoke) SMOKE=true; shift ;;
+    --workloads) WORKLOADS_FILTER="$2"; shift 2 ;;
     --host) HOST="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     --context-port) CONTEXT_PORT="$2"; shift 2 ;;
@@ -60,15 +64,35 @@ done
 [[ "$HOST" == "127.0.0.1" || "$HOST" == "localhost" ]] || { echo "only loopback host is supported" >&2; exit 2; }
 
 if [[ "$PHASE" == "1" ]]; then
-  WORKLOADS="repeated_long_prefix constrained_kv_churn"
+  PHASE_WORKLOADS="repeated_long_prefix constrained_kv_churn"
 else
-  WORKLOADS="queued_concurrency random_no_reuse"
+  PHASE_WORKLOADS="queued_concurrency random_no_reuse"
+fi
+if [[ -n "$WORKLOADS_FILTER" ]]; then
+  WORKLOADS=""
+  IFS=',' read -r -a FILTERED <<< "$WORKLOADS_FILTER"
+  for workload in "${FILTERED[@]}"; do
+    case " $PHASE_WORKLOADS " in
+      *" $workload "*) WORKLOADS="$WORKLOADS $workload" ;;
+      *) echo "workload $workload is not in phase $PHASE" >&2; exit 2 ;;
+    esac
+  done
+  WORKLOADS="${WORKLOADS# }"
+else
+  WORKLOADS="$PHASE_WORKLOADS"
 fi
 for workload in $WORKLOADS; do
   [[ -f "$WORKLOAD_DIR/$workload.jsonl" ]] || { echo "Missing $WORKLOAD_DIR/$workload.jsonl" >&2; exit 2; }
 done
 
 mkdir -p "$OUTPUT_DIR"
+if [[ "$SMOKE" == true ]]; then
+  SMOKE_WORKLOAD_DIR="$OUTPUT_DIR/smoke-workloads"
+  "$PYTHON" scripts/benchmark/materialize_smoke_regime_workloads.py \
+    --output-dir "$SMOKE_WORKLOAD_DIR" > "$OUTPUT_DIR/smoke_materialization.json"
+  WORKLOAD_DIR="$SMOKE_WORKLOAD_DIR"
+  echo "smoke mode: small workloads materialized under $SMOKE_WORKLOAD_DIR"
+fi
 CELLS_FILE="$OUTPUT_DIR/regime_cells.jsonl"
 : > "$CELLS_FILE"
 
@@ -85,34 +109,52 @@ run_cell() {
       --source-workload "$cell_workload_dir/$workload.jsonl" \
       --output-dir "$cell_workload_dir" > "$cell_dir/materialization.json"
   fi
+  local extra_args=""
+  [[ "$SMOKE" == true ]] && extra_args="--allow-ineligible"
   bash scripts/entrypoints/run_kv_core_controlled_suite.sh \
     --workload-dir "$cell_workload_dir" --workloads "$workload" --phases "$phase" \
     --output-dir "$cell_run_dir" --patch-manifest "$PATCH_MANIFEST" \
     --callback-smoke "$CALLBACK_SMOKE" --model "$MODEL" --host "$HOST" \
     --port "$PORT" --context-port "$CONTEXT_PORT" --timeout "$TIMEOUT" \
-    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
+    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" $extra_args
   local baseline_dir="$cell_run_dir/$phase/$workload/cold/baseline"
   local variant_dir="$cell_run_dir/$phase/$workload/cold/variant"
   [[ -d "$baseline_dir" && -d "$variant_dir" ]] || { echo "missing cell runs: $label" >&2; return 1; }
-  echo "{\"workload\": \"$workload\", \"arm\": \"$arm\", \"phase\": \"$phase\", \"baseline_dir\": \"$baseline_dir\", \"variant_dir\": \"$variant_dir\"}" >> "$CELLS_FILE"
+  echo "{\"workload\": \"$workload\", \"arm\": \"$arm\", \"phase\": \"$phase\", \"baseline_dir\": \"$baseline_dir\", \"variant_dir\": \"$variant_dir\", \"smoke\": $SMOKE}" >> "$CELLS_FILE"
 }
 
 if [[ "$PHASE" == "1" ]]; then
-  run_cell repeated_long_prefix E3 full
-  run_cell repeated_long_prefix E4 partial
-  run_cell repeated_long_prefix E2R recompute_only
-  run_cell constrained_kv_churn E0 off
-  run_cell constrained_kv_churn E3 full
-  run_cell constrained_kv_churn E4 partial
-  run_cell constrained_kv_churn E2R recompute_only
+  for workload in $WORKLOADS; do
+    case "$workload" in
+      repeated_long_prefix)
+        run_cell repeated_long_prefix E3 full
+        run_cell repeated_long_prefix E4 partial
+        run_cell repeated_long_prefix E2R recompute_only
+        ;;
+      constrained_kv_churn)
+        run_cell constrained_kv_churn E0 off
+        run_cell constrained_kv_churn E3 full
+        run_cell constrained_kv_churn E4 partial
+        run_cell constrained_kv_churn E2R recompute_only
+        ;;
+    esac
+  done
 else
-  run_cell queued_concurrency E3 full
-  run_cell queued_concurrency E4 partial
-  run_cell queued_concurrency E2R recompute_only
-  run_cell random_no_reuse E0 off
-  run_cell random_no_reuse E3 full
-  run_cell random_no_reuse E4 partial
-  run_cell random_no_reuse E2R recompute_only
+  for workload in $WORKLOADS; do
+    case "$workload" in
+      queued_concurrency)
+        run_cell queued_concurrency E3 full
+        run_cell queued_concurrency E4 partial
+        run_cell queued_concurrency E2R recompute_only
+        ;;
+      random_no_reuse)
+        run_cell random_no_reuse E0 off
+        run_cell random_no_reuse E3 full
+        run_cell random_no_reuse E4 partial
+        run_cell random_no_reuse E2R recompute_only
+        ;;
+    esac
+  done
 fi
 
 "$PYTHON" scripts/reporting/build_load_recompute_regime_report.py \

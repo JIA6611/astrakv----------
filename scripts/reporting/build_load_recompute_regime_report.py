@@ -97,8 +97,8 @@ def build(cells: list[dict[str, Any]]) -> dict[str, Any]:
         "",
         "## Per-Cell Metrics",
         "",
-        "| workload | arm | TTFT p95 (ms) | TTFT delta vs recompute (95% CI) | UMA peak (GB) | KV block budget | loaded tokens |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+        "| workload | arm | eligible | TTFT p95 (ms) | TTFT delta vs recompute (95% CI) | UMA peak (GB) | KV block budget | loaded tokens |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     comparisons: dict[str, dict[str, Any]] = {}
     for workload, workload_cells in sorted(by_workload.items()):
@@ -128,8 +128,13 @@ def build(cells: list[dict[str, Any]]) -> dict[str, Any]:
                 f"{s['uma_peak_bytes'] / 1024**3:.2f}"
                 if s.get("uma_peak_bytes") is not None else "-"
             )
+            eligible = "-"
+            if s.get("acceptance_eligible") is True:
+                eligible = "✓"
+            elif s.get("acceptance_eligible") is False:
+                eligible = "✗"
             lines.append(
-                f"| {workload} | {cell.get('arm')} | {_fmt(s.get('ttft_p95_ms'))} | {delta_text} | "
+                f"| {workload} | {cell.get('arm')} | {eligible} | {_fmt(s.get('ttft_p95_ms'))} | {delta_text} | "
                 f"{uma_gb} | {_fmt(s.get('kv_block_budget'))} | {s.get('loaded_tokens')} |"
             )
     record["comparisons"] = comparisons
@@ -160,6 +165,9 @@ def _cell_stats(variant_dir: Path) -> dict[str, Any]:
         max(0, int(row.get("actual_loaded_tokens") or 0))
         for row in accounting if row.get("terminal") is True
     )
+    acceptance = _load_json(variant_dir / "acceptance.json")
+    if acceptance is None:
+        acceptance = _load_json(variant_dir.parent / "acceptance.json")
     return {
         "request_count": len(requests),
         "ok_count": len(ok),
@@ -167,6 +175,8 @@ def _cell_stats(variant_dir: Path) -> dict[str, Any]:
         "uma_peak_bytes": uma.get("cgroup_memory_current_bytes"),
         "kv_block_budget": kv_block_budget(variant_dir),
         "loaded_tokens": loaded_tokens,
+        "acceptance_eligible": None if acceptance is None else acceptance.get("eligible"),
+        "acceptance_errors": [] if acceptance is None else list(acceptance.get("errors") or [])[:5],
     }
 
 
@@ -237,6 +247,16 @@ def _fmt(value: Any) -> str:
     if isinstance(value, float):
         return f"{value:.2f}"
     return str(value)
+
+
+def _load_json(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 if __name__ == "__main__":

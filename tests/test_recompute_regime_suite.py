@@ -59,7 +59,11 @@ class RecomputeOnlyVariantTests(unittest.TestCase):
                 self.assertEqual(row["metadata"]["kv_core_decision_probe"], {"force_recompute": True})
 
 
-def _write_run_dir(root: Path, arm: str, *, ttfts: list[float], uma_gb: float, loaded_tokens: int, blocks: int = 100) -> None:
+def _write_run_dir(
+    root: Path, arm: str, *,
+    ttfts: list[float], uma_gb: float, loaded_tokens: int, blocks: int = 100,
+    eligible: bool | None = True,
+) -> None:
     run = root
     run.mkdir(parents=True, exist_ok=True)
     requests = [
@@ -94,6 +98,12 @@ def _write_run_dir(root: Path, arm: str, *, ttfts: list[float], uma_gb: float, l
             "actual_loaded_tokens": loaded_tokens,
         }) + "\n", encoding="utf-8",
     )
+    (run / "acceptance.json").write_text(
+        json.dumps({
+            "eligible": eligible,
+            "errors": [] if eligible is not False else ["smoke_gate_not_met"],
+        }) + "\n", encoding="utf-8",
+    )
 
 
 class RegimeReportTests(unittest.TestCase):
@@ -124,6 +134,14 @@ class RegimeReportTests(unittest.TestCase):
             self.assertTrue(verdicts["repeated_long_prefix"]["label"].startswith("load wins TTFT"))
             self.assertTrue(verdicts["constrained_kv_churn"]["label"].startswith("recompute-only wins memory"))
             self.assertIn("## Verdicts", summary["markdown"])
+            stats_by_arm = {
+                cell["arm"]: cell["stats"]
+                for cell in summary["record"]["cells"]
+                if cell["workload"] == "repeated_long_prefix"
+            }
+            self.assertTrue(stats_by_arm["full"]["acceptance_eligible"])
+            self.assertEqual(stats_by_arm["full"]["acceptance_errors"], [])
+            self.assertIn("| repeated_long_prefix | full | ✓ |", summary["markdown"])
 
 
 if __name__ == "__main__":

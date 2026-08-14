@@ -234,6 +234,43 @@ class LMCache047RuntimePatchTests(unittest.TestCase):
         self.assertTrue(all(record["schema"] == "astrakv-backend-hook-v2" for record in binding_records + event_records))
         self.assertEqual(binding_records[0]["event_id"], event_records[0]["event_id"])
 
+    def test_store_observes_physical_size_bytes_for_execution_gate(self):
+        records = []
+        registry = BackendBindingRegistry(run_id="run", engine_instance_id="engine", worker_id="worker")
+        context = RequestContext("run", "request", "prefix", ObjectLevel.PREFIX)
+
+        class FakeMemory:
+            def get_physical_size(self):
+                return 37748736
+
+        class Storage:
+            def batched_put(self, keys, objects, **kwargs): return None
+            def get(self, key, location=None): return None
+            def batched_get(self, keys, location=None): return [None for _ in keys]
+            def remove(self, key, locations=None): return 0
+        storage = Storage()
+        engine = type("Engine", (), {"storage_manager": storage})()
+
+        class Factory:
+            def get_or_create_lmcache_engine(self): return engine
+
+        install_lmcache047_hooks(
+            records.append,
+            factory_cls=Factory,
+            versions={"vllm": "0.23.0", "lmcache": "0.4.7"},
+            binding_registry=registry,
+            request_context_provider=lambda: context,
+        )
+        Factory().get_or_create_lmcache_engine()
+        storage.batched_put(["key-a"], [FakeMemory()])
+
+        binding_records = [record for record in records if record.get("record_type") == "binding"]
+        self.assertTrue(binding_records)
+        metadata = dict(binding_records[0].get("metadata") or {})
+        self.assertEqual(int(metadata.get("size_bytes") or 0), 37748736)
+        snapshot = registry.snapshot(binding_records[0]["binding_id"])
+        self.assertEqual(int(snapshot.get("size_bytes") or 0), 37748736)
+
     def test_registry_context_emits_block_statistics_when_storage_key_carries_hints(self):
         records = []
         registry = BackendBindingRegistry(run_id="run", engine_instance_id="engine", worker_id="worker")

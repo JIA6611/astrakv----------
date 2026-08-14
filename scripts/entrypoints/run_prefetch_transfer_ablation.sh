@@ -159,7 +159,7 @@ bash scripts/entrypoints/run_grouped_exact_next_prefetch_ablation.sh \
   --grouped-root "$TEST_ROOT" --model "$MODEL" --limit "$LIMIT" \
   --datasets "$TEST_DATASET" \
   $([ "$INTERLEAVE" == "true" ] && echo --interleave) \
-  --prefetch-lead-s "${ASTRAKV_ABLATION_PREFETCH_LEAD_S:-0.25}" \
+  --prefetch-lead-s "${ASTRAKV_ABLATION_PREFETCH_LEAD_S:-1.5}" \
   --output-dir "$OUTPUT_ROOT/test-a-off" "${SIDECAR_ARGS[@]}"
 
 echo "=== [2x2] Run 2/2: A on (cells: A1B0, A1B1) ==="
@@ -170,7 +170,7 @@ ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD=true \
   --grouped-root "$TEST_ROOT" --model "$MODEL" --limit "$LIMIT" \
   --datasets "$TEST_DATASET" \
   $([ "$INTERLEAVE" == "true" ] && echo --interleave) \
-  --prefetch-lead-s "${ASTRAKV_ABLATION_PREFETCH_LEAD_S:-0.25}" \
+  --prefetch-lead-s "${ASTRAKV_ABLATION_PREFETCH_LEAD_S:-1.5}" \
   --roles baseline \
   --output-dir "$OUTPUT_ROOT/test-a-on" "${SIDECAR_ARGS[@]}"
 

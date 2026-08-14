@@ -2434,7 +2434,14 @@ def _patch_storage_manager(
     original_batched_get = getattr(manager, "batched_get", None)
     pending_store_callbacks: dict[str, list[tuple[Any, RequestContext, str]]] = {}
 
-    def emit(key: Any, action: HookAction, status: str, **metadata: Any) -> Any:
+    def emit(
+        key: Any,
+        action: HookAction,
+        status: str,
+        *,
+        bytes: int | None = None,
+        **metadata: Any,
+    ) -> Any:
         if binding_registry is None:
             legacy_action = "cache_store_submitted" if action == HookAction.CACHE_STORE and status == "submitted" else action.value
             event_sink({"backend_object_id": endpoint.remember(key, manager), "action": legacy_action, "status": status, **metadata})
@@ -2442,7 +2449,9 @@ def _patch_storage_manager(
         context = request_context_provider() if request_context_provider is not None else None
         if context is not None and action in {HookAction.CACHE_HIT, HookAction.CACHE_MISS, HookAction.CACHE_LOAD}:
             metadata.setdefault("allow_reserved_io", True)
-        observation = binding_registry.observe(key, action, status, context, metadata=metadata)
+        observation = binding_registry.observe(
+            key, action, status, context, bytes=bytes, metadata=metadata,
+        )
         if binding_observer is not None:
             binding_observer(key, observation, context, action_manager)
         if observation.binding is not None:
@@ -2538,12 +2547,13 @@ def _patch_storage_manager(
                 for key in keys:
                     emit(key, HookAction.CACHE_STORE, "deferred")
                 return None
-        for key in keys:
+        for key, memory_obj in zip(keys, memory_objs):
             endpoint.remember(key, self)
             observation = emit(
                 key,
                 HookAction.CACHE_STORE,
                 "submitted",
+                bytes=_memory_obj_size_bytes(memory_obj),
                 **_event_metadata_from_storage_key(key, action="store"),
             )
             if (
@@ -2603,12 +2613,13 @@ def _patch_storage_manager(
                 for key in keys:
                     emit(key, HookAction.CACHE_STORE, "deferred")
                 return None
-        for key in keys:
+        for key, memory_obj in zip(keys, memory_objs):
             endpoint.remember(key, self)
             observation = emit(
                 key,
                 HookAction.CACHE_STORE,
                 "submitted",
+                bytes=_memory_obj_size_bytes(memory_obj),
                 **_event_metadata_from_storage_key(key, action="store"),
             )
             if (

@@ -44,7 +44,10 @@ export ASTRAKV_KV_CORE_PATCH_VERIFICATION="$PATCH_VERIFICATION"
 export ASTRAKV_LOCAL_CPU_SIZE_GB="$CPU_GB"
 export ASTRAKV_KV_CORE_CPU_PREFETCH_BUDGET_FRACTION="${ASTRAKV_KV_CORE_CPU_PREFETCH_BUDGET_FRACTION:-1.0}"
 export ASTRAKV_ONLINE_PREFETCH_MODE="${ASTRAKV_ONLINE_PREFETCH_MODE:-hybrid}"
-export ASTRAKV_ABLATION_PREFETCH_LEAD_S="${ASTRAKV_ABLATION_PREFETCH_LEAD_S:-0.25}"
+# The async SSD->CPU copy of one ~0.6 GiB object takes a few hundred ms; a
+# 1.5 s lead lets the promotion land before the request's own lookup so the
+# ticket is actually consumed (0.25 s lost the race in the previous smoke).
+export ASTRAKV_ABLATION_PREFETCH_LEAD_S="${ASTRAKV_ABLATION_PREFETCH_LEAD_S:-1.5}"
 
 echo "== integration smoke: limit=$LIMIT cpu_gb=$CPU_GB model=$MODEL"
 echo "== output: $OUTPUT_DIR"

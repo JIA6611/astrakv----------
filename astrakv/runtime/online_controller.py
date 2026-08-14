@@ -157,6 +157,12 @@ class OnlinePolicyController:
         load_latency_ms = _profile_load_latency_ms(profile, object_state)
         pressure_snapshot = self._pressure_snapshot()
         pressure_over = bool(pressure_snapshot["over_pressure"]) if self.config.evict_pressure_gate_enabled else True
+        cpu_pressure_over = True
+        if self.config.evict_pressure_gate_enabled:
+            cpu_pressure_over = bool(
+                pressure_snapshot["available"]
+                and pressure_snapshot["cpu_usage_fraction"] >= float(pressure_snapshot["trigger"])
+            )
         runtime_confidence = (
             float(runtime_prefix_profile.get("runtime_confidence") or 0.0)
             if runtime_prefix_profile is not None
@@ -316,10 +322,15 @@ class OnlinePolicyController:
             elif scheduler_hint is not None and scheduler_action == "defer":
                 action = "defer"
                 reason = f"online policy: scheduler hint requested defer ({scheduler_hint.reason})"
-            elif active_refs == 0 and offload_ready:
-                action = "offload"
+            elif active_refs == 0 and evict_ready and cpu_pressure_over and (
+                evict_cold_score >= float(self.config.evict_cold_score_threshold)
+            ):
+                action = "evict"
                 target_tier = "ssd"
-                reason = "online profile: CPU-resident object is released with zero active refs, so offload is ready"
+                reason = (
+                    "evict-B: CPU-resident cold object demoted to SSD "
+                    f"(data preserved, cold_score={evict_cold_score:.3f})"
+                )
             else:
                 action = "keep"
                 target_tier = "cpu"
@@ -387,13 +398,6 @@ class OnlinePolicyController:
                 action = "prefetch"
                 target_tier = "cpu"
                 reason = "online profile: SSD-resident object looks warm but is not ready for direct load, so prefetch is preferred"
-            elif active_refs == 0 and evict_ready and pressure_over and (
-                (policy_reuse_frequency <= self.config.cold_reuse_threshold and prefetch_hit_rate > 0.0)
-                or prefetch_waste > 0
-            ):
-                action = "evict"
-                target_tier = "ssd"
-                reason = "online profile: SSD-resident object already served its warm revisit and now looks cold enough to evict"
             elif active_refs == 0 and drop_ready and (
                 policy_reuse_frequency <= self.config.cold_reuse_threshold
                 and prefetch_hit_rate <= 0.0
@@ -401,13 +405,6 @@ class OnlinePolicyController:
             ):
                 action = "drop"
                 reason = "online profile: SSD-resident object is cold, unreferenced, and has no prefetch waste, so drop is preferred"
-            elif active_refs == 0 and evict_ready and pressure_over and (
-                policy_reuse_frequency <= self.config.cold_reuse_threshold
-                or prefetch_waste > 0
-            ):
-                action = "evict"
-                target_tier = "ssd"
-                reason = "online profile: SSD-resident object is cold or has accumulated prefetch waste, so evict is preferred"
             elif active_refs == 0 and _recompute_is_preferred(
                 profile=profile,
                 load_target_present=bool(load_target_id),
@@ -493,6 +490,7 @@ class OnlinePolicyController:
                 "evict_pressure_gate_enabled": self.config.evict_pressure_gate_enabled,
                 "evict_pressure_snapshot": dict(pressure_snapshot),
                 "evict_pressure_over": bool(pressure_over),
+                "evict_cpu_pressure_over": bool(cpu_pressure_over),
                 "runtime_confidence": runtime_confidence,
                 "evict_cold_score": evict_cold_score,
                 "load_is_worthwhile": load_is_worthwhile,
@@ -732,6 +730,152 @@ class OnlinePolicyController:
         self.profile_store.checkpoint()
         return result
 
+    def _pressure_snapshot(self) -> dict[str, Any]:
+        """Estimate CPU/SSD usage from observed resident bytes and configured capacities."""
+        states = self.profile_store.objects()
+        cpu_used = sum(_resident_bytes(state) for state in states.values() if state.get("current_tier") == "cpu")
+        ssd_used = sum(_resident_bytes(state) for state in states.values() if state.get("current_tier") == "ssd")
+        cpu_cap = max(0, int(self.config.evict_cpu_capacity_bytes))
+        ssd_cap = max(0, int(self.config.evict_ssd_capacity_bytes))
+        cpu_frac = (cpu_used / cpu_cap) if cpu_cap > 0 else 0.0
+        ssd_frac = (ssd_used / ssd_cap) if ssd_cap > 0 else 0.0
+        trigger = max(0.0, min(1.0, float(self.config.evict_pressure_trigger)))
+        available = cpu_cap > 0 or ssd_cap > 0
+        return {
+            "available": bool(available),
+            "cpu_used_bytes": int(cpu_used),
+            "cpu_capacity_bytes": int(cpu_cap),
+            "cpu_usage_fraction": round(cpu_frac, 6),
+            "ssd_used_bytes": int(ssd_used),
+            "ssd_capacity_bytes": int(ssd_cap),
+            "ssd_usage_fraction": round(ssd_frac, 6),
+            "trigger": trigger,
+            "over_pressure": bool(available and (cpu_frac >= trigger or ssd_frac >= trigger)),
+        }
+
+    def global_evict_scan(
+        self,
+        *,
+        now_ns: int | None = None,
+    ) -> list[tuple[OfflineEvictionDecision, RuntimeActionResult]]:
+        """Under capacity pressure, dispatch evict for the coldest released objects.
+
+        Runs at most once per ``global_evict_scan_min_interval_s``.  Victims are
+        ranked by the evict coldness score (low reuse + low runtime confidence +
+        high prefetch waste) and dispatched through the normal bridge so every
+        evict-B action is receipt-backed.
+        """
+        now = time.time_ns() if now_ns is None else int(now_ns)
+        if not self.execution_enabled or not self.config.evict_dispatch_enabled:
+            return []
+        if not self.config.global_evict_scan_enabled:
+            return []
+        interval_ns = int(max(0.0, float(self.config.global_evict_scan_min_interval_s)) * 1_000_000_000)
+        if self._last_global_evict_scan_ns and (now - self._last_global_evict_scan_ns) < interval_ns:
+            return []
+        self._last_global_evict_scan_ns = now
+        if not self.config.evict_pressure_gate_enabled:
+            return []
+        pressure = self._pressure_snapshot()
+        if not (
+            pressure["available"]
+            and pressure["cpu_usage_fraction"] >= float(pressure["trigger"])
+        ):
+            return []
+        candidates: list[tuple[float, str, Any]] = []
+        for backend_object_id, state in self.profile_store.objects().items():
+            tier = str(state.get("current_tier") or "")
+            if tier != "cpu":
+                continue
+            if _as_int(state.get("active_reference_count")) > 0:
+                continue
+            object_key = str(state.get("last_object_key") or "")
+            level_raw = str(state.get("last_object_level") or "")
+            request_id = str(state.get("last_request_id") or "")
+            if not object_key or not level_raw or not request_id:
+                continue
+            try:
+                object_level = ObjectLevel(level_raw)
+            except ValueError:
+                continue
+            binding = self.bridge.binding_for(object_level, object_key, request_id=request_id)
+            if binding is None:
+                continue
+            execution_actions = {} if binding.execution_spec is None else dict(binding.execution_spec.actions)
+            if not _action_ready(execution_actions, "evict"):
+                continue
+            profile = (
+                self.observed_profile_db.get_chunk(binding.backend_object_id, workload_id=self.workload_id)
+                or self.profile_db.get_chunk(binding.backend_object_id, workload_id=self.workload_id)
+            )
+            reuse = _reuse_frequency(profile, state)
+            policy_reuse = _policy_reuse_frequency(profile, state, reuse)
+            prefetch_waste = _as_int(state.get("prefetch_waste_count"))
+            prefix_key = prefix_key_from_binding(binding, state)
+            prefix_profile = None if not prefix_key else self.profile_store.prefix_profile(prefix_key)
+            confidence = (
+                float(prefix_profile.get("runtime_confidence") or 0.0)
+                if prefix_profile is not None
+                else 0.0
+            )
+            score = _evict_cold_score(
+                policy_reuse_frequency=policy_reuse,
+                runtime_confidence=confidence,
+                prefetch_waste=prefetch_waste,
+                cold_reuse_threshold=self.config.cold_reuse_threshold,
+                prefetch_waste_tolerance=self.config.prefetch_waste_tolerance,
+            )
+            if score < float(self.config.evict_cold_score_threshold):
+                continue
+            candidates.append(
+                (
+                    score,
+                    backend_object_id,
+                    (state, binding, object_level, object_key, request_id, policy_reuse, confidence, prefetch_waste),
+                )
+            )
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        results: list[tuple[OfflineEvictionDecision, RuntimeActionResult]] = []
+        max_victims = max(0, int(self.config.global_evict_scan_max_victims))
+        for score, backend_object_id, payload in candidates[:max_victims]:
+            state, binding, object_level, object_key, request_id, policy_reuse, confidence, prefetch_waste = payload
+            decision = OfflineEvictionDecision(
+                run_id=self.run_id,
+                decision_id=f"online-global-evict-{len(self.decisions)}-{binding.binding_id}",
+                request_id=request_id,
+                object_key=object_key,
+                object_level=object_level,
+                predicted_action="evict",
+                target_tier="ssd",
+                decision_time_ns=now,
+                decision_index=_as_int(state.get("last_arrival_index")) or None,
+                reason=(
+                    "global pressure scan: "
+                    f"cpu_frac={pressure['cpu_usage_fraction']:.3f} "
+                    f"ssd_frac={pressure['ssd_usage_fraction']:.3f} "
+                    f"cold_score={score:.3f}"
+                ),
+                metadata={
+                    "binding_id": binding.binding_id,
+                    "binding_generation": binding.binding_generation,
+                    "backend_object_id": backend_object_id,
+                    "decision_source": "global_pressure_scan",
+                    "dispatch_origin": "global_evict_scan",
+                    "policy_reuse_frequency": policy_reuse,
+                    "runtime_confidence": confidence,
+                    "prefetch_waste_count": prefetch_waste,
+                    "evict_cold_score": score,
+                    "evict_pressure_snapshot": dict(pressure),
+                    "current_tier": str(state.get("current_tier") or "unknown"),
+                    "active_reference_count": _as_int(state.get("active_reference_count")),
+                },
+            )
+            self.decisions.append(decision)
+            results.append((decision, self.dispatch(decision)))
+        if results:
+            self.profile_store.checkpoint()
+        return results
+
     def records(self) -> dict[str, list[dict[str, Any]]]:
         return {
             "trace": [item.to_record() for item in self.trace_events],
@@ -775,6 +919,29 @@ def _reuse_frequency(profile: ChunkProfile | None, object_state: dict[str, Any])
     if profile is not None:
         return float(profile.reuse_frequency)
     return 0.0
+
+
+def _resident_bytes(object_state: dict[str, Any]) -> int:
+    """Best-effort resident size estimate: last placed bytes while in cpu/ssd."""
+    if str(object_state.get("current_tier") or "") not in {"cpu", "ssd"}:
+        return 0
+    return max(0, _as_int(object_state.get("resident_bytes")))
+
+
+def _evict_cold_score(
+    *,
+    policy_reuse_frequency: float,
+    runtime_confidence: float,
+    prefetch_waste: int,
+    cold_reuse_threshold: float,
+    prefetch_waste_tolerance: int,
+) -> float:
+    """0..1 coldness: low reuse + low runtime confidence + high prefetch waste."""
+    reuse_denom = max(1e-9, float(cold_reuse_threshold))
+    reuse_signal = min(1.0, max(0.0, 1.0 - (float(policy_reuse_frequency) / reuse_denom)))
+    confidence_signal = min(1.0, max(0.0, 1.0 - float(runtime_confidence)))
+    waste_signal = min(1.0, max(0, int(prefetch_waste)) / max(1, int(prefetch_waste_tolerance)))
+    return round((0.5 * reuse_signal) + (0.3 * confidence_signal) + (0.2 * waste_signal), 6)
 
 
 def _reuse_ratio_hint(profile: ChunkProfile | None) -> float:

@@ -76,6 +76,15 @@ class RuntimeControlHostConfig:
     scheduler_hints_path: Path | None = None
     online_prefetch_dispatch_enabled: bool = True
     online_prefetch_mode: str = "disabled"
+    online_evict_dispatch_enabled: bool = True
+    evict_pressure_gate_enabled: bool = True
+    evict_pressure_trigger: float = 0.8
+    evict_cpu_capacity_bytes: int = 0
+    evict_ssd_capacity_bytes: int = 0
+    evict_cold_score_threshold: float = 0.35
+    global_evict_scan_enabled: bool = True
+    global_evict_scan_min_interval_s: float = 5.0
+    global_evict_scan_max_victims: int = 4
     kv_core_mode: RuntimeMode = RuntimeMode.OFF
 
     def __post_init__(self) -> None:
@@ -455,6 +464,15 @@ class RuntimeControlHost:
             config=OnlinePolicyControllerConfig(
                 enable_prefetch_dispatch=self.config.online_prefetch_dispatch_enabled,
                 online_prefetch_mode=self.config.online_prefetch_mode,
+                evict_dispatch_enabled=self.config.online_evict_dispatch_enabled,
+                evict_pressure_gate_enabled=self.config.evict_pressure_gate_enabled,
+                evict_pressure_trigger=self.config.evict_pressure_trigger,
+                evict_cpu_capacity_bytes=self.config.evict_cpu_capacity_bytes,
+                evict_ssd_capacity_bytes=self.config.evict_ssd_capacity_bytes,
+                evict_cold_score_threshold=self.config.evict_cold_score_threshold,
+                global_evict_scan_enabled=self.config.global_evict_scan_enabled,
+                global_evict_scan_min_interval_s=self.config.global_evict_scan_min_interval_s,
+                global_evict_scan_max_victims=self.config.global_evict_scan_max_victims,
                 kv_core_mode=self.config.kv_core_mode,
             ),
             prediction_source=prediction_source,
@@ -554,10 +572,14 @@ class RuntimeControlHost:
                         continue
                     self._write_online_policy_rejection(task.event, result.status, deadline_ns=task.deadline_ns)
                     continue
-                if bridge.commands:
-                    self._write_command(bridge.commands[-1])
-                if bridge.receipts:
-                    self._write_receipt(bridge.receipts[-1])
+                if task.event.action is HookAction.RELEASE and task.event.status == "completed":
+                    for _decision, _result in controller.global_evict_scan():
+                        if _result.receipt is not None:
+                            self._write_receipt(_result.receipt)
+                for command in bridge.commands:
+                    self._write_command(command)
+                for receipt in bridge.receipts:
+                    self._write_receipt(receipt)
             finally:
                 self._online_policy_queue.task_done()
 

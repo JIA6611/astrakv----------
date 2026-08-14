@@ -18,12 +18,14 @@ export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 PYTHON="${ASTRAKV_PYTHON:-/home/zyx/venv_for_zyx/bin/python3}"
 export ASTRAKV_PYTHON="$PYTHON"
-# CPU==GPU on the DGX (UMA shared memory): CPU tier capacity equals the GPU KV
-# cache size (71.16 GiB observed), and the prefetch budget = available unified
-# memory so the capacity gate is the binding constraint.  Override via env.
-LOCAL_CPU_SIZE_GB="${ASTRAKV_LOCAL_CPU_SIZE_GB:-71}"
+# CPU==GPU on the DGX (UMA shared memory): CPU and GPU tiers are partitions of
+# the same 128 GiB pool, so equal sizes must fit together with the model
+# (~15 GiB).  36 GiB each keeps the total ~90 GiB; GPU utilization is lowered
+# to 0.45 so the GPU KV cache lands near the CPU tier size.  Override via env.
+LOCAL_CPU_SIZE_GB="${ASTRAKV_LOCAL_CPU_SIZE_GB:-36}"
 export ASTRAKV_LOCAL_CPU_SIZE_GB="$LOCAL_CPU_SIZE_GB"
 export ASTRAKV_KV_CORE_CPU_PREFETCH_BUDGET_FRACTION="${ASTRAKV_KV_CORE_CPU_PREFETCH_BUDGET_FRACTION:-1.0}"
+export ASTRAKV_GPU_MEMORY_UTILIZATION="${ASTRAKV_GPU_MEMORY_UTILIZATION:-0.45}"
 MODEL="${ASTRAKV_MODEL:-/home/zyx/astrakv2/models/Qwen3-8B}"
 MANIFEST="${ASTRAKV_MANIFEST:-/home/zyx/astrakv-W/deployments/kv-core-v3-e3-deterministic-recovery-20260809/deployment.manifest.json}"
 SMOKE="${ASTRAKV_SMOKE:-/home/zyx/astrakv-W/results/kv-core-e1-smoke-20260813T120659Z/E1/repeated_long_prefix/cold/variant/callback-smoke.json}"

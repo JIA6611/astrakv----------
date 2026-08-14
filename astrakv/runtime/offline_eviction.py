@@ -377,11 +377,16 @@ class OfflineEvictionSimulator:
             values.pop(0)
 
     def _load_cost(self, item: _ResidentObject, source: str) -> float:
+        observed = (
+            item.spec.observed_load_ms
+            if item.spec.observed_load_ms is not None and item.spec.observed_load_ms > 0
+            else None
+        )
         if source == "cpu":
             return self.cost_model.cpu_to_gpu_ms
         if source == "ssd":
-            return item.spec.observed_load_ms if item.spec.observed_load_ms is not None else self.cost_model.ssd_to_gpu_ms
-        return item.spec.observed_load_ms if item.spec.observed_load_ms is not None else self.cost_model.recompute_ms
+            return observed if observed is not None else self.cost_model.ssd_to_gpu_ms
+        return observed if observed is not None else self.cost_model.recompute_ms
 
     def _event(
         self, access: OfflineAccess, event_type: str, item: _ResidentObject, before: str, after: str, *, latency: float = 0.0

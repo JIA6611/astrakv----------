@@ -135,23 +135,36 @@ def build_inputs(
 
 
 def load_or_build_hints(args: argparse.Namespace, profile: ProfileDB, objects: list[OfflineObject]) -> tuple[list[PrefetchHint], list[dict[str, Any]]]:
+    scores = ChunkScorer().score_db(profile)
+    score_lookup = {item.chunk_id: item.score for item in scores}
+    by_key = {(item.object_level, item.object_key): item for item in objects}
+
+    def attach_scores(records: list[dict[str, Any]]) -> None:
+        for record in records:
+            level = str(record.get("object_level") or "prefix")
+            key = str(record.get("object_key") or "")
+            if (level, key) in by_key:
+                current = by_key[(level, key)]
+                by_key[(level, key)] = OfflineObject(
+                    current.object_key,
+                    current.object_level,
+                    current.size_bytes,
+                    current.size_source,
+                    current.observed_load_ms,
+                    score_lookup.get(str(key), current.astrakv_score),
+                )
+
     if args.scheduler_decisions:
         records = load_csv(args.scheduler_decisions)
+        attach_scores(records)
+        objects[:] = list(by_key.values())
         return hints_from_records(records), records
-    scores = ChunkScorer().score_db(profile)
     score_by_chunk = {item.chunk_id: item.to_record() for item in scores}
     scheduler = UnifiedObjectScheduler(ObjectSchedulerConfig(gpu_budget_bytes=args.gpu_capacity_bytes, default_object_bytes=args.default_object_bytes))
     decisions = scheduler.schedule(candidates_from_profile_db(profile, chunk_scores=score_by_chunk, default_size_bytes=args.default_object_bytes))
     records = [item.to_record() for item in decisions if not item.metadata.get("legacy_unlinked", True)]
-    score_lookup = {item.chunk_id: item.score for item in scores}
     updated: list[OfflineObject] = []
-    by_key = {(item.object_level, item.object_key): item for item in objects}
-    for record in records:
-        level = str(record.get("object_level") or "prefix")
-        key = str(record.get("object_key") or "")
-        if (level, key) in by_key:
-            current = by_key[(level, key)]
-            by_key[(level, key)] = OfflineObject(current.object_key, current.object_level, current.size_bytes, current.size_source, current.observed_load_ms, score_lookup.get(str(record.get("chunk_id")), 0.0))
+    attach_scores(records)
     objects[:] = list(by_key.values())
     return hints_from_records(records), records
 

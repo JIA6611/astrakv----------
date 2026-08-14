@@ -150,6 +150,27 @@ def install_from_environment(
                     os.environ.get("ASTRAKV_ENABLE_ONLINE_PREFETCH_DISPATCH", "true") == "true"
                 ),
                 online_prefetch_mode=os.environ.get("ASTRAKV_ONLINE_PREFETCH_MODE", "disabled"),
+                online_evict_dispatch_enabled=(
+                    os.environ.get("ASTRAKV_ONLINE_EVICT_DISPATCH_ENABLED", "true") == "true"
+                ),
+                evict_pressure_gate_enabled=(
+                    os.environ.get("ASTRAKV_EVICT_PRESSURE_GATE_ENABLED", "true") == "true"
+                ),
+                evict_pressure_trigger=float(os.environ.get("ASTRAKV_EVICT_PRESSURE_TRIGGER", "0.8")),
+                evict_cpu_capacity_bytes=int(os.environ.get("ASTRAKV_EVICT_CPU_CAPACITY_BYTES", "0")),
+                evict_ssd_capacity_bytes=int(os.environ.get("ASTRAKV_EVICT_SSD_CAPACITY_BYTES", "0")),
+                evict_cold_score_threshold=float(
+                    os.environ.get("ASTRAKV_EVICT_COLD_SCORE_THRESHOLD", "0.35")
+                ),
+                global_evict_scan_enabled=(
+                    os.environ.get("ASTRAKV_EVICT_GLOBAL_SCAN_ENABLED", "true") == "true"
+                ),
+                global_evict_scan_min_interval_s=float(
+                    os.environ.get("ASTRAKV_EVICT_GLOBAL_SCAN_MIN_INTERVAL_S", "5.0")
+                ),
+                global_evict_scan_max_victims=int(
+                    os.environ.get("ASTRAKV_EVICT_GLOBAL_SCAN_MAX_VICTIMS", "4")
+                ),
                 kv_core_mode=mode,
             ))
         except (KeyError, ValueError) as exc:

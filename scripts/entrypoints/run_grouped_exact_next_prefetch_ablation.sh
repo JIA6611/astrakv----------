@@ -33,13 +33,15 @@ HOST="${ASTRAKV_HOST:-127.0.0.1}"
 PORT="18000"
 CONTEXT_PORT="17900"
 MAX_MODEL_LEN="24576"
-GPU_MEMORY_UTILIZATION="0.72"
+GPU_MEMORY_UTILIZATION="${ASTRAKV_GPU_MEMORY_UTILIZATION:-0.72}"
 TIMEOUT="900"
 LIMIT="0"
 SERVER_PID=""
 SIDECAR_MODE="build"
 EXTERNAL_SIDECAR=""
 DATASETS="qasper,multifieldqa_en"
+WARMUP_PASSES="${ASTRAKV_ABLATION_WARMUP_PASSES:-0}"
+WARMUP_LIMIT="${ASTRAKV_ABLATION_WARMUP_LIMIT:-8}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -101,6 +103,7 @@ start_server() {
   # KV tier (default 5.0 GiB standalone; the full pipeline sets it to 71 GiB).
   sed -e "s|^local_cpu:.*|local_cpu: true|" \
       -e "s|^max_local_cpu_size:.*|max_local_cpu_size: ${ASTRAKV_LOCAL_CPU_SIZE_GB:-5.0}|" \
+      -e "s|^max_local_disk_size:.*|max_local_disk_size: ${ASTRAKV_LOCAL_DISK_SIZE_GB:-80.0}|" \
       -e "s|^local_disk:.*|local_disk: $cache_dir|" \
       configs/lmcache_disk_example.yaml > "$state_dir/lmcache.yaml"
   set -a
@@ -212,6 +215,53 @@ run_condition() {
   # shellcheck disable=SC1090
   source "$runtime_env"
   set +a
+  if [[ "$WARMUP_PASSES" =~ ^[0-9]+$ && "$WARMUP_PASSES" -gt 0 ]]; then
+    local warmup_file="$OUTPUT_DIR/$dataset/materialized/${dataset}_grouped_exact_next_warmup.jsonl"
+    if [[ ! -f "$warmup_file" ]]; then
+      "$PYTHON" - "$canonical" "$warmup_file" "$WARMUP_LIMIT" <<'PY'
+import json, sys
+source, target, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
+rows = []
+with open(source, encoding="utf-8") as handle:
+    for line in handle:
+        rows.append(json.loads(line))
+        if len(rows) >= limit:
+            break
+with open(target, "w", encoding="utf-8") as handle:
+    for row in rows:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+print(f"warmup workload written to {target} ({len(rows)} rows)")
+PY
+    fi
+    for pass_index in $(seq 1 "$WARMUP_PASSES"); do
+      echo "[$dataset/$role] warmup pass $pass_index/$WARMUP_PASSES (same server/cache)"
+      "$PYTHON" scripts/benchmark/run_real_benchmark.py \
+        --base-url "http://${HOST}:${PORT}/v1" \
+        --model "$MODEL" \
+        --backend "vllm-lmcache047" \
+        --output-dir "$run_dir/warmup-$pass_index" \
+        --workload-jsonl "$warmup_file" \
+        --run-id "${run_id}-warmup-${pass_index}" \
+        --workload-id "${dataset}_grouped_exact_next_warmup" \
+        --model-revision "local-qwen3-8b" \
+        --tokenizer-revision "local-qwen3-8b" \
+        --dtype "bfloat16" \
+        --quantization "unquantized" \
+        --random-seed "0" \
+        --cache-state warm \
+        --connector-version "lmcache-vllm-v1-0.4.7" \
+        --pair-id "$pair_id" \
+        --pair-role "$role" \
+        --claim-scope online_control_warmup \
+        --runtime-state-dir "$state_dir" \
+        --request-context-url "http://${HOST}:${CONTEXT_PORT}/request-context" \
+        --request-context-session-id "${run_id}-session" \
+        --request-context-secret-hex "$secret" \
+        --metrics-interval 1.0 \
+        --timeout "$TIMEOUT" \
+        --output-tokens 128
+    done
+  fi
   "$PYTHON" scripts/benchmark/run_real_benchmark.py \
     --base-url "http://${HOST}:${PORT}/v1" \
     --model "$MODEL" \

@@ -139,7 +139,7 @@ class OnlineControllerTests(unittest.TestCase):
             self.assertEqual(state["dispatch_status_counts"]["advisory_only"], 1)
             self.assertEqual(state["dispatch_status_counts"]["no_dispatch_required"], 1)
 
-    def test_propose_for_prefers_offload_for_cpu_resident_binding_with_ready_execution_spec(self):
+    def test_propose_for_demotes_cold_cpu_object_to_ssd_when_pressured(self):
         execution_spec = BackendExecutionSpec(
             spec_id="spec-1",
             binding_id="bind",
@@ -153,6 +153,7 @@ class OnlineControllerTests(unittest.TestCase):
             lifecycle="released",
             actions={
                 "offload": {"status": "ready"},
+                "evict": {"status": "ready"},
                 "drop": {"status": "ready"},
             },
         )
@@ -173,7 +174,13 @@ class OnlineControllerTests(unittest.TestCase):
             gate=gate(),
         )
         store = OnlineProfileStore(run_id="run")
-        controller = OnlinePolicyController(run_id="run", workload_id="w", bridge=bridge, profile_store=store)
+        controller = OnlinePolicyController(
+            run_id="run",
+            workload_id="w",
+            bridge=bridge,
+            profile_store=store,
+            config=OnlinePolicyControllerConfig(evict_cpu_capacity_bytes=1),
+        )
         event = BackendHookEvent(
             "run",
             "event",
@@ -186,13 +193,15 @@ class OnlineControllerTests(unittest.TestCase):
             1,
             tier_before="ssd",
             tier_after="cpu",
+            bytes=1,
         )
 
         self.assertTrue(controller.ingest(event))
         proposed = controller.propose_for("prefix", ObjectLevel.PREFIX)
-        self.assertEqual(proposed.predicted_action, "offload")
+        self.assertEqual(proposed.predicted_action, "evict")
         self.assertEqual(proposed.target_tier, "ssd")
         self.assertEqual(proposed.metadata["current_tier"], "cpu")
+        self.assertTrue(proposed.metadata["evict_cpu_pressure_over"])
 
     def test_keep_decision_stays_noop_even_when_execution_is_enabled(self):
         binding = BackendObjectBinding("run", "req", "prefix", ObjectLevel.PREFIX, "block-7", "bind")
@@ -1048,7 +1057,7 @@ class OnlineControllerTests(unittest.TestCase):
         self.assertEqual(proposed.metadata["prefetch_candidate_source"], "runtime-observed")
         self.assertEqual(proposed.metadata["decision_source"], "runtime-observed")
 
-    def test_propose_for_evicts_cold_ssd_object_after_prefetch_waste(self):
+    def test_ssd_resident_cold_object_is_no_longer_evicted(self):
         execution_spec = BackendExecutionSpec(
             spec_id="spec-1",
             binding_id="bind",
@@ -1084,18 +1093,17 @@ class OnlineControllerTests(unittest.TestCase):
         )
         controller = OnlinePolicyController(run_id="run", workload_id="w", bridge=bridge)
         self.assertTrue(controller.ingest(
-            BackendHookEvent("run", "event-store", "req", "prefix", ObjectLevel.PREFIX, "block-7", HookAction.CACHE_STORE, "submitted", 1, tier_after="ssd")
+            BackendHookEvent("run", "event-store", "req", "prefix", ObjectLevel.PREFIX, "block-7", HookAction.CACHE_STORE, "submitted", 1, tier_after="ssd", bytes=1)
         ))
         self.assertTrue(controller.ingest(
-            BackendHookEvent("run", "event-prefetch", "req", "prefix", ObjectLevel.PREFIX, "block-7", HookAction.PREFETCH, "completed", 2, tier_before="ssd", tier_after="cpu")
+            BackendHookEvent("run", "event-prefetch", "req", "prefix", ObjectLevel.PREFIX, "block-7", HookAction.PREFETCH, "completed", 2, tier_before="ssd", tier_after="cpu", bytes=1)
         ))
         self.assertTrue(controller.ingest(
-            BackendHookEvent("run", "event-offload", "req", "prefix", ObjectLevel.PREFIX, "block-7", HookAction.OFFLOAD, "completed", 3, tier_before="cpu", tier_after="ssd")
+            BackendHookEvent("run", "event-offload", "req", "prefix", ObjectLevel.PREFIX, "block-7", HookAction.OFFLOAD, "completed", 3, tier_before="cpu", tier_after="ssd", bytes=1)
         ))
 
         proposed = controller.propose_for("prefix", ObjectLevel.PREFIX)
-        self.assertEqual(proposed.predicted_action, "evict")
-        self.assertEqual(proposed.target_tier, "ssd")
+        self.assertNotEqual(proposed.predicted_action, "evict")
 
     def test_propose_for_drops_cold_ssd_object_without_prefetch_waste(self):
         execution_spec = BackendExecutionSpec(
@@ -1243,7 +1251,7 @@ class OnlineControllerTests(unittest.TestCase):
         self.assertEqual(controller.dispatch(proposed).status, "no_dispatch_required")
         self.assertEqual(controller.bridge.commands, [])
 
-    def test_propose_for_evicts_prefetched_object_after_low_value_revisit_returns_to_ssd(self):
+    def test_ssd_resident_object_with_prefetch_waste_is_no_longer_evicted(self):
         execution_spec = BackendExecutionSpec(
             spec_id="spec-evict-after-hit",
             binding_id="bind",
@@ -1284,13 +1292,13 @@ class OnlineControllerTests(unittest.TestCase):
         self.assertTrue(controller.ingest(
             BackendHookEvent(
                 "run", "event-store", "req", "prefix-evict-hit", ObjectLevel.PREFIX, "block-evict-hit",
-                HookAction.CACHE_STORE, "submitted", 1, tier_after="ssd", metadata=seed_metadata,
+                HookAction.CACHE_STORE, "submitted", 1, tier_after="ssd", bytes=1, metadata=seed_metadata,
             )
         ))
         self.assertTrue(controller.ingest(
             BackendHookEvent(
                 "run", "event-prefetch", "req", "prefix-evict-hit", ObjectLevel.PREFIX, "block-evict-hit",
-                HookAction.PREFETCH, "completed", 2, tier_before="ssd", tier_after="cpu", metadata=seed_metadata,
+                HookAction.PREFETCH, "completed", 2, tier_before="ssd", tier_after="cpu", bytes=1, metadata=seed_metadata,
             )
         ))
         self.assertTrue(controller.ingest(
@@ -1308,12 +1316,12 @@ class OnlineControllerTests(unittest.TestCase):
         self.assertTrue(controller.ingest(
             BackendHookEvent(
                 "run", "event-offload", "req", "prefix-evict-hit", ObjectLevel.PREFIX, "block-evict-hit",
-                HookAction.OFFLOAD, "completed", 5, tier_before="cpu", tier_after="ssd", metadata=followup_metadata,
+                HookAction.OFFLOAD, "completed", 5, tier_before="cpu", tier_after="ssd", bytes=1, metadata=followup_metadata,
             )
         ))
 
         proposed = controller.propose_for("prefix-evict-hit", ObjectLevel.PREFIX)
-        self.assertEqual(proposed.predicted_action, "evict")
+        self.assertNotEqual(proposed.predicted_action, "evict")
         self.assertEqual(proposed.metadata["policy_reuse_frequency"], 0.05)
         self.assertGreater(proposed.metadata["prefetch_hit_rate"], 0.0)
 
@@ -1367,6 +1375,274 @@ class OnlineControllerTests(unittest.TestCase):
 
         proposed = controller.propose_for("prefix", ObjectLevel.PREFIX)
         self.assertEqual(proposed.predicted_action, "recompute")
+
+
+    def _evict_ready_binding(
+        self,
+        *,
+        object_key: str,
+        backend_object_id: str,
+        spec_id: str,
+        binding_id: str = "bind",
+    ) -> BackendObjectBinding:
+        execution_spec = BackendExecutionSpec(
+            spec_id=spec_id,
+            binding_id=binding_id,
+            binding_generation=1,
+            backend_object_id=backend_object_id,
+            object_key=object_key,
+            object_level=ObjectLevel.PREFIX,
+            runtime_owner="owner",
+            owner_channel="channel",
+            key_identity="key",
+            lifecycle="released",
+            actions={
+                "prefetch": {"status": "ready"},
+                "evict": {"status": "ready"},
+                "drop": {"status": "ready"},
+            },
+        )
+        return BackendObjectBinding(
+            "run",
+            "req",
+            object_key,
+            ObjectLevel.PREFIX,
+            backend_object_id,
+            binding_id,
+            execution_spec=execution_spec,
+        )
+
+    def _ingest_ssd_object(
+        self,
+        controller: OnlinePolicyController,
+        *,
+        object_key: str,
+        backend_object_id: str,
+        prefetch: bool,
+        size: int,
+    ) -> None:
+        self.assertTrue(controller.ingest(
+            BackendHookEvent(
+                "run", f"store-{backend_object_id}", "req", object_key, ObjectLevel.PREFIX,
+                backend_object_id, HookAction.CACHE_STORE, "submitted", 1, tier_after="ssd", bytes=size,
+            )
+        ))
+        if prefetch:
+            self.assertTrue(controller.ingest(
+                BackendHookEvent(
+                    "run", f"prefetch-{backend_object_id}", "req", object_key, ObjectLevel.PREFIX,
+                    backend_object_id, HookAction.PREFETCH, "completed", 2,
+                    tier_before="ssd", tier_after="cpu", bytes=size,
+                )
+            ))
+        self.assertTrue(controller.ingest(
+            BackendHookEvent(
+                "run", f"offload-{backend_object_id}", "req", object_key, ObjectLevel.PREFIX,
+                backend_object_id, HookAction.OFFLOAD, "completed", 3,
+                tier_before="cpu" if prefetch else "ssd", tier_after="ssd", bytes=size,
+            )
+        ))
+
+    def _ingest_cpu_object(
+        self,
+        controller: OnlinePolicyController,
+        *,
+        object_key: str,
+        backend_object_id: str,
+        prefetch_waste: bool,
+        size: int,
+    ) -> None:
+        self.assertTrue(controller.ingest(
+            BackendHookEvent(
+                "run", f"store-{backend_object_id}", "req", object_key, ObjectLevel.PREFIX,
+                backend_object_id, HookAction.CACHE_STORE, "submitted", 1, tier_after="ssd", bytes=size,
+            )
+        ))
+        self.assertTrue(controller.ingest(
+            BackendHookEvent(
+                "run", f"prefetch-{backend_object_id}", "req", object_key, ObjectLevel.PREFIX,
+                backend_object_id, HookAction.PREFETCH, "completed", 2,
+                tier_before="ssd", tier_after="cpu", bytes=size,
+            )
+        ))
+        if prefetch_waste:
+            self.assertTrue(controller.ingest(
+                BackendHookEvent(
+                    "run", f"drop-{backend_object_id}", "req", object_key, ObjectLevel.PREFIX,
+                    backend_object_id, HookAction.DROP, "completed", 3, tier_before="cpu", bytes=size,
+                )
+            ))
+
+    def test_evict_pressure_gate_blocks_below_trigger(self):
+        binding = self._evict_ready_binding(
+            object_key="prefix", backend_object_id="block-7", spec_id="spec-pressure-low",
+        )
+        bridge = OnlineBackendBridge(
+            run_id="run",
+            bindings=[binding],
+            hook_client=object(),
+            hook_url="http://127.0.0.1:7900/actions",
+            gate=gate(),
+        )
+        controller = OnlinePolicyController(
+            run_id="run",
+            workload_id="w",
+            bridge=bridge,
+            config=OnlinePolicyControllerConfig(evict_cpu_capacity_bytes=100),
+        )
+        self._ingest_cpu_object(controller, object_key="prefix", backend_object_id="block-7", prefetch_waste=False, size=1)
+        proposed = controller.propose_for("prefix", ObjectLevel.PREFIX)
+        self.assertEqual(proposed.predicted_action, "keep")
+        self.assertFalse(proposed.metadata["evict_cpu_pressure_over"])
+        self.assertLess(proposed.metadata["evict_pressure_snapshot"]["cpu_usage_fraction"], 0.8)
+
+    def test_evict_dispatch_switch_disables_evict(self):
+        binding = self._evict_ready_binding(
+            object_key="prefix", backend_object_id="block-7", spec_id="spec-switch-off",
+        )
+        bridge = OnlineBackendBridge(
+            run_id="run",
+            bindings=[binding],
+            hook_client=object(),
+            hook_url="http://127.0.0.1:7900/actions",
+            gate=gate(),
+        )
+        controller = OnlinePolicyController(
+            run_id="run",
+            workload_id="w",
+            bridge=bridge,
+            config=OnlinePolicyControllerConfig(
+                evict_cpu_capacity_bytes=1,
+                evict_dispatch_enabled=False,
+            ),
+        )
+        self._ingest_cpu_object(controller, object_key="prefix", backend_object_id="block-7", prefetch_waste=True, size=1)
+        proposed = controller.propose_for("prefix", ObjectLevel.PREFIX)
+        self.assertEqual(proposed.predicted_action, "keep")
+        self.assertFalse(proposed.metadata["evict_ready"])
+
+    def test_pressure_snapshot_reports_usage_fractions(self):
+        binding_a = self._evict_ready_binding(
+            object_key="prefix-a", backend_object_id="block-a", spec_id="spec-pressure-a",
+        )
+        binding_b = self._evict_ready_binding(
+            object_key="prefix-b", backend_object_id="block-b", spec_id="spec-pressure-b", binding_id="bind-b",
+        )
+        bridge = OnlineBackendBridge(
+            run_id="run",
+            bindings=[binding_a, binding_b],
+            hook_client=object(),
+            hook_url="http://127.0.0.1:7900/actions",
+            gate=gate(),
+        )
+        controller = OnlinePolicyController(
+            run_id="run",
+            workload_id="w",
+            bridge=bridge,
+            config=OnlinePolicyControllerConfig(evict_ssd_capacity_bytes=2),
+        )
+        self._ingest_ssd_object(controller, object_key="prefix-a", backend_object_id="block-a", prefetch=False, size=1)
+        snapshot = controller._pressure_snapshot()
+        self.assertAlmostEqual(snapshot["ssd_usage_fraction"], 0.5)
+        self.assertFalse(snapshot["over_pressure"])
+        self.assertTrue(controller.ingest(
+            BackendHookEvent(
+                "run", "store-block-b", "req", "prefix-b", ObjectLevel.PREFIX,
+                "block-b", HookAction.CACHE_STORE, "submitted", 1, tier_after="ssd", bytes=2,
+            )
+        ))
+        snapshot = controller._pressure_snapshot()
+        self.assertGreaterEqual(snapshot["ssd_usage_fraction"], 1.0)
+        self.assertTrue(snapshot["over_pressure"])
+
+    def test_global_evict_scan_ranks_cold_victims_and_dispatches(self):
+        binding_a = self._evict_ready_binding(
+            object_key="prefix-a", backend_object_id="block-a", spec_id="spec-scan-a",
+        )
+        binding_b = self._evict_ready_binding(
+            object_key="prefix-b", backend_object_id="block-b", spec_id="spec-scan-b", binding_id="bind-b",
+        )
+        bridge = OnlineBackendBridge(
+            run_id="run",
+            bindings=[binding_a, binding_b],
+            hook_client=object(),
+            hook_url="http://127.0.0.1:7900/actions",
+            gate=gate(),
+        )
+        controller = OnlinePolicyController(
+            run_id="run",
+            workload_id="w",
+            bridge=bridge,
+            config=OnlinePolicyControllerConfig(
+                evict_cpu_capacity_bytes=1,
+                global_evict_scan_min_interval_s=0.0,
+            ),
+        )
+        controller.execution_enabled = True
+        self._ingest_cpu_object(controller, object_key="prefix-a", backend_object_id="block-a", prefetch_waste=True, size=1)
+        self._ingest_cpu_object(controller, object_key="prefix-b", backend_object_id="block-b", prefetch_waste=False, size=1)
+        results = controller.global_evict_scan(now_ns=1_000)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(
+            [item[0].object_key for item in results],
+            ["prefix-a", "prefix-b"],
+        )
+        self.assertTrue(all(item[0].predicted_action == "evict" for item in results))
+        self.assertTrue(all(item[0].metadata["decision_source"] == "global_pressure_scan" for item in results))
+        self.assertGreater(
+            results[0][0].metadata["evict_cold_score"],
+            results[1][0].metadata["evict_cold_score"],
+        )
+        self.assertIn("evict_pressure_snapshot", results[0][0].metadata)
+
+    def test_global_evict_scan_skips_without_pressure(self):
+        binding = self._evict_ready_binding(
+            object_key="prefix", backend_object_id="block-7", spec_id="spec-scan-nopressure",
+        )
+        bridge = OnlineBackendBridge(
+            run_id="run",
+            bindings=[binding],
+            hook_client=object(),
+            hook_url="http://127.0.0.1:7900/actions",
+            gate=gate(),
+        )
+        controller = OnlinePolicyController(run_id="run", workload_id="w", bridge=bridge)
+        controller.execution_enabled = True
+        self._ingest_cpu_object(controller, object_key="prefix", backend_object_id="block-7", prefetch_waste=True, size=1)
+        self.assertEqual(controller.global_evict_scan(now_ns=1_000), [])
+
+    def test_global_evict_scan_is_deterministic(self):
+        binding_a = self._evict_ready_binding(
+            object_key="prefix-a", backend_object_id="block-a", spec_id="spec-scan-det-a",
+        )
+        binding_b = self._evict_ready_binding(
+            object_key="prefix-b", backend_object_id="block-b", spec_id="spec-scan-det-b", binding_id="bind-b",
+        )
+        bridge = OnlineBackendBridge(
+            run_id="run",
+            bindings=[binding_a, binding_b],
+            hook_client=object(),
+            hook_url="http://127.0.0.1:7900/actions",
+            gate=gate(),
+        )
+        controller = OnlinePolicyController(
+            run_id="run",
+            workload_id="w",
+            bridge=bridge,
+            config=OnlinePolicyControllerConfig(
+                evict_cpu_capacity_bytes=1,
+                global_evict_scan_min_interval_s=0.0,
+            ),
+        )
+        controller.execution_enabled = True
+        self._ingest_cpu_object(controller, object_key="prefix-a", backend_object_id="block-a", prefetch_waste=True, size=1)
+        self._ingest_cpu_object(controller, object_key="prefix-b", backend_object_id="block-b", prefetch_waste=False, size=1)
+        first = controller.global_evict_scan(now_ns=1_000)
+        second = controller.global_evict_scan(now_ns=2_000)
+        self.assertEqual(
+            [item[0].object_key for item in first],
+            [item[0].object_key for item in second],
+        )
 
 
 if __name__ == "__main__":

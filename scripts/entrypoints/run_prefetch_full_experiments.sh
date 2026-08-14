@@ -28,6 +28,12 @@ export ASTRAKV_LOCAL_CPU_SIZE_GB="$LOCAL_CPU_SIZE_GB"
 # the hot layer between interleaved visits; the E3 stage keeps the larger
 # CPU==GPU pool above.  Override via env.
 ABLATION_CPU_SIZE_GB="${ASTRAKV_ABLATION_CPU_SIZE_GB:-4.0}"
+# vLLM's own prefix cache must be OFF for the 2x2/transfer stages, exactly like
+# the E3 suite (ASTRAKV_PREFIX_CACHING=false): otherwise vLLM serves every
+# revisit from its GPU block manager (observed GPU KV usage ~1.8%) and neither
+# A nor B is ever needed.  With it off, revisits fall back to LMCache where a
+# promoted/prefetched CPU copy measurably saves a disk read.
+export ASTRAKV_PREFIX_CACHING="${ASTRAKV_PREFIX_CACHING:-false}"
 export ASTRAKV_KV_CORE_CPU_PREFETCH_BUDGET_FRACTION="${ASTRAKV_KV_CORE_CPU_PREFETCH_BUDGET_FRACTION:-1.0}"
 export ASTRAKV_ABLATION_PREFETCH_LEAD_S="${ASTRAKV_ABLATION_PREFETCH_LEAD_S:-1.5}"
 export ASTRAKV_GPU_MEMORY_UTILIZATION="${ASTRAKV_GPU_MEMORY_UTILIZATION:-0.45}"

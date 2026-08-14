@@ -56,6 +56,10 @@ class BuildProfileFromRuntimeEventsTests(unittest.TestCase):
                  "locally_cached_tokens": 0, "lookup_hit_tokens": 0},
                 {"callback": "scheduler_exact_lookup", "request_id": "chatcmpl-req-1",
                  "locally_cached_tokens": 4096, "lookup_hit_tokens": 4096},
+                # vLLM prefix caching OFF: vLLM local miss but LMCache supplied
+                # the prefix -> must count as a cache hit for the profile.
+                {"callback": "scheduler_exact_lookup", "request_id": "chatcmpl-req-2",
+                 "locally_cached_tokens": 0, "lookup_hit_tokens": 2048},
                 {"callback": "scheduler_compute_progress", "request_id": "chatcmpl-req-1"},
             ]
             bindings = [
@@ -93,14 +97,17 @@ class BuildProfileFromRuntimeEventsTests(unittest.TestCase):
         by_type: dict[str, list[dict]] = {}
         for record in records:
             by_type.setdefault(record["event_type"], []).append(record)
-        self.assertEqual(len(by_type.get("cache_lookup", [])), 2)
-        self.assertEqual(len(by_type.get("cache_hit", [])), 1)
+        self.assertEqual(len(by_type.get("cache_lookup", [])), 3)
+        self.assertEqual(len(by_type.get("cache_hit", [])), 2)
         self.assertEqual(len(by_type.get("cache_miss", [])), 1)
         self.assertEqual(len(by_type.get("cache_store", [])), 2)
         self.assertEqual(len(by_type.get("prefetch", [])), 1)
         hit = by_type["cache_hit"][0]
         self.assertEqual(hit["chunk_id"], PREFIX_A)
         self.assertEqual(hit["request_id"], "req-1")
+        hit_b = [r for r in by_type["cache_hit"] if r["request_id"] == "req-2"]
+        self.assertEqual(len(hit_b), 1)
+        self.assertEqual(hit_b[0]["chunk_id"], PREFIX_B)
         store = by_type["cache_store"][0]
         self.assertEqual(store["chunk_id"], PREFIX_A)
         self.assertEqual(store["bytes"], 37748736)

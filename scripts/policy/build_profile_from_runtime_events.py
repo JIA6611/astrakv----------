@@ -159,6 +159,13 @@ def build_events(args: argparse.Namespace) -> list[TraceEvent]:
         chunk_id = canonical.get(logical, "")
         locally_cached = max(0, int(row.get("locally_cached_tokens") or 0))
         lookup_hit = max(0, int(row.get("lookup_hit_tokens") or 0))
+        # ``lookup_hit_tokens`` is the LMCache-external hit AFTER subtracting
+        # vLLM's locally computed tokens (available_hit = hit - local).  With
+        # vLLM prefix caching OFF, revisits have locally_cached=0 but
+        # lookup_hit>0 (LMCache supplied the prefix); with it ON, the opposite
+        # happens.  Either signal means LMCache provided the prefix, so the
+        # profile must count the union as a cache hit.
+        lmcache_hit = locally_cached + lookup_hit
         events.append(_event(
             event_type="cache_lookup",
             category="kv",
@@ -171,20 +178,25 @@ def build_events(args: argparse.Namespace) -> list[TraceEvent]:
             metadata={
                 "locally_cached_tokens": locally_cached,
                 "lookup_hit_tokens": lookup_hit,
+                "lmcache_hit_tokens": lmcache_hit,
                 "physical_object_id": str(row.get("physical_object_id") or ""),
             },
         ))
         if chunk_id:
             events.append(_event(
-                event_type="cache_hit" if locally_cached > 0 else "cache_miss",
+                event_type="cache_hit" if lmcache_hit > 0 else "cache_miss",
                 category="kv",
                 source="scheduler_exact_lookup",
                 status="observed",
                 request_id=logical or runtime_request_id,
                 chunk_id=chunk_id,
-                tier="cpu" if locally_cached > 0 else "ssd",
+                tier="cpu" if lmcache_hit > 0 else "ssd",
                 run_id=run_id,
-                metadata={"locally_cached_tokens": locally_cached},
+                metadata={
+                    "locally_cached_tokens": locally_cached,
+                    "lookup_hit_tokens": lookup_hit,
+                    "lmcache_hit_tokens": lmcache_hit,
+                },
             ))
 
     # Prefetch receipts (metadata.object_key carries the canonical id).

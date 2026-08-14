@@ -32,6 +32,8 @@ REPEATS="3"
 KV_BYTES_PER_TOKEN="1600"
 CPU_FRACTION="0.15"
 SSD_FRACTION="0.45"
+CPU_CAPACITY_BYTES=""
+SSD_CAPACITY_BYTES=""
 PRESSURE_TRIGGER="0.8"
 COLD_SCORE_THRESHOLD="0.35"
 GLOBAL_SCAN_INTERVAL_S="5.0"
@@ -57,6 +59,8 @@ Options:
   --kv-bytes-per-token N      KV bytes per token for footprint estimate (default 1600)
   --cpu-fraction N            CPU tier as footprint fraction (default 0.15)
   --ssd-fraction N            SSD tier as footprint fraction (default 0.45)
+  --cpu-capacity-bytes N      Explicit CPU tier bytes (overrides fraction/floor)
+  --ssd-capacity-bytes N      Explicit SSD tier bytes (overrides fraction/floor)
   --pressure-trigger N        Pressure trigger fraction (default 0.8)
   --cold-score-threshold N    evict coldness score threshold (default 0.35)
   --global-scan-interval-s N  Global evict scan min interval (default 5.0)
@@ -85,6 +89,8 @@ while [[ $# -gt 0 ]]; do
     --kv-bytes-per-token) KV_BYTES_PER_TOKEN="$2"; shift 2 ;;
     --cpu-fraction) CPU_FRACTION="$2"; shift 2 ;;
     --ssd-fraction) SSD_FRACTION="$2"; shift 2 ;;
+    --cpu-capacity-bytes) CPU_CAPACITY_BYTES="$2"; shift 2 ;;
+    --ssd-capacity-bytes) SSD_CAPACITY_BYTES="$2"; shift 2 ;;
     --pressure-trigger) PRESSURE_TRIGGER="$2"; shift 2 ;;
     --cold-score-threshold) COLD_SCORE_THRESHOLD="$2"; shift 2 ;;
     --global-scan-interval-s) GLOBAL_SCAN_INTERVAL_S="$2"; shift 2 ;;
@@ -228,10 +234,18 @@ mkdir -p "$OUTPUT_ROOT"
 for dataset in "${SELECTED_DATASETS[@]}"; do
   canonical="$(materialize_dataset "$dataset")"
   footprint="$(footprint_bytes "$canonical")"
-  # Floor at 128 MiB so the pool can hold several KV chunks (Qwen3-8B chunk
-  # ~36 MiB); a pool smaller than one chunk makes LMCache store 0 chunks.
-  cpu_bytes="$("$PYTHON" -c "print(max(int($footprint * $CPU_FRACTION), 134217728))")"
-  ssd_bytes="$("$PYTHON" -c "print(max(int($footprint * $SSD_FRACTION), 134217728))")"
+  if [[ -n "$CPU_CAPACITY_BYTES" ]]; then
+    cpu_bytes="$CPU_CAPACITY_BYTES"
+  else
+    # Floor at 128 MiB so the pool can hold several KV chunks (Qwen3-8B chunk
+    # ~36 MiB); a pool smaller than one chunk makes LMCache store 0 chunks.
+    cpu_bytes="$("$PYTHON" -c "print(max(int($footprint * $CPU_FRACTION), 134217728))")"
+  fi
+  if [[ -n "$SSD_CAPACITY_BYTES" ]]; then
+    ssd_bytes="$SSD_CAPACITY_BYTES"
+  else
+    ssd_bytes="$("$PYTHON" -c "print(max(int($footprint * $SSD_FRACTION), 134217728))")"
+  fi
   echo "[$dataset] footprint=$footprint cpu_bytes=$cpu_bytes ssd_bytes=$ssd_bytes"
   for rep in $(seq 1 "$REPEATS"); do
     run_arm "arm-evict-b" "true" "$dataset" "$rep" "$cpu_bytes" "$ssd_bytes"

@@ -194,6 +194,48 @@ class OnlineControllerTests(unittest.TestCase):
         )
         self.assertEqual(inert.dispatch(evict).status, "kv_core_off")
 
+    def test_resident_bytes_combine_store_submitted_bytes_and_completed_tier(self):
+        binding = self._evict_ready_binding(
+            object_key="prefix", backend_object_id="block-7", spec_id="spec-resident",
+        )
+        bridge = OnlineBackendBridge(
+            run_id="run",
+            bindings=[binding],
+            hook_client=object(),
+            hook_url="http://127.0.0.1:7900/actions",
+            gate=gate(),
+        )
+        controller = OnlinePolicyController(
+            run_id="run",
+            workload_id="w",
+            bridge=bridge,
+            config=OnlinePolicyControllerConfig(evict_cpu_capacity_bytes=1),
+        )
+        # Legacy hooks: bytes on store submitted, tier on store completed.
+        self.assertTrue(controller.ingest(
+            BackendHookEvent(
+                "run", "store-submitted", "req", "prefix", ObjectLevel.PREFIX, "block-7",
+                HookAction.CACHE_STORE, "submitted", 1, tier_after="unknown", bytes=37748736,
+            )
+        ))
+        self.assertTrue(controller.ingest(
+            BackendHookEvent(
+                "run", "store-completed", "req", "prefix", ObjectLevel.PREFIX, "block-7",
+                HookAction.CACHE_STORE, "completed", 2, tier_after="cpu", bytes=None,
+            )
+        ))
+        self.assertTrue(controller.ingest(
+            BackendHookEvent(
+                "run", "release", "req", "prefix", ObjectLevel.PREFIX, "block-7",
+                HookAction.RELEASE, "completed", 3, tier_before="cpu", tier_after="cpu",
+            )
+        ))
+        snapshot = controller._pressure_snapshot()
+        self.assertGreater(snapshot["cpu_usage_fraction"], 0.8)
+        proposed = controller.propose_for("prefix", ObjectLevel.PREFIX)
+        self.assertEqual(proposed.predicted_action, "evict")
+        self.assertEqual(proposed.target_tier, "cpu")
+
     def test_online_event_stays_advisory_without_runtime_capability_preflight(self):
         binding = BackendObjectBinding("run", "req", "prefix", ObjectLevel.PREFIX, "block-7", "bind")
         class Client:

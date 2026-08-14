@@ -87,7 +87,11 @@ class OnlineProfileStore:
             state["current_tier"] = _prefer_known_tier(event.tier_after, state["current_tier"])
             if event.bytes and event.bytes > 0:
                 tier_after = str(event.tier_after or "")
-                if (
+                if event.action is HookAction.CACHE_STORE and event.status == "submitted":
+                    state["last_store_bytes"] = max(int(state.get("last_store_bytes") or 0), int(event.bytes))
+                    if tier_after in {"cpu", "ssd"}:
+                        state["resident_bytes"] = max(int(state["resident_bytes"] or 0), int(event.bytes))
+                elif (
                     event.action in {
                         HookAction.CACHE_STORE,
                         HookAction.CACHE_LOAD,
@@ -97,6 +101,17 @@ class OnlineProfileStore:
                     and tier_after in {"cpu", "ssd"}
                 ):
                     state["resident_bytes"] = max(int(state["resident_bytes"] or 0), int(event.bytes))
+            # Legacy hooks report the byte size on store *submitted* and the
+            # target tier on store *completed*; combine them so resident bytes
+            # accumulate even though no single event carries both.
+            if (
+                event.action is HookAction.CACHE_STORE
+                and event.status in {"completed", "ok", "executed"}
+                and str(event.tier_after or "") in {"cpu", "ssd"}
+            ):
+                last_store_bytes = int(state.get("last_store_bytes") or 0)
+                if last_store_bytes > 0:
+                    state["resident_bytes"] = max(int(state["resident_bytes"] or 0), last_store_bytes)
             if (
                 event.action in {HookAction.EVICT, HookAction.DROP}
                 and event.status in {"completed", "ok", "executed"}
@@ -433,6 +448,7 @@ def _new_object_state(backend_object_id: str, *, binding_generation: Any) -> dic
         "reuse_count": 0,
         "bytes": 0,
         "resident_bytes": 0,
+        "last_store_bytes": 0,
         "cache_hits": 0,
         "cache_misses": 0,
         "cache_stores": 0,

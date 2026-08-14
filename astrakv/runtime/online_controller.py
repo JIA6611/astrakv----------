@@ -66,6 +66,9 @@ class OnlinePolicyControllerConfig:
     # False so the fail-closed "mode=off means nothing executes" contract is
     # preserved.
     prefetch_dispatch_independent_of_mode: bool = False
+    # Same mode=off bypass for evict decisions, so legacy-hooks runs can
+    # execute evict-B through the action service without KV-Core active mode.
+    evict_dispatch_independent_of_mode: bool = False
     # Offline ProfileDB workload id for cross-run profile lookups.  The
     # controller's own workload_id is the live run id, but a train-phase
     # profile is keyed by its own workload id (e.g. "train-qasper"); without
@@ -653,16 +656,21 @@ class OnlinePolicyController:
                 and self.config.enable_prefetch_dispatch
                 and self.config.online_prefetch_mode != "disabled"
             )
-            if not prefetch_independent_channel:
+            evict_independent_channel = (
+                self.config.evict_dispatch_independent_of_mode
+                and decision.predicted_action == "evict"
+                and self.config.evict_dispatch_enabled
+            )
+            if not (prefetch_independent_channel or evict_independent_channel):
                 result = RuntimeActionResult("kv_core_off", "KV-Core mode is off; no runtime command was issued")
                 self.profile_store.record_dispatch(
                     decision, result, execution_enabled=False, breaker_state=_breaker_snapshot(breaker),
                 )
                 self.profile_store.checkpoint()
                 return result
-            # Prefetch-only channel: fall through so the prefetch dispatch
-            # gates (execution_enabled, live revalidation, per-action config)
-            # decide; non-prefetch actions never reach here.
+            # Independent channel: fall through so the dispatch gates
+            # (execution_enabled, live revalidation, per-action config) decide;
+            # non-prefetch/evict actions never reach here.
         if self.config.kv_core_mode is RuntimeMode.SHADOW:
             result = RuntimeActionResult("shadow_only", "KV-Core shadow mode recorded the decision without runtime execution")
             self.profile_store.record_dispatch(

@@ -181,6 +181,9 @@ def install_from_environment(
                 evict_periodic_scan_interval_s=float(
                     os.environ.get("ASTRAKV_EVICT_PERIODIC_SCAN_INTERVAL_S", "1.0")
                 ),
+                evict_dispatch_independent_of_mode=(
+                    os.environ.get("ASTRAKV_EVICT_DISPATCH_INDEPENDENT_OF_MODE", "false") == "true"
+                ),
                 kv_core_mode=mode,
             ))
         except (KeyError, ValueError) as exc:

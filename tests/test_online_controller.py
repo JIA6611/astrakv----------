@@ -139,6 +139,61 @@ class OnlineControllerTests(unittest.TestCase):
         )
         self.assertEqual(inert.dispatch(prefetch).status, "kv_core_off")
 
+    def test_evict_dispatch_independent_of_mode_only_unlocks_evict(self):
+        bridge = OnlineBackendBridge(
+            run_id="run",
+            bindings=[],
+            hook_client=object(),
+            hook_url="http://127.0.0.1:7900/actions",
+            gate=gate(),
+        )
+        evict = OfflineEvictionDecision(
+            run_id="run",
+            decision_id="decision-independent-evict",
+            request_id="req",
+            object_key="prefix",
+            object_level=ObjectLevel.PREFIX,
+            predicted_action="evict",
+        )
+        keep = replace(evict, decision_id="decision-independent-keep", predicted_action="keep")
+
+        # Fail-closed default: mode=off blocks evict.
+        closed = OnlinePolicyController(
+            run_id="run",
+            workload_id="w",
+            bridge=bridge,
+            config=OnlinePolicyControllerConfig(kv_core_mode=RuntimeMode.OFF),
+        )
+        self.assertEqual(closed.dispatch(evict).status, "kv_core_off")
+        self.assertEqual(closed.dispatch(keep).status, "kv_core_off")
+
+        # Independent channel: evict bypasses the mode=off gate (hits the
+        # execution_enabled gate -> advisory_only), non-evict stays gated.
+        independent = OnlinePolicyController(
+            run_id="run",
+            workload_id="w",
+            bridge=bridge,
+            config=OnlinePolicyControllerConfig(
+                kv_core_mode=RuntimeMode.OFF,
+                evict_dispatch_independent_of_mode=True,
+            ),
+        )
+        self.assertEqual(independent.dispatch(evict).status, "advisory_only")
+        self.assertEqual(independent.dispatch(keep).status, "kv_core_off")
+
+        # Inert when evict execution itself is disabled.
+        inert = OnlinePolicyController(
+            run_id="run",
+            workload_id="w",
+            bridge=bridge,
+            config=OnlinePolicyControllerConfig(
+                kv_core_mode=RuntimeMode.OFF,
+                evict_dispatch_independent_of_mode=True,
+                evict_dispatch_enabled=False,
+            ),
+        )
+        self.assertEqual(inert.dispatch(evict).status, "kv_core_off")
+
     def test_online_event_stays_advisory_without_runtime_capability_preflight(self):
         binding = BackendObjectBinding("run", "req", "prefix", ObjectLevel.PREFIX, "block-7", "bind")
         class Client:

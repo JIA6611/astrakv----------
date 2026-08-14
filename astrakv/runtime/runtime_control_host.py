@@ -89,6 +89,7 @@ class RuntimeControlHostConfig:
     global_evict_scan_max_victims: int = 4
     evict_periodic_scan_enabled: bool = False
     evict_periodic_scan_interval_s: float = 1.0
+    evict_dispatch_independent_of_mode: bool = False
     kv_core_mode: RuntimeMode = RuntimeMode.OFF
 
     def __post_init__(self) -> None:
@@ -486,6 +487,7 @@ class RuntimeControlHost:
                 global_evict_scan_max_victims=self.config.global_evict_scan_max_victims,
                 kv_core_mode=self.config.kv_core_mode,
                 prefetch_dispatch_independent_of_mode=self.config.prefetch_dispatch_independent_of_mode,
+                evict_dispatch_independent_of_mode=self.config.evict_dispatch_independent_of_mode,
                 offline_profile_workload_id=self.config.offline_profile_workload_id,
             ),
             prediction_source=prediction_source,

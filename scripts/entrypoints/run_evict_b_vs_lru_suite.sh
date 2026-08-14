@@ -182,6 +182,7 @@ run_arm() {
     scope_env+=(
       "ASTRAKV_RUNTIME_CONTROL_PROCESS_SCOPE=engine_child"
       "PYTHONPATH=$ROOT/scripts/runtime${PYTHONPATH:+:$PYTHONPATH}"
+      "ASTRAKV_EVICT_DISPATCH_INDEPENDENT_OF_MODE=true"
     )
   fi
   local -a periodic_env=()

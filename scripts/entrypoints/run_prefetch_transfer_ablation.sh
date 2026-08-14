@@ -36,6 +36,7 @@ LIMIT="50"
 TRAIN_TRACE=""
 SIDECAR_PATH=""
 PREFETCH_MODE="prefix_only"
+PATCH_VERIFICATION="${ASTRAKV_KV_CORE_PATCH_VERIFICATION:-}"
 
 usage() {
   cat <<'EOF'
@@ -60,6 +61,7 @@ Options:
   --train-trace FILE         Unified astra-trace-v1 JSONL from a real run on A;
                              builds the offline profile DB.
   --sidecar-path FILE        Optional train-derived exact-next sidecar (upper bound).
+  --patch-verification PATH  connector_patch_verification.json for active (A-on) servers.
   --prefetch-mode MODE       Online prefetch mode for the test phase:
                              prefix_only (default, Profile-B via hints/profile),
                              hybrid (adds online RuntimePrefixIndex adaptation),
@@ -79,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     --limit) LIMIT="$2"; shift 2 ;;
     --train-trace) TRAIN_TRACE="$2"; shift 2 ;;
     --sidecar-path) SIDECAR_PATH="$2"; shift 2 ;;
+    --patch-verification) PATCH_VERIFICATION="$2"; shift 2 ;;
     --prefetch-mode) PREFETCH_MODE="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -100,6 +103,10 @@ case "$PREFETCH_MODE" in
 esac
 if [[ -n "$TRAIN_TRACE" ]]; then
   [[ -f "$TRAIN_TRACE" ]] || { echo "train trace is not a file: $TRAIN_TRACE" >&2; exit 2; }
+fi
+
+if [[ -n "$PATCH_VERIFICATION" ]]; then
+  export ASTRAKV_KV_CORE_PATCH_VERIFICATION="$PATCH_VERIFICATION"
 fi
 
 mkdir -p "$OUTPUT_ROOT"

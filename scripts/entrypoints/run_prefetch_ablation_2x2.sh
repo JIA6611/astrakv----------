@@ -25,6 +25,7 @@ OUTPUT_ROOT="${ASTRAKV_ROOT:-$ROOT}/results/prefetch-ablation-2x2-$TIMESTAMP"
 LIMIT="50"
 SKIP_VALIDATE="false"
 DATASETS="qasper,multifieldqa_en"
+PATCH_VERIFICATION="${ASTRAKV_KV_CORE_PATCH_VERIFICATION:-}"
 
 usage() {
   cat <<'EOF'
@@ -37,6 +38,7 @@ Options:
   --output-root PATH   Root for the two ablation runs (default results/...).
   --limit N            Per-dataset request limit for both runs (default 50).
   --datasets LIST      Comma-separated datasets (default qasper,multifieldqa_en).
+  --patch-verification PATH  connector_patch_verification.json for active (A-on) servers.
   --skip-validate      Skip the final 4-cell aggregation step.
 EOF
 }
@@ -48,6 +50,7 @@ while [[ $# -gt 0 ]]; do
     --output-root) OUTPUT_ROOT="$2"; shift 2 ;;
     --limit) LIMIT="$2"; shift 2 ;;
     --datasets) DATASETS="$2"; shift 2 ;;
+    --patch-verification) PATCH_VERIFICATION="$2"; shift 2 ;;
     --skip-validate) SKIP_VALIDATE="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -65,6 +68,10 @@ for dataset in "${SELECTED_DATASETS[@]}"; do
     exit 2
   }
 done
+
+if [[ -n "$PATCH_VERIFICATION" ]]; then
+  export ASTRAKV_KV_CORE_PATCH_VERIFICATION="$PATCH_VERIFICATION"
+fi
 
 AOFF_DIR="$OUTPUT_ROOT/a-off"
 AON_DIR="$OUTPUT_ROOT/a-on"

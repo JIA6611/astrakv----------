@@ -89,6 +89,7 @@ from pathlib import Path
 root = Path.cwd()
 paths = [
     root / "astrakv/runtime/vendor_callback_bridge.py",
+    root / "astrakv/runtime/lmcache047_runtime_patch.py",
     root / "scripts/benchmark/run_real_benchmark.py",
     root / "scripts/benchmark/materialize_kv_equivalence_workload.py",
     root / "scripts/reporting/validate_kv_equivalence.py",

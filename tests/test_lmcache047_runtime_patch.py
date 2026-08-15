@@ -715,6 +715,98 @@ class LMCache047RuntimePatchTests(unittest.TestCase):
 
         self.assertEqual(result, (False, None))
 
+    def test_scheduler_without_engine_still_finalizes_vendor_bridge(self):
+        records = []
+        registry = BackendBindingRegistry(
+            run_id="run", engine_instance_id="engine", worker_id="worker",
+        )
+        authority = RuntimeRequestContextAuthority.install(
+            run_id="run", session_id="session", secret=b"f" * 32, ttl_s=60,
+        )
+        receiver = RuntimeRequestContextReceiver(
+            "http://127.0.0.1:9988/request-context", authority,
+        )
+        consumer = LMCache047RequestContextConsumer(receiver)
+
+        class Bridge:
+            def __init__(self):
+                self.finished = []
+
+            def request_finished(self, **kwargs):
+                self.finished.append(kwargs)
+
+        bridge = Bridge()
+
+        class Connector:
+            def __init__(self):
+                # This is the normal LMCache 0.4.7 scheduler-role shape, not
+                # proof that the connector is being torn down.
+                self.lmcache_engine = None
+                self._astrakv_bridge = bridge
+                self._parent = None
+
+            def save_kv_layer(self, *args, **kwargs):
+                return None
+
+            def wait_for_save(self, *args, **kwargs):
+                return None
+
+            def start_load_kv(self, request):
+                return request
+
+            def wait_for_layer_load(self, request):
+                return request
+
+            def request_finished(self, request, block_ids):
+                raise AssertionError("scheduler role must use the safe branch")
+
+            def get_finished(self, finished_req_ids):
+                return None, None
+
+            def get_num_new_matched_tokens(self, request):
+                return 0
+
+            def update_state_after_alloc(self, request, num_computed_tokens=0):
+                return request
+
+        class Factory:
+            def get_or_create_lmcache_engine(self):
+                return object()
+
+        install_lmcache047_hooks(
+            records.append,
+            factory_cls=Factory,
+            connector_cls=Connector,
+            versions={"vllm": "0.23.0", "lmcache": "0.4.7"},
+            binding_registry=registry,
+            request_context_consumer=consumer,
+        )
+
+        connector = Connector()
+        request = type(
+            "ReqMeta",
+            (),
+            {
+                "request_id": "reqmeta-scheduler",
+                "status": "FINISHED_LENGTH_CAPPED",
+                "num_computed_tokens": 4337,
+                "num_tokens": 4338,
+            },
+        )()
+
+        result = connector.request_finished(request, [])
+
+        self.assertEqual(result, (False, None))
+        self.assertEqual(
+            bridge.finished,
+            [{
+                "request_id": "reqmeta-scheduler",
+                "finish_status": "FINISHED_LENGTH_CAPPED",
+                "num_computed_tokens": 4337,
+                "num_tokens": 4338,
+            }],
+        )
+
     def test_connector_load_lifecycle_registers_dynamic_load_target_and_emits_ready_signal(self):
         records = []
         registry = BackendBindingRegistry(run_id="run", engine_instance_id="engine", worker_id="worker")

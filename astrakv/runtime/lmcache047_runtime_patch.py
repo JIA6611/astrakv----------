@@ -2835,6 +2835,44 @@ def _patch_connector_lifecycle(connector_cls: type[Any], lifecycle: _ConnectorLi
         metadata = getter()
         return tuple(str(getattr(request, "req_id", "") or "") for request in getattr(metadata, "requests", ()) if getattr(request, "req_id", None))
 
+    def finalize_vendor_bridge_without_engine(
+        connector: Any, request: Any,
+    ) -> None:
+        """Close KV-Core accounting for the normal scheduler-only role.
+
+        LMCache 0.4.7 keeps ``lmcache_engine`` only on the worker-side adapter;
+        the scheduler-side adapter legitimately exposes ``None`` throughout
+        its lifetime.  Treating every ``None`` as worker teardown skips the
+        version-locked vendor ``request_finished`` callback and leaves all
+        request accounting provisional.  Call the already-installed bridge
+        directly in this role; the worker path still delegates to the original
+        adapter method and therefore cannot double-finalize a request.
+        """
+        bridge = getattr(connector, "_astrakv_bridge", None)
+        if bridge is None:
+            return
+        request_id = str(
+            getattr(request, "request_id", "")
+            or getattr(request, "req_id", "")
+        )
+        if not request_id:
+            return
+        bridge.request_finished(
+            request_id=request_id,
+            finish_status=str(getattr(request, "status", "")),
+            num_computed_tokens=int(
+                getattr(request, "num_computed_tokens", 0) or 0
+            ),
+            num_tokens=int(
+                getattr(
+                    request,
+                    "num_tokens",
+                    len(getattr(request, "all_token_ids", ())),
+                )
+                or 0
+            ),
+        )
+
     def note_dynamic_load(
         connector: Any,
         args: tuple[Any, ...],
@@ -2888,6 +2926,7 @@ def _patch_connector_lifecycle(connector_cls: type[Any], lifecycle: _ConnectorLi
     def request_finished_wrapper(connector: Any, request: Any, block_ids: Any) -> Any:
         reqmeta_id = str(getattr(request, "request_id", "") or getattr(request, "req_id", ""))
         if getattr(connector, "lmcache_engine", None) is None:
+            finalize_vendor_bridge_without_engine(connector, request)
             if reqmeta_id:
                 lifecycle.release_after_unpin(
                     reqmeta_id, source="lmcache_connector_request_finished_teardown_safe"

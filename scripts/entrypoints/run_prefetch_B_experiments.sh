@@ -24,10 +24,14 @@ PYTHON="${ASTRAKV_PYTHON:-/home/zyx/venv_for_zyx/bin/python3}"
 MODEL="${ASTRAKV_MODEL:-/home/zyx/astrakv2/models/Qwen3-8B}"
 GROUPED_ROOT="${ASTRAKV_GROUPED_ROOT:-/home/zyx/astrakv-W/results/dgx_prefetch_validation_bundle/workloads}"
 OUT_ROOT="${ASTRAKV_B_OUT_ROOT:-/home/zyx/astrakv-W/results/prefetch-B-$(date -u +%Y%m%dT%H%M%SZ)}"
-LIMIT="${ASTRAKV_B_LIMIT:-50}"
+# fire-consume emits a bounded measured set after scheduling all eligible
+# groups; do not truncate the final near pair when the filler count changes.
+LIMIT="${ASTRAKV_B_LIMIT:-0}"
+# Keep one prefetched object resident while making the first/filler set large
+# enough to evict the target objects before the measured far requests.
 CPU_GB="${ASTRAKV_B_CPU_GB:-4.0}"
-LEAD="${ASTRAKV_B_LEAD_S:-3.0}"
-EVICTION_FILL="${ASTRAKV_B_EVICTION_FILL_GROUPS:-16}"
+LEAD="${ASTRAKV_B_LEAD_S:-5.0}"
+EVICTION_FILL="${ASTRAKV_B_EVICTION_FILL_GROUPS:-32}"
 RUN_SIDECAR="${ASTRAKV_B_RUN_SIDECAR:-1}"
 RUN_PROFILE="${ASTRAKV_B_RUN_PROFILE:-1}"
 export ASTRAKV_PYTHON="$PYTHON"
@@ -55,6 +59,10 @@ COMMON_ENV=(
   ASTRAKV_LOCAL_CPU_SIZE_GB="$CPU_GB"
   ASTRAKV_ABLATION_PREFETCH_LEAD_S="$LEAD"
   ASTRAKV_KV_CORE_CPU_PREFETCH_BUDGET_FRACTION=1.0
+  # Give SSD->CPU promotion enough time for the largest qasper prefix while
+  # keeping the TTL finite and the near request inside the same window.
+  ASTRAKV_KV_CORE_PREFETCH_DEADLINE_NS=15000000000
+  ASTRAKV_KV_CORE_PREFETCH_TTL_NS=60000000000
 )
 
 echo "=================================================="
@@ -85,10 +93,11 @@ echo "=================================================="
 echo ">>> Exp 3/3: B-profile (train trace -> ProfileDB, no test sidecar)"
 echo "=================================================="
 if [[ "$RUN_PROFILE" == "1" ]]; then
-  # NOTE: the profile is built from a real run over the SAME qasper object set
-  # (an interleaved warm-up with Prefetch-B active).  The test phase replays
-  # the same interleaved workload with the offline ProfileDB + hints and no
-  # test-set sidecar, so B's decisions come from the profile path.
+  # NOTE: the profile is built from a real measured run over the SAME qasper
+  # object set.  Its SSD is seeded by an independent LMCache-only warmup, then
+  # the measured far->near phase runs with Prefetch-B active.  The test phase
+  # replays that workload with the offline ProfileDB + hints and no test-set
+  # sidecar, so B's decisions come from the profile path.
   echo "--- [3a] train trace run (full qasper, Prefetch-B active, prefix caching off) ---"
   env "${COMMON_ENV[@]}" \
     bash scripts/entrypoints/run_grouped_exact_next_prefetch_ablation.sh \
@@ -127,6 +136,27 @@ if [[ "$RUN_PROFILE" == "1" ]]; then
       --output-dir "$OUT_ROOT/profile-test"
 else
   echo ">>> B-profile skipped (ASTRAKV_B_RUN_PROFILE=0)"
+fi
+
+summarize_near_ttft() {
+  local experiment_root="$1"
+  local baseline="$experiment_root/qasper/baseline/request_results.jsonl"
+  local variant="$experiment_root/qasper/variant/request_results.jsonl"
+  local output="$experiment_root/qasper/near_ttft_summary.json"
+  if [[ -f "$baseline" && -f "$variant" ]]; then
+    "$PYTHON" scripts/reporting/summarize_prefetch_phase_ttft.py \
+      --baseline "$baseline" \
+      --variant "$variant" \
+      --phase near \
+      --output "$output"
+  fi
+}
+
+if [[ "$RUN_SIDECAR" == "1" ]]; then
+  summarize_near_ttft "$OUT_ROOT/sidecar"
+fi
+if [[ "$RUN_PROFILE" == "1" ]]; then
+  summarize_near_ttft "$OUT_ROOT/profile-test"
 fi
 
 echo

@@ -118,7 +118,23 @@ wait_for_endpoint() {
 
 start_server() {
   local run_id="$1" state_dir="$2" runtime_env="$3" cache_dir="$4" log_path="$5"
+  local hooks_enabled="${6:-true}"
+  local launch_run_id="$run_id"
+  local online_policy="true"
+  local prefetch_dispatch="${ASTRAKV_ENABLE_ONLINE_PREFETCH_DISPATCH:-true}"
+  local kv_core_mode="${ASTRAKV_KV_CORE_MODE:-off}"
+  local vendor_patch="${ASTRAKV_KV_CORE_VENDOR_PATCH:-true}"
+  if [[ "$hooks_enabled" != "true" ]]; then
+    # Warmup must populate only LMCache's SSD store.  In particular, do not
+    # let a stale vendor-patch flag reinstall AstraKV when hooks are disabled.
+    launch_run_id=""
+    online_policy="false"
+    prefetch_dispatch="false"
+    kv_core_mode="off"
+    vendor_patch="false"
+  fi
   cleanup
+  mkdir -p "$state_dir"
   mkdir -p "$cache_dir"
   # CPU==GPU on UMA: force the CPU hot cache on and size it equal to the GPU
   # KV tier (default 5.0 GiB standalone; the full pipeline sets it to 71 GiB).
@@ -127,10 +143,12 @@ start_server() {
       -e "s|^max_local_disk_size:.*|max_local_disk_size: ${ASTRAKV_LOCAL_DISK_SIZE_GB:-80.0}|" \
       -e "s|^local_disk:.*|local_disk: $cache_dir|" \
       configs/lmcache_disk_example.yaml > "$state_dir/lmcache.yaml"
-  set -a
-  # shellcheck disable=SC1090
-  source "$runtime_env"
-  set +a
+  if [[ "$hooks_enabled" == "true" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$runtime_env"
+    set +a
+  fi
   ASTRAKV_MODEL="$MODEL" \
   ASTRAKV_PYTHON="$PYTHON" \
   ASTRAKV_HOST="$HOST" \
@@ -138,12 +156,25 @@ start_server() {
   ASTRAKV_MAX_MODEL_LEN="$MAX_MODEL_LEN" \
   ASTRAKV_GPU_MEMORY_UTILIZATION="$GPU_MEMORY_UTILIZATION" \
   ASTRAKV_PREFIX_CACHING="${ASTRAKV_PREFIX_CACHING:-true}" \
-  ASTRAKV_ENABLE_LMCACHE047_HOOKS=true \
+  ASTRAKV_ENABLE_LMCACHE047_HOOKS="$hooks_enabled" \
+  ASTRAKV_KV_CORE_VENDOR_PATCH="$vendor_patch" \
   ASTRAKV_LMCACHE047_EVENTS="$state_dir/hook_raw.jsonl" \
-  ASTRAKV_RUNTIME_CONTROL_RUN_ID="$run_id" \
+  ASTRAKV_RUNTIME_CONTROL_RUN_ID="$launch_run_id" \
   ASTRAKV_RUNTIME_CONTROL_STATE_DIR="$state_dir" \
+  ASTRAKV_RUNTIME_CONTROL_SECRET_HEX="${ASTRAKV_RUNTIME_CONTROL_SECRET_HEX:-}" \
+  ASTRAKV_RUNTIME_CONTROL_SESSION_ID="${ASTRAKV_RUNTIME_CONTROL_SESSION_ID:-}" \
+  ASTRAKV_RUNTIME_CONTROL_ENGINE_ID="${ASTRAKV_RUNTIME_CONTROL_ENGINE_ID:-}" \
+  ASTRAKV_RUNTIME_CONTROL_WORKER_ID="${ASTRAKV_RUNTIME_CONTROL_WORKER_ID:-}" \
   ASTRAKV_RUNTIME_CONTROL_CONTEXT_PORT="$CONTEXT_PORT" \
-  ASTRAKV_REQUIRE_EXACT_TOKEN_IDS=true \
+  ASTRAKV_ENABLE_ONLINE_POLICY="$online_policy" \
+  ASTRAKV_ENABLE_ONLINE_POLICY_RELEASE_DISPATCH="$([[ "$hooks_enabled" == "true" ]] && echo "${ASTRAKV_ENABLE_ONLINE_POLICY_RELEASE_DISPATCH:-true}" || echo false)" \
+  ASTRAKV_ENABLE_ONLINE_PREFETCH_DISPATCH="$prefetch_dispatch" \
+  ASTRAKV_ONLINE_PROFILE_DB_PATH="${ASTRAKV_ONLINE_PROFILE_DB_PATH:-}" \
+  ASTRAKV_ONLINE_SCHEDULER_HINTS_PATH="${ASTRAKV_ONLINE_SCHEDULER_HINTS_PATH:-}" \
+  ASTRAKV_ONLINE_PREDICTION_SIDECAR_PATH="${ASTRAKV_ONLINE_PREDICTION_SIDECAR_PATH:-}" \
+  ASTRAKV_ONLINE_OFFLINE_GATE_PATH="${ASTRAKV_ONLINE_OFFLINE_GATE_PATH:-}" \
+  ASTRAKV_KV_CORE_MODE="$kv_core_mode" \
+  ASTRAKV_REQUIRE_EXACT_TOKEN_IDS="$([[ "$hooks_enabled" == "true" ]] && echo true || echo false)" \
   LMCACHE_CONFIG_FILE="$state_dir/lmcache.yaml" \
   ASTRAKV_KV_TRANSFER_CONFIG='{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}' \
   VLLM_ENGINE_READY_TIMEOUT_S=1200 \
@@ -227,6 +258,28 @@ if not measured:
     raise SystemExit(f"no measured rows matched phases={sorted(phases)}")
 if not warmup:
     raise SystemExit("phase-filtered workload has no warmup rows")
+if {"far", "near"}.issubset(phases):
+    def pair_ids(rows):
+        return {
+            str((row.get("metadata") or {}).get("prefetch_pair_id") or "")
+            for row in rows
+            if str((row.get("metadata") or {}).get("prefetch_pair_id") or "")
+        }
+    far_ids = pair_ids(
+        row for row in measured
+        if str((row.get("metadata") or {}).get("prefetch_phase") or "") == "far"
+    )
+    near_ids = pair_ids(
+        row for row in measured
+        if str((row.get("metadata") or {}).get("prefetch_phase") or "") == "near"
+    )
+    if far_ids != near_ids:
+        raise SystemExit(
+            "fire-consume phase pairing is incomplete: "
+            f"far={len(far_ids)} near={len(near_ids)} "
+            f"missing_near={sorted(far_ids - near_ids)} "
+            f"missing_far={sorted(near_ids - far_ids)}"
+        )
 for path, rows in ((measured_path, measured), (warmup_path, warmup)):
     with open(path, "w", encoding="utf-8") as handle:
         for row in rows:
@@ -306,11 +359,6 @@ PY
     fi
   fi
   write_runtime_env "$run_id" "$state_dir" "$runtime_env" "$secret" "$role" "$sidecar_path"
-  start_server "$run_id" "$state_dir" "$runtime_env" "$cache_dir" "$server_log"
-  set -a
-  # shellcheck disable=SC1090
-  source "$runtime_env"
-  set +a
   if [[ "$WARMUP_PASSES" =~ ^[0-9]+$ && "$WARMUP_PASSES" -gt 0 ]]; then
     local warmup_file="$OUTPUT_DIR/$dataset/materialized/${dataset}_grouped_exact_next_warmup.jsonl"
     if [[ ! -f "$warmup_file" ]]; then
@@ -329,8 +377,14 @@ with open(target, "w", encoding="utf-8") as handle:
 print(f"warmup workload written to {target} ({len(rows)} rows)")
 PY
     fi
+    local warmup_state_dir="$state_dir/warmup-state"
+    local warmup_server_log="$OUTPUT_DIR/$dataset/${role}-warmup-server.log"
+    # Warmup writes the same LMCache SSD directory, then the process is
+    # stopped before the formal run.  This makes CPU/GPU residency cold while
+    # preserving the disk objects needed by the measured far requests.
+    start_server "" "$warmup_state_dir" "" "$cache_dir" "$warmup_server_log" false
     for pass_index in $(seq 1 "$WARMUP_PASSES"); do
-      echo "[$dataset/$role] warmup pass $pass_index/$WARMUP_PASSES (same server/cache)"
+      echo "[$dataset/$role] warmup pass $pass_index/$WARMUP_PASSES (independent LMCache-only server)"
       "$PYTHON" scripts/benchmark/run_real_benchmark.py \
         --base-url "http://${HOST}:${PORT}/v1" \
         --model "$MODEL" \
@@ -353,7 +407,13 @@ PY
         --timeout "$TIMEOUT" \
         --output-tokens 128
     done
+    cleanup
   fi
+  start_server "$run_id" "$state_dir" "$runtime_env" "$cache_dir" "$server_log"
+  set -a
+  # shellcheck disable=SC1090
+  source "$runtime_env"
+  set +a
   "$PYTHON" scripts/benchmark/run_real_benchmark.py \
     --base-url "http://${HOST}:${PORT}/v1" \
     --model "$MODEL" \

@@ -116,6 +116,28 @@ wait_for_endpoint() {
   return 1
 }
 
+pick_free_port() {
+  "$PYTHON" - <<'PY'
+import socket
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+}
+
+wait_for_runtime_capabilities() {
+  local state_dir="$1" log_path="$2"
+  for _ in $(seq 1 180); do
+    if [[ -s "$state_dir/backend_capabilities.json" || -s "$state_dir/preflight.json" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "runtime control host did not publish capabilities under: $state_dir" >&2
+  tail -n 160 "$log_path" >&2 || true
+  return 1
+}
+
 start_server() {
   local run_id="$1" state_dir="$2" runtime_env="$3" cache_dir="$4" log_path="$5"
   local hooks_enabled="${6:-true}"
@@ -134,6 +156,17 @@ start_server() {
     vendor_patch="false"
   fi
   cleanup
+  # Never reuse a possibly orphaned vLLM or RuntimeControlHost port from a
+  # prior interrupted arm.  The benchmark URLs use these globals after this
+  # function returns, so each warmup/formal server gets its own endpoints.
+  PORT="$(pick_free_port)"
+  if [[ "$hooks_enabled" == "true" ]]; then
+    CONTEXT_PORT="$(pick_free_port)"
+    while [[ "$CONTEXT_PORT" == "$PORT" ]]; do
+      CONTEXT_PORT="$(pick_free_port)"
+    done
+  fi
+  echo "starting ${hooks_enabled} server: port=$PORT context_port=$CONTEXT_PORT state=$state_dir" >&2
   mkdir -p "$state_dir"
   mkdir -p "$cache_dir"
   # CPU==GPU on UMA: force the CPU hot cache on and size it equal to the GPU
@@ -181,6 +214,9 @@ start_server() {
   setsid nohup bash scripts/launch/launch_lmcache_vllm.sh disk > "$log_path" 2>&1 < /dev/null &
   SERVER_PID="$!"
   wait_for_endpoint "$log_path"
+  if [[ "$hooks_enabled" == "true" ]]; then
+    wait_for_runtime_capabilities "$state_dir" "$log_path"
+  fi
 }
 
 write_runtime_env() {

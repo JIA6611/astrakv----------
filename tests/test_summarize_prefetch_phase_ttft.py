@@ -47,6 +47,8 @@ class SummarizePrefetchPhaseTTFTTests(unittest.TestCase):
             self.assertEqual(record["paired_count"], 2)
             self.assertEqual(record["variant_wins"], 2)
             self.assertLess(record["p50_delta_percent"], 0.0)
+            self.assertLess(record["p95_delta_percent"], 0.0)
+            self.assertLess(record["p95_delta_bootstrap_ci_percent"][1], 0.0)
             self.assertEqual(record["baseline_request_count"], 2)
 
 

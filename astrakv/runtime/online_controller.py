@@ -865,6 +865,8 @@ class OnlinePolicyController:
             binding = self.bridge.binding_for(object_level, object_key, request_id=request_id)
             if binding is None:
                 continue
+            if self.bridge.has_active_prefetch(binding.object_key):
+                continue
             execution_actions = {} if binding.execution_spec is None else dict(binding.execution_spec.actions)
             if not _action_ready(execution_actions, "evict"):
                 continue
@@ -1689,6 +1691,8 @@ def _live_dispatch_skip_reason(controller: OnlinePolicyController, decision: Off
     snapshot = controller.bridge.binding_snapshot(binding.binding_id)
     if snapshot is None:
         return "binding_snapshot_unavailable"
+    if controller.bridge.has_active_prefetch(decision.object_key):
+        return "prefetch_in_flight_conflict"
     if snapshot.get("active_request_ids"):
         return "active_binding_conflict"
     if snapshot.get("pending_io") or snapshot.get("pending_operations") or snapshot.get("action_reservation"):

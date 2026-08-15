@@ -98,12 +98,13 @@ def paired_summary(
         "variant_wins": wins,
         "variant_win_rate": (wins / len(pairs)) if pairs else None,
         "paired_request_ids": [request_id for request_id in common_ids if request_id not in missing_pair_id],
-        "p50_delta_bootstrap_ci_percent": bootstrap_p50_ci(pairs),
+        "p50_delta_bootstrap_ci_percent": bootstrap_percentile_ci(pairs, 0.50),
+        "p95_delta_bootstrap_ci_percent": bootstrap_percentile_ci(pairs, 0.95),
     }
 
 
-def bootstrap_p50_ci(
-    pairs: list[tuple[float, float]], *, samples: int = 2000,
+def bootstrap_percentile_ci(
+    pairs: list[tuple[float, float]], quantile: float, *, samples: int = 2000,
 ) -> list[float | None]:
     if not pairs:
         return [None, None]
@@ -111,8 +112,8 @@ def bootstrap_p50_ci(
     deltas: list[float] = []
     for _ in range(samples):
         sampled = [pairs[rng.randrange(len(pairs))] for _ in pairs]
-        left = percentile((pair[0] for pair in sampled), 0.50)
-        right = percentile((pair[1] for pair in sampled), 0.50)
+        left = percentile((pair[0] for pair in sampled), quantile)
+        right = percentile((pair[1] for pair in sampled), quantile)
         if left is not None and right is not None and left > 0.0:
             deltas.append((right - left) / left * 100.0)
     return [percentile(deltas, 0.025), percentile(deltas, 0.975)]

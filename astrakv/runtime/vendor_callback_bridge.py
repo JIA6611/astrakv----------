@@ -99,6 +99,7 @@ class VendorCallbackBridge:
         self._keys_by_request: dict[str, tuple[Any, ...]] = {}
         self._prefetch_by_request: dict[str, str] = {}
         self._ingress_started_ns: dict[str, int] = {}
+        self._ingress_object_key: dict[str, str] = {}
         # Test-only per-request decision overrides (memory pressure, deadline,
         # IO bandwidth, forced recompute) published through the authenticated
         # request context.  Populated only when the equivalence test gate is
@@ -114,6 +115,7 @@ class VendorCallbackBridge:
         self._consumed_prefetch_seen: set[str] = set()
         self._association_receipts: dict[str, Any] = {}
         self._prefetch_keys: dict[str, tuple[Any, ...]] = {}
+        self._prefetch_lease_by_id: dict[str, str] = {}
         self._prefetch_futures: dict[str, Any] = {}
         self._prefetch_watcher: threading.Thread | None = None
         # Cold external-copy reaper state, keyed by physical object id.  The
@@ -177,6 +179,12 @@ class VendorCallbackBridge:
         """Accept an authenticated exact-token intent before HTTP submission."""
         request_id = str(getattr(context, "request_id", "") or "")
         metadata = dict(getattr(context, "metadata", {}) or {})
+        object_key = str(
+            metadata.get("object_key")
+            or metadata.get("cache_key")
+            or request_id
+        )
+        self._ingress_object_key[request_id] = object_key
         try:
             tokens = tuple(int(token) for token in metadata.get("exact_token_ids", ()))
         except (TypeError, ValueError):
@@ -1136,6 +1144,23 @@ class VendorCallbackBridge:
             compatibility_identity=physical.compatibility_key.identity,
         )
         reason: str | None = None
+        prefetch_lease: str | None = None
+        if callbacks.tickets.has_open_for_physical(
+            physical.physical_object_id, physical.binding_generation,
+        ):
+            reason = "prefetch_duplicate_for_physical_object"
+        object_key = self._ingress_object_key.get(request_id, request_id)
+        if reason is None:
+            host = installed_runtime_control_host()
+            guard = getattr(host, "prefetch_guard", None) if host is not None else None
+            if guard is not None:
+                prefetch_lease = guard.try_begin(
+                    object_key,
+                    request_id=request_id,
+                    deadline_ns=ticket.deadline_ns,
+                )
+                if prefetch_lease is None:
+                    reason = "prefetch_single_flight_conflict"
         if profile_hint is not None and capability.cpu_prefetch_budget_bytes > 0:
             budget_utilization = (
                 capability.cpu_prefetch_used_budget_bytes + in_flight_reserved_bytes
@@ -1161,10 +1186,16 @@ class VendorCallbackBridge:
             "timestamp_ns": time.time_ns(),
         })
         if reason is not None:
+            if prefetch_lease is not None:
+                host = installed_runtime_control_host()
+                guard = getattr(host, "prefetch_guard", None) if host is not None else None
+                if guard is not None:
+                    guard.complete(prefetch_lease)
             self._append_ticket(replace(ticket, status=PrefetchStatus.CANCELLED, failure_reason=reason))
             return
         self._append_ticket(ticket)
         self._prefetch_keys[ticket.prefetch_id] = selected_keys
+        self._prefetch_lease_by_id[ticket.prefetch_id] = prefetch_lease
 
         async def promote() -> int:
             memory_objs = await disk.batched_get_non_blocking(ticket.prefetch_id, list(selected_keys))
@@ -1220,6 +1251,7 @@ class VendorCallbackBridge:
                     return
             finally:
                 self._prefetch_futures.pop(ticket.prefetch_id, None)
+                self._release_prefetch_lease(ticket.prefetch_id)
             self._append_ticket(updated)
 
         future.add_done_callback(completed)
@@ -1374,6 +1406,7 @@ class VendorCallbackBridge:
                 self._append_ticket(updated)
 
     def _demote_prefetch_keys(self, prefetch_id: str) -> None:
+        self._release_prefetch_lease(prefetch_id)
         keys = self._prefetch_keys.pop(prefetch_id, ())
         # A prefetched chunk may already be pinned by another exact-prefix
         # consumer.  Direct LocalCPUBackend.remove(force=True) would violate
@@ -1386,6 +1419,15 @@ class VendorCallbackBridge:
             "key_count": len(keys),
             "timestamp_ns": time.time_ns(),
         })
+
+    def _release_prefetch_lease(self, prefetch_id: str) -> None:
+        lease_id = self._prefetch_lease_by_id.pop(prefetch_id, None)
+        if not lease_id:
+            return
+        host = installed_runtime_control_host()
+        guard = getattr(host, "prefetch_guard", None) if host is not None else None
+        if guard is not None:
+            guard.complete(lease_id)
 
     def _note_reap_reference(
         self,
@@ -1748,6 +1790,25 @@ class VendorCallbackBridge:
         cpu, disk = backends.get("LocalCPUBackend"), backends.get("LocalDiskBackend")
         chunks = self._token_chunks(self._connector, token_ids, request_configs)
         physical, _native_keys = self._physical(self._connector, token_ids, request_configs)
+        callbacks = self._callbacks()
+        if (
+            physical is not None
+            and callbacks is not None
+            and callbacks.tickets.has_open_for_physical(
+                physical.physical_object_id, physical.binding_generation,
+            )
+        ):
+            self._append("kv_core_policy_decisions.jsonl", {
+                "request_id": request_id,
+                "action": "invalidate_external_copy",
+                "tier": "cpu",
+                "reason": reason,
+                "status": "skipped_open_prefetch_ticket",
+                "physical_object_id": physical.physical_object_id,
+                "binding_generation": physical.binding_generation,
+                "timestamp_ns": time.time_ns(),
+            })
+            return
         disk_backed_keys: list[Any] = []
         cpu_only_chunks = 0
         for _start, _end, key in chunks:

@@ -194,6 +194,7 @@ class OnlineBackendBridge:
         capabilities: BackendCapabilityPreflight | None = None,
         binding_registry: BackendBindingRegistry | None = None,
         execution_gate: RuntimeExecutionGate | None = None,
+        prefetch_guard: Any | None = None,
     ) -> None:
         if not is_loopback_url(hook_url):
             raise ValueError("backend Hook URL must use a loopback host")
@@ -205,6 +206,7 @@ class OnlineBackendBridge:
         self.capabilities = capabilities
         self.binding_registry = binding_registry
         self.execution_gate = execution_gate
+        self.prefetch_guard = prefetch_guard
         self._bindings_by_object: dict[tuple[Any, str], BackendObjectBinding] = {}
         self._bindings_by_request_object: dict[tuple[str, Any, str], BackendObjectBinding] = {}
         self._bindings_by_id: dict[str, BackendObjectBinding] = {}
@@ -255,6 +257,29 @@ class OnlineBackendBridge:
     def binding_is_active(self, binding_id: str) -> bool:
         return binding_id in self._active_binding_ids
 
+    def has_active_prefetch(self, object_key: str) -> bool:
+        if self.prefetch_guard is None:
+            return False
+        check = getattr(self.prefetch_guard, "has_active", None)
+        return bool(check(object_key)) if callable(check) else False
+
+    def _begin_prefetch_guard(
+        self, *, object_key: str, request_id: str, deadline_ns: int,
+    ) -> str | None:
+        if self.prefetch_guard is None:
+            return None
+        begin = getattr(self.prefetch_guard, "try_begin", None)
+        if not callable(begin):
+            return None
+        return begin(object_key, request_id=request_id, deadline_ns=deadline_ns)
+
+    def _end_prefetch_guard(self, lease_id: str | None) -> None:
+        if not lease_id or self.prefetch_guard is None:
+            return
+        complete = getattr(self.prefetch_guard, "complete", None)
+        if callable(complete):
+            complete(lease_id)
+
     def observe_event(self, event: BackendHookEvent) -> bool:
         event_binding_id = str(event.metadata.get("binding_id") or "")
         binding = self.binding_for(
@@ -285,6 +310,7 @@ class OnlineBackendBridge:
         if decision.run_id != self.run_id:
             return RuntimeActionResult("run_mismatch", "decision run_id does not match bridge run_id")
         action = EXECUTION_ACTIONS.get(decision.predicted_action)
+        prefetch_lease: str | None = None
         binding = self.binding_for(
             decision.object_level,
             decision.object_key,
@@ -472,6 +498,24 @@ class OnlineBackendBridge:
                 "binding registry could not bind reservation to command",
                 "binding_registry_could_not_bind_reservation",
             )
+        if action is HookAction.PREFETCH:
+            if self.has_active_prefetch(decision.object_key):
+                return rejected(
+                    "prefetch_single_flight_conflict",
+                    "another SSD->CPU promotion is already active for this object",
+                    "prefetch_single_flight_conflict",
+                )
+            prefetch_lease = self._begin_prefetch_guard(
+                object_key=decision.object_key,
+                request_id=decision.request_id,
+                deadline_ns=time.time_ns() + 30_000_000_000,
+            )
+            if prefetch_lease is None:
+                return rejected(
+                    "prefetch_single_flight_conflict",
+                    "could not acquire the shared SSD->CPU promotion lease",
+                    "prefetch_single_flight_lease_unavailable",
+                )
         self._issued_decision_ids.add(decision.decision_id)
         self.commands.append(command)
         try:
@@ -484,6 +528,8 @@ class OnlineBackendBridge:
                 if self.execution_gate.breaker is not None:
                     self.execution_gate.breaker.record_failure(now_ns=time.time_ns())
             return RuntimeActionResult("hook_transport_failed", f"backend Hook request failed: {exc}")
+        finally:
+            self._end_prefetch_guard(prefetch_lease)
         self.receipts.append(receipt)
         if not receipt.matches_command(command):
             if not runtime_owned_action_service:

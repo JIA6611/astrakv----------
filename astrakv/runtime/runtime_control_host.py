@@ -124,6 +124,77 @@ def _measured_runtime_versions() -> dict[str, str]:
     return result
 
 
+class PrefetchSingleFlightGuard:
+    """Cross-path single-flight for SSD->CPU promotion by logical object key.
+
+    Prefetch-A uses the vendor bridge and Prefetch-B uses the online backend
+    bridge.  Without a shared guard they can promote the same logical object
+    twice, invalidate each other's CPU copy, and double-count the same benefit.
+    This guard intentionally keys on ``object_key`` rather than backend IDs
+    because the two paths construct different physical identifiers from the
+    same workload identity.
+    """
+
+    def __init__(self) -> None:
+        self._active: dict[str, dict[str, Any]] = {}
+        self._lock = threading.RLock()
+        self._lease_index = 0
+
+    def try_begin(
+        self,
+        object_key: str,
+        *,
+        request_id: str,
+        deadline_ns: int,
+        now_ns: int | None = None,
+    ) -> str | None:
+        key = str(object_key or "")
+        if not key:
+            return None
+        current = time.time_ns() if now_ns is None else int(now_ns)
+        with self._lock:
+            self._reap_expired(current)
+            existing = self._active.get(key)
+            if existing is not None:
+                return None
+            self._lease_index += 1
+            lease_id = f"prefetch-single-flight:{key}:{self._lease_index}"
+            self._active[key] = {
+                "lease_id": lease_id,
+                "request_id": str(request_id or ""),
+                "deadline_ns": int(deadline_ns),
+            }
+            return lease_id
+
+    def complete(self, lease_id: str) -> None:
+        with self._lock:
+            for key, entry in tuple(self._active.items()):
+                if entry.get("lease_id") == lease_id:
+                    self._active.pop(key, None)
+                    return
+
+    def has_active(self, object_key: str) -> bool:
+        with self._lock:
+            self._reap_expired(time.time_ns())
+            return str(object_key or "") in self._active
+
+    def snapshot(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            self._reap_expired(time.time_ns())
+            return {
+                key: dict(entry)
+                for key, entry in self._active.items()
+            }
+
+    def _reap_expired(self, now_ns: int) -> None:
+        expired = [
+            key for key, entry in self._active.items()
+            if int(entry.get("deadline_ns") or 0) < now_ns
+        ]
+        for key in expired:
+            self._active.pop(key, None)
+
+
 class RuntimeControlHost:
     """Own one run's context ingress, Hook dependencies, and action authority."""
 
@@ -149,6 +220,7 @@ class RuntimeControlHost:
         self.execution_gate: RuntimeExecutionGate | None = None
         self._runtime_identities: dict[str, RuntimeRequestIdentity] = {}
         self._kv_runtime_bridge: Any | None = None
+        self.prefetch_guard = PrefetchSingleFlightGuard()
         self._identity_lock = threading.RLock()
         self._http_server: ThreadingHTTPServer | None = None
         self._http_thread: threading.Thread | None = None
@@ -455,6 +527,7 @@ class RuntimeControlHost:
             hook_client=InMemoryRuntimeActionClient(self.action_service, endpoint_identity=self.action_url),
             hook_url=self.action_url, gate=gate, capabilities=self.execution_gate.capabilities,
             binding_registry=self.binding_registry, execution_gate=self.execution_gate,
+            prefetch_guard=self.prefetch_guard,
         )
         prediction_source = None
         if self.config.prediction_sidecar_path is not None:

@@ -411,6 +411,26 @@ class PrefetchTicketStore:
                 if ticket.status is PrefetchStatus.SUBMITTED
             )
 
+    def has_open_for_physical(
+        self,
+        physical_object_id: str,
+        binding_generation: int,
+        *,
+        statuses: Iterable[PrefetchStatus] | None = None,
+    ) -> bool:
+        """True when an unfinished promotion already targets this generation."""
+        allowed = (
+            {PrefetchStatus.SUBMITTED, PrefetchStatus.COMPLETED}
+            if statuses is None
+            else frozenset(statuses)
+        )
+        with self._lock:
+            return any(
+                ticket.generation_key == (physical_object_id, binding_generation)
+                and ticket.status in allowed
+                for ticket in self._tickets.values()
+            )
+
     def _require_open(self, prefetch_id: str, *, now_ns: int | None, allow_completed: bool = False) -> PrefetchTicket:
         ticket = self._tickets.get(prefetch_id)
         if ticket is None:

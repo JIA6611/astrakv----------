@@ -81,11 +81,11 @@ def released_runtime_binding(binding_cycles: int = 1) -> tuple[BackendBindingReg
     return registry, binding
 
 
-def capabilities(hook_url: str = "http://127.0.0.1:7900/actions"):
+def capabilities(hook_url: str = "http://127.0.0.1:7900/actions", available_actions=("drop",)):
     return preflight_backend_capabilities(
         vllm_version="0.23.0", lmcache_version="0.4.7",
         connector_name="lmcache-vllm-v1", connector_version="0.4.7",
-        available_actions=("drop",), available_object_levels=(ObjectLevel.PREFIX,),
+        available_actions=available_actions, available_object_levels=(ObjectLevel.PREFIX,),
         binding_generation_observed=True,
         run_id="run-1", hook_url=hook_url,
         installation_evidence=build_installation_evidence(
@@ -419,6 +419,100 @@ class BackendBridgeTests(unittest.TestCase):
         )
 
         self.assertEqual(service.submit(command, challenge, forged).status, "failed")
+
+    def test_prefetch_single_flight_guard_blocks_a_second_promotion(self) -> None:
+        class Guard:
+            def __init__(self, active: bool = True) -> None:
+                self.active = active
+                self.completed: list[str] = []
+
+            def try_begin(self, object_key: str, *, request_id: str, deadline_ns: int) -> str | None:
+                if self.active:
+                    return None
+                self.active = True
+                return "lease-1"
+
+            def complete(self, lease_id: str) -> None:
+                self.completed.append(lease_id)
+                self.active = False
+
+            def has_active(self, object_key: str) -> bool:
+                return self.active
+
+        registry, runtime_binding = released_runtime_binding()
+        guard = Guard(active=True)
+        bridge = OnlineBackendBridge(
+            run_id="run-1", bindings=[runtime_binding],
+            hook_client=InMemoryLoopbackHookClient(
+                "http://127.0.0.1:7900/actions",
+                InMemoryProtectedActionService(
+                    lambda command: self.fail("single-flight guard must block before submit"),
+                    source="lmcache047_runtime_patch",
+                    method="signature_probe",
+                    session_id="session-a",
+                ),
+            ),
+            hook_url="http://127.0.0.1:7900/actions",
+            gate=accepted_gate(), capabilities=capabilities(available_actions=("drop", "prefetch")),
+            binding_registry=registry, prefetch_guard=guard,
+        )
+        self.assertTrue(bridge.observe_event(activation_event(runtime_binding)))
+        prefetch_decision = replace(decision(), decision_id="prefetch-1", predicted_action="prefetch")
+
+        result = bridge.dispatch(prefetch_decision)
+
+        self.assertEqual(result.status, "prefetch_single_flight_conflict")
+        self.assertEqual(guard.completed, [])
+        self.assertTrue(guard.active)
+
+    def test_prefetch_single_flight_guard_is_released_after_hook_submit(self) -> None:
+        class Guard:
+            def __init__(self) -> None:
+                self.active = False
+                self.completed: list[str] = []
+
+            def try_begin(self, object_key: str, *, request_id: str, deadline_ns: int) -> str | None:
+                self.active = True
+                return "lease-1"
+
+            def complete(self, lease_id: str) -> None:
+                self.completed.append(lease_id)
+                self.active = False
+
+            def has_active(self, object_key: str) -> bool:
+                return self.active
+
+        registry, runtime_binding = released_runtime_binding()
+
+        def responder(command: BackendActionCommand) -> BackendActionReceipt:
+            return BackendActionReceipt(
+                run_id=command.run_id, command_id=command.command_id, receipt_id="receipt-prefetch",
+                binding_id=command.binding_id, backend_object_id=command.backend_object_id,
+                action=command.action, status="completed", timestamp_ns=2,
+            )
+
+        guard = Guard()
+        bridge = OnlineBackendBridge(
+            run_id="run-1", bindings=[runtime_binding],
+            hook_client=InMemoryLoopbackHookClient(
+                "http://127.0.0.1:7900/actions",
+                InMemoryProtectedActionService(
+                    responder, source="lmcache047_runtime_patch",
+                    method="signature_probe", session_id="session-a",
+                ),
+            ),
+            hook_url="http://127.0.0.1:7900/actions", gate=accepted_gate(),
+            capabilities=capabilities(available_actions=("drop", "prefetch")),
+            binding_registry=registry, prefetch_guard=guard,
+        )
+        self.assertTrue(bridge.observe_event(activation_event(runtime_binding)))
+        prefetch_decision = replace(decision(), decision_id="prefetch-1", predicted_action="prefetch")
+
+        result = bridge.dispatch(prefetch_decision)
+
+        self.assertEqual(result.status, "executed")
+        self.assertEqual(guard.completed, ["lease-1"])
+        self.assertFalse(guard.active)
 
 
 if __name__ == "__main__":

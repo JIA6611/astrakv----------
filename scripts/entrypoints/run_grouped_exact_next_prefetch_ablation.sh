@@ -43,6 +43,7 @@ DATASETS="qasper,multifieldqa_en"
 WARMUP_PASSES="${ASTRAKV_ABLATION_WARMUP_PASSES:-0}"
 WARMUP_LIMIT="${ASTRAKV_ABLATION_WARMUP_LIMIT:-8}"
 INTERLEAVE="false"
+INTERLEAVE_PATTERN="${ASTRAKV_INTERLEAVE_PATTERN:-round-robin}"
 ROLES="${ASTRAKV_ABLATION_ROLES:-baseline,variant}"
 PREFETCH_LEAD_S="${ASTRAKV_ABLATION_PREFETCH_LEAD_S:-0.0}"
 
@@ -62,6 +63,7 @@ while [[ $# -gt 0 ]]; do
     --datasets) DATASETS="$2"; shift 2 ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
     --interleave) INTERLEAVE="true"; shift ;;
+    --interleave-pattern) INTERLEAVE_PATTERN="$2"; shift 2 ;;
     --roles) ROLES="$2"; shift 2 ;;
     --prefetch-lead-s) PREFETCH_LEAD_S="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
@@ -188,7 +190,7 @@ materialize_dataset() {
     --task "$dataset" \
     --limit "$LIMIT" \
     --prefetch-lead-s "$PREFETCH_LEAD_S" \
-    $([ "$INTERLEAVE" == "true" ] && echo --interleave)
+    $([ "$INTERLEAVE" == "true" ] && echo --interleave --interleave-pattern "$INTERLEAVE_PATTERN")
 }
 
 build_analysis_artifacts() {

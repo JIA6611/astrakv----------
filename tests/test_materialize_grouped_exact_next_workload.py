@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.benchmark.materialize_grouped_exact_next_workload import (  # noqa: E402
+    fire_consume_groups,
     interleave_groups,
 )
 
@@ -32,6 +33,30 @@ def _row(group: str, order: int, prompt: str = "shared context") -> dict:
 
 
 class InterleaveGroupsTests(unittest.TestCase):
+    def test_fire_consume_groups_schedule_firsts_then_far_near(self) -> None:
+        rows = []
+        for g in ("g1", "g2", "g3"):
+            for v in range(3):
+                rows.append(_row(g, len(rows), prompt=f"ctx-{g}-{v}"))
+        # g4 has only 2 rows -> must be excluded from the schedule.
+        rows.append(_row("g4", len(rows)))
+        rows.append(_row("g4", len(rows)))
+
+        scheduled = fire_consume_groups(rows)
+        self.assertEqual(len(scheduled), 9)
+        groups = [r["reuse_group"] for r in scheduled]
+        # All first visits first.
+        self.assertEqual(groups[:3], ["g1", "g2", "g3"])
+        # Then per group: far immediately followed by near (consecutive).
+        tail = groups[3:]
+        for i in range(0, 6, 2):
+            self.assertEqual(tail[i], tail[i + 1])
+        self.assertEqual(tail[0], "g1")
+        self.assertEqual(tail[2], "g2")
+        self.assertEqual(tail[4], "g3")
+        # g4 (2-row group) is excluded entirely.
+        self.assertNotIn("g4", groups)
+
     def test_round_robin_spaces_same_group_visits(self) -> None:
         rows = [
             _row("g1", 0), _row("g1", 1), _row("g1", 2),

@@ -31,6 +31,20 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--interleave-pattern",
+        choices=("round-robin", "fire-consume"),
+        default="round-robin",
+        help=(
+            "round-robin: uniform spacing (default).  fire-consume: emit all "
+            "first visits, then per object a far revisit (spaced enough that "
+            "the CPU hot pool evicts it, so Prefetch-B fires) immediately "
+            "followed by a near revisit (so the prefetched CPU copy survives "
+            "and is consumed).  fire-consume is required for B to show TTFT "
+            "benefit: with a uniform cycle the prefetched copy is always "
+            "evicted before the next visit."
+        ),
+    )
+    parser.add_argument(
         "--prefetch-lead-s",
         type=float,
         default=0.0,
@@ -53,7 +67,11 @@ def main() -> int:
     if args.limit > 0:
         ordered = ordered[: args.limit]
     if args.interleave:
-        ordered = interleave_groups(ordered)
+        ordered = (
+            fire_consume_groups(ordered)
+            if args.interleave_pattern == "fire-consume"
+            else interleave_groups(ordered)
+        )
     dataset = args.dataset or input_path.parent.name
     task = args.task or dataset
     group_sizes = reuse_group_sizes(ordered)
@@ -202,6 +220,30 @@ def interleave_groups(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 result.append(bucket[position])
                 cursor[group] = position + 1
                 pending = True
+    return result
+
+
+def fire_consume_groups(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fire-and-consume revisit schedule for Prefetch-B.
+
+    Every reuse group with >=3 rows contributes three visits: the first visit,
+    a far revisit and an immediately following near revisit.  The far visit is
+    separated from the first visit by N-1 other objects (their combined KV
+    exceeds the CPU hot pool, so the object is evicted and Prefetch-B fires at
+    the far visit's LMCache load); the near visit follows the far visit with
+    zero intervening requests, so the prefetched CPU copy survives and is
+    consumed.  Sequence: [all first visits] then [far, near] per group.
+    """
+    buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        buckets[str(row.get("reuse_group") or "")].append(row)
+    eligible = [bucket for bucket in buckets.values() if len(bucket) >= 3]
+    result: list[dict[str, Any]] = []
+    for bucket in eligible:
+        result.append(bucket[0])
+    for bucket in eligible:
+        result.append(bucket[1])
+        result.append(bucket[2])
     return result
 
 

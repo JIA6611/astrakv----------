@@ -346,6 +346,18 @@ class OnlineProfileStore:
                     state["last_timestamp_ns"] = max(state["last_timestamp_ns"], int(entry["timestamp_ns"]))
                 if receipt is not None:
                     state["binding_generation"] = receipt.binding_generation
+                    if receipt.status in {"completed", "ok", "executed"}:
+                        # Independent-channel dispatches (evict/prefetch via the
+                        # action service) surface a receipt without a runtime
+                        # event.  Keep the tracked resident tier in sync so a
+                        # later global evict scan does not re-select an object
+                        # that a completed evict already moved (cpu -> ssd) or
+                        # removed (ssd -> none), which previously produced
+                        # repeated not_found decisions.
+                        state["current_tier"] = _prefer_known_tier(
+                            receipt.tier_after,
+                            state["current_tier"],
+                        )
                 elif event is not None:
                     state["binding_generation"] = event.metadata.get("binding_generation", state["binding_generation"])
                     state["current_tier"] = _prefer_known_tier(event.tier_after, state["current_tier"])

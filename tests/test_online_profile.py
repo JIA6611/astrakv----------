@@ -187,6 +187,94 @@ class OnlineProfileStoreTests(unittest.TestCase):
             self.assertEqual(object_state["last_receipt_status"], "rejected")
             self.assertEqual(object_state["last_rejection_reason"], "runtime_execution_gate:byte_budget")
 
+    def test_receipt_only_completed_evict_updates_resident_tier(self) -> None:
+        """Independent-channel evicts carry a receipt without a runtime event;
+        the tracked resident tier must still move cpu -> ssd so the global
+        evict scan does not re-select the same object (not_found churn)."""
+        store = OnlineProfileStore(run_id="run-a")
+        decision = OfflineEvictionDecision(
+            run_id="run-a",
+            decision_id="decision-evict-1",
+            request_id="request-a",
+            object_key="prefix-a",
+            object_level=ObjectLevel.PREFIX,
+            predicted_action="evict",
+        )
+        completed = RuntimeActionResult(
+            "executed",
+            "evicted",
+            receipt=BackendActionReceipt(
+                "run-a",
+                "run-a:decision-evict-1",
+                "run-a:decision-evict-1:terminal",
+                "binding-a",
+                "object-a",
+                HookAction.EVICT,
+                "completed",
+                2,
+                tier_before="cpu",
+                tier_after="ssd",
+                bytes=64,
+                binding_generation=1,
+                decision_id="decision-evict-1",
+                request_id="request-a",
+                metadata={
+                    "source_location": "LocalCPUBackend",
+                    "target_location": "LocalDiskBackend",
+                },
+            ),
+        )
+        self.assertTrue(
+            store.record_dispatch(decision, completed, execution_enabled=True, breaker_state={})
+        )
+        state = store.object_state("object-a")
+        assert state is not None
+        self.assertEqual(state["current_tier"], "ssd")
+
+        # A later not_found re-attempt (stale candidate) must not move the
+        # tier back or churn further.
+        not_found_decision = OfflineEvictionDecision(
+            run_id="run-a",
+            decision_id="decision-evict-2",
+            request_id="request-a",
+            object_key="prefix-a",
+            object_level=ObjectLevel.PREFIX,
+            predicted_action="evict",
+        )
+        not_found = RuntimeActionResult(
+            "not_found",
+            "object no longer resident in source tier",
+            receipt=BackendActionReceipt(
+                "run-a",
+                "run-a:decision-evict-2",
+                "run-a:decision-evict-2:terminal",
+                "binding-a",
+                "object-a",
+                HookAction.EVICT,
+                "not_found",
+                3,
+                tier_before="cpu",
+                tier_after="ssd",
+                bytes=0,
+                binding_generation=1,
+                decision_id="decision-evict-2",
+                request_id="request-a",
+                metadata={
+                    "source_location": "LocalCPUBackend",
+                    "target_location": "LocalDiskBackend",
+                },
+            ),
+        )
+        self.assertTrue(
+            store.record_dispatch(
+                not_found_decision,
+                not_found,
+                execution_enabled=True,
+                breaker_state={},
+            )
+        )
+        self.assertEqual(store.object_state("object-a")["current_tier"], "ssd")
+
     def test_profile_tracks_tier_transitions_prefetch_waste_and_reaccess(self) -> None:
         store = OnlineProfileStore(run_id="run-a")
         self.assertTrue(

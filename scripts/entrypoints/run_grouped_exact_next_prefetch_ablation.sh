@@ -42,6 +42,9 @@ EXTERNAL_SIDECAR=""
 DATASETS="qasper,multifieldqa_en"
 WARMUP_PASSES="${ASTRAKV_ABLATION_WARMUP_PASSES:-0}"
 WARMUP_LIMIT="${ASTRAKV_ABLATION_WARMUP_LIMIT:-8}"
+EVICTION_FILL_GROUPS="${ASTRAKV_ABLATION_EVICTION_FILL_GROUPS:-0}"
+MEASURE_PHASES="${ASTRAKV_ABLATION_MEASURE_PHASES:-}"
+PREDICTION_PHASES="${ASTRAKV_ABLATION_PREDICTION_PHASES:-}"
 INTERLEAVE="false"
 INTERLEAVE_PATTERN="${ASTRAKV_INTERLEAVE_PATTERN:-round-robin}"
 ROLES="${ASTRAKV_ABLATION_ROLES:-baseline,variant}"
@@ -66,6 +69,7 @@ while [[ $# -gt 0 ]]; do
     --interleave-pattern) INTERLEAVE_PATTERN="$2"; shift 2 ;;
     --roles) ROLES="$2"; shift 2 ;;
     --prefetch-lead-s) PREFETCH_LEAD_S="$2"; shift 2 ;;
+    --eviction-fill-groups) EVICTION_FILL_GROUPS="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -74,6 +78,7 @@ done
 [[ -d "$MODEL" ]] || { echo "Model path is missing: $MODEL" >&2; exit 2; }
 [[ "$HOST" == "127.0.0.1" || "$HOST" == "localhost" ]] || { echo "Only loopback hosts are allowed" >&2; exit 2; }
 [[ "$LIMIT" =~ ^[0-9]+$ ]] || { echo "--limit must be a non-negative integer" >&2; exit 2; }
+[[ "$EVICTION_FILL_GROUPS" =~ ^[0-9]+$ ]] || { echo "--eviction-fill-groups must be a non-negative integer" >&2; exit 2; }
 [[ -n "$GROUPED_ROOT" ]] || { echo "--grouped-root is required" >&2; exit 2; }
 IFS=',' read -r -a SELECTED_DATASETS <<< "$DATASETS"
 [[ "${#SELECTED_DATASETS[@]}" -gt 0 ]] || { echo "--datasets must not be empty" >&2; exit 2; }
@@ -183,6 +188,13 @@ materialize_dataset() {
   local dataset="$1"
   local materialized_dir="$OUTPUT_DIR/$dataset/materialized"
   mkdir -p "$materialized_dir"
+  local extra_args=()
+  if [[ "$INTERLEAVE" == "true" ]]; then
+    extra_args+=(--interleave --interleave-pattern "$INTERLEAVE_PATTERN")
+    if [[ "$INTERLEAVE_PATTERN" == "fire-consume" && "$EVICTION_FILL_GROUPS" -gt 0 ]]; then
+      extra_args+=(--eviction-fill-groups "$EVICTION_FILL_GROUPS")
+    fi
+  fi
   "$PYTHON" scripts/benchmark/materialize_grouped_exact_next_workload.py \
     --grouped-prompts-jsonl "$GROUPED_ROOT/$dataset/grouped_prompts.jsonl" \
     --output-dir "$materialized_dir" \
@@ -190,7 +202,38 @@ materialize_dataset() {
     --task "$dataset" \
     --limit "$LIMIT" \
     --prefetch-lead-s "$PREFETCH_LEAD_S" \
-    $([ "$INTERLEAVE" == "true" ] && echo --interleave --interleave-pattern "$INTERLEAVE_PATTERN")
+    "${extra_args[@]}"
+
+  if [[ -n "$MEASURE_PHASES" ]]; then
+    local canonical="$materialized_dir/${dataset}_grouped_exact_next_canonical_workload.jsonl"
+    local measured="$materialized_dir/${dataset}_grouped_exact_next_measured_workload.jsonl"
+    local warmup="$materialized_dir/${dataset}_grouped_exact_next_warmup.jsonl"
+    "$PYTHON" - "$canonical" "$measured" "$warmup" "$MEASURE_PHASES" <<'PY'
+import json, sys
+source, measured_path, warmup_path, phase_text = sys.argv[1:]
+phases = {item.strip() for item in phase_text.split(",") if item.strip()}
+measured, warmup = [], []
+with open(source, encoding="utf-8") as handle:
+    for line in handle:
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        if str(metadata.get("prefetch_phase") or "") in phases:
+            measured.append(row)
+        else:
+            warmup.append(row)
+if not measured:
+    raise SystemExit(f"no measured rows matched phases={sorted(phases)}")
+if not warmup:
+    raise SystemExit("phase-filtered workload has no warmup rows")
+for path, rows in ((measured_path, measured), (warmup_path, warmup)):
+    with open(path, "w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+print(f"phase-filtered workload: measured={len(measured)} warmup={len(warmup)} phases={sorted(phases)}")
+PY
+  fi
 }
 
 build_analysis_artifacts() {
@@ -225,8 +268,36 @@ run_condition() {
     if [[ -n "$EXTERNAL_SIDECAR" ]]; then
       sidecar_path="$EXTERNAL_SIDECAR"
     elif [[ "$SIDECAR_MODE" == "build" ]]; then
+      local sidecar_candidate_report="$candidate_report"
+      if [[ -n "$PREDICTION_PHASES" ]]; then
+        sidecar_candidate_report="$sidecar_dir/predictor_candidate_report.phases.jsonl"
+        "$PYTHON" - "$candidate_report" "$canonical" "$sidecar_candidate_report" "$PREDICTION_PHASES" <<'PY'
+import json, sys
+source, workload, target, phase_text = sys.argv[1:]
+phases = {item.strip() for item in phase_text.split(",") if item.strip()}
+allowed = set()
+with open(workload, encoding="utf-8") as handle:
+    for line in handle:
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        if str(metadata.get("prefetch_phase") or "") in phases:
+            allowed.add(str(row.get("request_id") or ""))
+count = 0
+with open(source, encoding="utf-8") as source_handle, open(target, "w", encoding="utf-8") as target_handle:
+    for line in source_handle:
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if str(row.get("request_id") or "") in allowed:
+            target_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            count += 1
+print(f"phase-filtered predictor candidates: {count} rows, phases={sorted(phases)}")
+PY
+      fi
       "$PYTHON" scripts/reporting/build_sidecar_prediction.py \
-        --candidate-report "$candidate_report" \
+        --candidate-report "$sidecar_candidate_report" \
         --output-dir "$sidecar_dir" \
         --run-id "$run_id" \
         --lead-time-ms 250 \
@@ -324,6 +395,10 @@ for dataset in "${SELECTED_DATASETS[@]}"; do
   materialize_dataset "$dataset"
   build_analysis_artifacts "$dataset"
   canonical="$OUTPUT_DIR/$dataset/materialized/${dataset}_grouped_exact_next_canonical_workload.jsonl"
+  measured_canonical="$OUTPUT_DIR/$dataset/materialized/${dataset}_grouped_exact_next_measured_workload.jsonl"
+  if [[ -f "$measured_canonical" ]]; then
+    canonical="$measured_canonical"
+  fi
   candidate_report="$OUTPUT_DIR/$dataset/analysis/candidates/predictor_candidate_report.jsonl"
   pair_id="grouped-exact-next-prefetch-${dataset}-$TIMESTAMP"
   for role in "${SELECTED_ROLES[@]}"; do

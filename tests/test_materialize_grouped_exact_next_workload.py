@@ -56,6 +56,14 @@ class InterleaveGroupsTests(unittest.TestCase):
         self.assertEqual(tail[4], "g3")
         # g4 (2-row group) is excluded entirely.
         self.assertNotIn("g4", groups)
+        self.assertEqual(
+            [row["_prefetch_phase"] for row in scheduled],
+            ["first", "first", "first", "far", "near", "far", "near", "far", "near"],
+        )
+        self.assertEqual(
+            [row["_prefetch_pair_id"] for row in scheduled[3:]],
+            ["g1", "g1", "g2", "g2", "g3", "g3"],
+        )
 
     def test_round_robin_spaces_same_group_visits(self) -> None:
         rows = [
@@ -76,6 +84,19 @@ class InterleaveGroupsTests(unittest.TestCase):
         # Intra-group order is preserved (request ids ascending per group).
         g1_orders = [int(r["order"]) for r in interleaved if r["reuse_group"] == "g1"]
         self.assertEqual(g1_orders, [0, 1, 2])
+
+    def test_fire_consume_can_add_ineligible_eviction_fillers(self) -> None:
+        rows = []
+        for group in ("target", "fill1", "fill2"):
+            visits = 3 if group == "target" else 1
+            for _ in range(visits):
+                rows.append(_row(group, len(rows), prompt=f"ctx-{group}"))
+        scheduled = fire_consume_groups(rows, eviction_fill_groups=2)
+        self.assertEqual([row["reuse_group"] for row in scheduled], ["target", "fill1", "fill2", "target", "target"])
+        self.assertEqual(
+            [row["_prefetch_phase"] for row in scheduled],
+            ["first", "first", "first", "far", "near"],
+        )
 
     def test_cli_interleave_canonical_has_gapped_revisits(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -158,6 +179,10 @@ class InterleaveGroupsTests(unittest.TestCase):
             rows = [json.loads(line) for line in canonical.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(len(rows), 6)
             self.assertEqual([r["prefix_id"] for r in rows], ["g1", "g2", "g3", "g1", "g1", "g2"])
+            self.assertEqual(
+                [r["metadata"].get("prefetch_phase") for r in rows],
+                ["first", "first", "first", "far", "near", "far"],
+            )
 
 
 if __name__ == "__main__":

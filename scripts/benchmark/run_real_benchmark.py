@@ -133,6 +133,11 @@ class RequestResult:
     runtime_request_id: str = ""
     runtime_event_id: str = ""
     request_context_error: str = ""
+    # Fire-consume experiments label the trigger/consumer pair in workload
+    # metadata.  Persist the labels in request results for phase-specific
+    # paired TTFT analysis; they are empty for ordinary workloads.
+    prefetch_phase: str = ""
+    prefetch_pair_id: str = ""
     # vLLM returns these only when its token-evidence options are enabled.
     # They make KV-Core correctness comparisons about generated token IDs, not
     # merely decoded text that can hide tokenizer-boundary differences.
@@ -823,6 +828,8 @@ def run_one_request(
         runtime_request_id=runtime_request_id,
         runtime_event_id=runtime_event_id,
         request_context_error=request_context_error,
+        prefetch_phase=str(task_metadata.get("prefetch_phase") or ""),
+        prefetch_pair_id=str(task_metadata.get("prefetch_pair_id") or ""),
         output_token_ids=tuple(output_token_ids),
         finish_reason=finish_reason,
         deterministic_logprob=deterministic_logprob if logprob_observed else None,

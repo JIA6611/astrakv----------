@@ -56,17 +56,31 @@ def parse_args() -> argparse.Namespace:
             "CPU pool."
         ),
     )
+    parser.add_argument(
+        "--eviction-fill-groups",
+        type=int,
+        default=0,
+        help=(
+            "For fire-consume, include this many first visits from otherwise "
+            "ineligible groups before far->near pairs.  They are warmup/filler "
+            "requests that force target objects out of the CPU hot tier."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.eviction_fill_groups < 0:
+        raise SystemExit("--eviction-fill-groups must be non-negative")
     input_path = Path(args.grouped_prompts_jsonl)
     rows = load_jsonl(input_path)
     ordered = sorted(rows, key=lambda row: int(row.get("order") or 0))
     if args.interleave:
         ordered = (
-            fire_consume_groups(ordered)
+            fire_consume_groups(
+                ordered, eviction_fill_groups=args.eviction_fill_groups,
+            )
             if args.interleave_pattern == "fire-consume"
             else interleave_groups(ordered)
         )
@@ -106,6 +120,16 @@ def main() -> int:
             "messages": row.get("messages") if isinstance(row.get("messages"), list) else None,
             "source_prompt_path": str(input_path),
         }
+        # fire-consume annotates the only requests that can prove B's value:
+        # the far request is the trigger and the immediately following near
+        # request is the consumer.  Keep these labels in the canonical
+        # workload so paired TTFT analysis cannot accidentally use all rows.
+        schedule_phase = str(row.get("_prefetch_phase") or "")
+        schedule_pair_id = str(row.get("_prefetch_pair_id") or "")
+        if schedule_phase:
+            metadata["prefetch_phase"] = schedule_phase
+        if schedule_pair_id:
+            metadata["prefetch_pair_id"] = schedule_pair_id
         workload_rows.append(
             RuntimeWorkloadRow(
                 request_id=request_id,
@@ -227,7 +251,9 @@ def interleave_groups(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
-def fire_consume_groups(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def fire_consume_groups(
+    rows: list[dict[str, Any]], *, eviction_fill_groups: int = 0,
+) -> list[dict[str, Any]]:
     """Fire-and-consume revisit schedule for Prefetch-B.
 
     Every reuse group with >=3 rows contributes three visits: the first visit,
@@ -242,12 +268,28 @@ def fire_consume_groups(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for row in rows:
         buckets[str(row.get("reuse_group") or "")].append(row)
     eligible = [bucket for bucket in buckets.values() if len(bucket) >= 3]
+    ineligible = [bucket for bucket in buckets.values() if len(bucket) < 3]
     result: list[dict[str, Any]] = []
+
+    def tagged(row: dict[str, Any], phase: str, pair_id: str) -> dict[str, Any]:
+        tagged_row = dict(row)
+        tagged_row["_prefetch_phase"] = phase
+        tagged_row["_prefetch_pair_id"] = pair_id
+        return tagged_row
+
     for bucket in eligible:
-        result.append(bucket[0])
+        pair_id = str(bucket[0].get("reuse_group") or "")
+        result.append(tagged(bucket[0], "first", pair_id))
+    # A small number of unrelated first visits makes the target objects cold
+    # in LocalCPUBackend without adding any requests to the measured phase.
+    # The B runner sends these rows through its explicit warmup pass.
+    for bucket in ineligible[: max(0, int(eviction_fill_groups))]:
+        pair_id = str(bucket[0].get("reuse_group") or "")
+        result.append(tagged(bucket[0], "first", pair_id))
     for bucket in eligible:
-        result.append(bucket[1])
-        result.append(bucket[2])
+        pair_id = str(bucket[0].get("reuse_group") or "")
+        result.append(tagged(bucket[1], "far", pair_id))
+        result.append(tagged(bucket[2], "near", pair_id))
     return result
 
 

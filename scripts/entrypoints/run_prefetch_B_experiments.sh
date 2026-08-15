@@ -26,7 +26,8 @@ GROUPED_ROOT="${ASTRAKV_GROUPED_ROOT:-/home/zyx/astrakv-W/results/dgx_prefetch_v
 OUT_ROOT="${ASTRAKV_B_OUT_ROOT:-/home/zyx/astrakv-W/results/prefetch-B-$(date -u +%Y%m%dT%H%M%SZ)}"
 LIMIT="${ASTRAKV_B_LIMIT:-50}"
 CPU_GB="${ASTRAKV_B_CPU_GB:-4.0}"
-LEAD="${ASTRAKV_B_LEAD_S:-1.5}"
+LEAD="${ASTRAKV_B_LEAD_S:-3.0}"
+EVICTION_FILL="${ASTRAKV_B_EVICTION_FILL_GROUPS:-16}"
 RUN_SIDECAR="${ASTRAKV_B_RUN_SIDECAR:-1}"
 RUN_PROFILE="${ASTRAKV_B_RUN_PROFILE:-1}"
 export ASTRAKV_PYTHON="$PYTHON"
@@ -36,8 +37,16 @@ export ASTRAKV_PYTHON="$PYTHON"
 
 COMMON_ENV=(
   ASTRAKV_PREFIX_CACHING=false
+  # Keep this suite B-only.  A's ingress promotion/invalidation can otherwise
+  # make a near request fast even when the release-triggered B copy missed it.
+  ASTRAKV_KV_CORE_CPU_PREFETCH_ENABLED=false
+  ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD=false
   ASTRAKV_PREFETCH_DISPATCH_INDEPENDENT_OF_MODE=true
   ASTRAKV_INTERLEAVE_PATTERN=fire-consume
+  ASTRAKV_ABLATION_EVICTION_FILL_GROUPS="$EVICTION_FILL"
+  ASTRAKV_ABLATION_MEASURE_PHASES=far,near
+  ASTRAKV_ABLATION_PREDICTION_PHASES=far
+  ASTRAKV_ABLATION_WARMUP_PASSES=1
   ASTRAKV_LOCAL_CPU_SIZE_GB="$CPU_GB"
   ASTRAKV_ABLATION_PREFETCH_LEAD_S="$LEAD"
   ASTRAKV_KV_CORE_CPU_PREFETCH_BUDGET_FRACTION=1.0
@@ -60,7 +69,7 @@ if [[ "$RUN_SIDECAR" == "1" ]]; then
   env "${COMMON_ENV[@]}" \
     bash scripts/entrypoints/run_grouped_exact_next_prefetch_ablation.sh \
       --grouped-root "$GROUPED_ROOT" --datasets qasper --limit "$LIMIT" \
-      --interleave --prefetch-lead-s "$LEAD" --model "$MODEL" \
+      --interleave --interleave-pattern fire-consume --prefetch-lead-s "$LEAD" --model "$MODEL" \
       --output-dir "$OUT_ROOT/sidecar"
 else
   echo ">>> B-sidecar skipped (ASTRAKV_B_RUN_SIDECAR=0)"
@@ -79,10 +88,13 @@ if [[ "$RUN_PROFILE" == "1" ]]; then
   env "${COMMON_ENV[@]}" \
     bash scripts/entrypoints/run_grouped_exact_next_prefetch_ablation.sh \
       --grouped-root "$GROUPED_ROOT" --datasets qasper --limit "$LIMIT" \
-      --roles variant --interleave --prefetch-lead-s "$LEAD" --model "$MODEL" \
+      --roles variant --interleave --interleave-pattern fire-consume --prefetch-lead-s "$LEAD" --model "$MODEL" \
       --output-dir "$OUT_ROOT/train-trace"
   TRAIN_STATE="$OUT_ROOT/train-trace/qasper/variant-state"
-  TRAIN_CANONICAL="$OUT_ROOT/train-trace/qasper/materialized/qasper_grouped_exact_next_canonical_workload.jsonl"
+  TRAIN_CANONICAL="$OUT_ROOT/train-trace/qasper/materialized/qasper_grouped_exact_next_measured_workload.jsonl"
+  if [[ ! -f "$TRAIN_CANONICAL" ]]; then
+    TRAIN_CANONICAL="$OUT_ROOT/train-trace/qasper/materialized/qasper_grouped_exact_next_canonical_workload.jsonl"
+  fi
 
   echo "--- [3b] build offline ProfileDB + hints from the train trace ---"
   "$PYTHON" scripts/policy/build_profile_from_runtime_events.py \
@@ -106,7 +118,7 @@ if [[ "$RUN_PROFILE" == "1" ]]; then
     ASTRAKV_ONLINE_PREFETCH_MODE=prefix_only \
     bash scripts/entrypoints/run_grouped_exact_next_prefetch_ablation.sh \
       --grouped-root "$GROUPED_ROOT" --datasets qasper --limit "$LIMIT" \
-      --interleave --prefetch-lead-s "$LEAD" --model "$MODEL" --no-sidecar \
+      --interleave --interleave-pattern fire-consume --prefetch-lead-s "$LEAD" --model "$MODEL" --no-sidecar \
       --output-dir "$OUT_ROOT/profile-test"
 else
   echo ">>> B-profile skipped (ASTRAKV_B_RUN_PROFILE=0)"

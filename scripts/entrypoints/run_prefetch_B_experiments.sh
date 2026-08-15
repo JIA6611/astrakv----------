@@ -37,8 +37,10 @@ export ASTRAKV_PYTHON="$PYTHON"
 
 COMMON_ENV=(
   ASTRAKV_PREFIX_CACHING=false
-  # Keep this suite B-only.  A's ingress promotion/invalidation can otherwise
-  # make a near request fast even when the release-triggered B copy missed it.
+  # This is the formal B-only contract: disable KV-Core's active A path, but
+  # keep the LMCache hooks/runtime-control host alive because B decisions and
+  # SSD->CPU action receipts still flow through that control plane.
+  ASTRAKV_KV_CORE_MODE=off
   ASTRAKV_KV_CORE_CPU_PREFETCH_ENABLED=false
   ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD=false
   ASTRAKV_PREFETCH_DISPATCH_INDEPENDENT_OF_MODE=true

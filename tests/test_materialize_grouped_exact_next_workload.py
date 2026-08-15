@@ -119,6 +119,46 @@ class InterleaveGroupsTests(unittest.TestCase):
             # window.
             self.assertTrue(all(abs(r["prefetch_lead_s"] - 0.25) < 1e-9 for r in rows))
 
+    def test_cli_fire_consume_applies_limit_after_pair_construction(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            source = tmp / "grouped_prompts.jsonl"
+            # Put two complete three-visit groups after a two-visit group. If
+            # limit is applied to raw rows first, only one eligible group is
+            # available; applying it after scheduling retains both pairs.
+            source_rows = []
+            for group in ("short", "g1", "g2", "g3"):
+                visits = 2 if group == "short" else 3
+                for _ in range(visits):
+                    source_rows.append(_row(group, len(source_rows), prompt=f"ctx-{group}"))
+            source.write_text(
+                "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in source_rows),
+                encoding="utf-8",
+            )
+            out_dir = tmp / "out"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(PROJECT_ROOT / "scripts/benchmark/materialize_grouped_exact_next_workload.py"),
+                    "--grouped-prompts-jsonl", str(source),
+                    "--output-dir", str(out_dir),
+                    "--dataset", "qasper",
+                    "--task", "qasper",
+                    "--limit", "6",
+                    "--interleave",
+                    "--interleave-pattern", "fire-consume",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                env={**os.environ, "PYTHONPATH": str(PROJECT_ROOT)},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            canonical = out_dir / "qasper_grouped_exact_next_canonical_workload.jsonl"
+            rows = [json.loads(line) for line in canonical.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(rows), 6)
+            self.assertEqual([r["prefix_id"] for r in rows], ["g1", "g2", "g3", "g1", "g1", "g2"])
+
 
 if __name__ == "__main__":
     unittest.main()

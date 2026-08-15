@@ -7,11 +7,23 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from astrakv.benchmarks.experiment_manifest import file_sha256, normalized_lmcache_config_sha256
-from scripts.benchmark.run_real_benchmark import finalize_experiment_manifest, write_effective_config
+from scripts.benchmark.run_real_benchmark import (
+    finalize_experiment_manifest,
+    parse_args,
+    write_effective_config,
+)
 from scripts.reporting.compare_real_runs import RunInput, comparison_claim
 
 
 class RealBenchmarkManifestTests(unittest.TestCase):
+    def test_warmup_claim_scope_is_accepted_by_runner(self) -> None:
+        with patch(
+            "scripts.benchmark.run_real_benchmark.sys.argv",
+            ["run_real_benchmark.py", "--claim-scope", "online_control_warmup"],
+        ):
+            args = parse_args()
+        self.assertEqual(args.claim_scope, "online_control_warmup")
+
     def test_controlled_suite_exports_static_server_controls_to_benchmark(self) -> None:
         suite = Path(__file__).resolve().parents[1] / "scripts" / "entrypoints" / "run_kv_core_controlled_suite.sh"
         text = suite.read_text(encoding="utf-8")

@@ -64,14 +64,18 @@ def main() -> int:
     input_path = Path(args.grouped_prompts_jsonl)
     rows = load_jsonl(input_path)
     ordered = sorted(rows, key=lambda row: int(row.get("order") or 0))
-    if args.limit > 0:
-        ordered = ordered[: args.limit]
     if args.interleave:
         ordered = (
             fire_consume_groups(ordered)
             if args.interleave_pattern == "fire-consume"
             else interleave_groups(ordered)
         )
+    # fire-consume must see the complete grouped source before limiting.  If
+    # the raw rows are truncated first, many groups lose their third visit
+    # and cannot form a far->near pair; a nominal limit of 50 then silently
+    # becomes a much smaller, underpowered experiment.
+    if args.limit > 0:
+        ordered = ordered[: args.limit]
     dataset = args.dataset or input_path.parent.name
     task = args.task or dataset
     group_sizes = reuse_group_sizes(ordered)

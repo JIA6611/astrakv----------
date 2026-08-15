@@ -2319,6 +2319,77 @@ class _ConnectorLifecycle:
             self._event_sink(record)
 
 
+def patch_local_disk_remove_race(manager: Any) -> int:
+    """Tolerate LocalDiskBackend.remove() racing a concurrent eviction.
+
+    LMCache 0.4.7 ``LocalDiskBackend.remove`` calls ``os.remove(path)``
+    without a FileNotFoundError guard (``read_file`` has one).  When another
+    eviction path deletes the same backing file first, the raw ``os.remove``
+    raises and kills vLLM EngineCore.  This wrapper keeps the original
+    semantics but treats an already-missing file as success and always
+    releases the lock.
+    """
+    try:
+        from lmcache.v1.cache_controller.message import OpType  # noqa: PLC0415
+    except ImportError:
+        # Local dev/test environments may not install lmcache; the OpType is
+        # only needed when a batched message sender exists (runtime only).
+        OpType = None  # type: ignore[assignment]
+    backends = getattr(manager, "storage_backends", {})
+    if not isinstance(backends, dict):
+        return 0
+    patched = 0
+    for backend_name, backend in backends.items():
+        if backend_name != "LocalDiskBackend":
+            continue
+        original_remove = getattr(backend, "remove", None)
+        if original_remove is None or getattr(
+            original_remove, "__astrakv_lmcache047_remove_race_patch__", False
+        ):
+            continue
+
+        def remove_wrapper(
+            backend_self: Any,
+            key: Any,
+            force: bool = True,
+            *,
+            _original: Callable[..., Any] = original_remove,
+        ) -> bool:
+            acquired = False
+            if force:
+                backend_self.disk_lock.acquire()
+                acquired = True
+            try:
+                meta = backend_self.dict.pop(key, None)
+                if meta is None:
+                    return False
+                path = meta.path
+                size = meta.size
+                backend_self.usage -= size
+                backend_self.stats_monitor.update_local_storage_usage(backend_self.usage)
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    # Already deleted by a concurrent eviction path.
+                    pass
+                if force:
+                    backend_self.cache_policy.update_on_force_evict(key)
+                if backend_self.batched_msg_sender is not None and OpType is not None:
+                    backend_self.batched_msg_sender.add_kv_op(
+                        OpType.EVICT,
+                        key=key.chunk_hash,
+                    )
+                return True
+            finally:
+                if acquired:
+                    backend_self.disk_lock.release()
+
+        remove_wrapper.__astrakv_lmcache047_remove_race_patch__ = True
+        backend.remove = types.MethodType(remove_wrapper, backend)
+        patched += 1
+    return patched
+
+
 def install_lmcache047_hooks(
     event_sink: EventSink,
     *,
@@ -2540,6 +2611,7 @@ def _patch_storage_manager(
         return patched
 
     endpoint._require_verified_local_disk_completion = patch_local_disk_completion_backends()
+    patch_local_disk_remove_race(manager)
 
     def put_wrapper(self: Any, keys: Any, memory_objs: Any, *args: Any, **kwargs: Any) -> Any:
         if binding_registry is not None and (request_context_provider is None or request_context_provider() is None):

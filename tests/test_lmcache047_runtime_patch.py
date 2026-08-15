@@ -1,4 +1,7 @@
 import unittest
+import tempfile
+import threading
+import types
 from unittest.mock import patch
 
 from astrakv.runtime.backend_binding_registry import BackendBindingRegistry, RequestContext
@@ -8,6 +11,7 @@ from astrakv.runtime.lmcache047_runtime_patch import (
     LMCache047RequestContextConsumer,
     _ConnectorLifecycle,
     _owner_action_batched_get,
+    patch_local_disk_remove_race,
     _prefetch_ready,
     install_lmcache047_hooks,
     probe_lmcache047_storage_contract,
@@ -22,6 +26,42 @@ from astrakv.runtime.eviction import ObjectLevel
 
 
 class LMCache047RuntimePatchTests(unittest.TestCase):
+    def test_local_disk_remove_race_tolerates_missing_file(self):
+        class Meta:
+            def __init__(self, path: str, size: int) -> None:
+                self.path = path
+                self.size = size
+
+        class FakeBackend:
+            def __init__(self) -> None:
+                self.disk_lock = threading.RLock()
+                self.dict = {}
+                self.usage = 0
+                self.stats_monitor = types.SimpleNamespace(update_local_storage_usage=lambda usage: None)
+                self.cache_policy = types.SimpleNamespace(update_on_force_evict=lambda key: None)
+                self.batched_msg_sender = None
+
+            def update_local_storage_usage(self, usage: int) -> None:
+                self.usage = usage
+
+            def remove(self, key, force=True):
+                raise AssertionError("original remove should be replaced by the race patch")
+
+        backend = FakeBackend()
+        missing_path = tempfile.mktemp(suffix=".pt")
+        backend.dict["key"] = Meta(missing_path, 10)
+        backend.usage = 10
+        manager = types.SimpleNamespace(storage_backends={"LocalDiskBackend": backend})
+
+        self.assertEqual(patch_local_disk_remove_race(manager), 1)
+        # The backing file does not exist: remove must not raise, must return
+        # True, and must release the lock.
+        self.assertTrue(backend.remove("key"))
+        self.assertEqual(backend.usage, 0)
+        self.assertFalse(backend.disk_lock._is_owned())
+        # Second remove on the same key returns False without crashing.
+        self.assertFalse(backend.remove("key"))
+
     def test_owner_action_read_bypasses_only_its_own_reservation_guard(self):
         records = []
         registry = BackendBindingRegistry(run_id="run", engine_instance_id="engine", worker_id="worker")

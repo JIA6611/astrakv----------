@@ -1897,6 +1897,86 @@ class OnlineControllerTests(unittest.TestCase):
         self._ingest_cpu_object(controller, object_key="prefix", backend_object_id="block-7", prefetch_waste=True, size=1)
         self.assertEqual(controller.global_evict_scan(now_ns=1_000), [])
 
+    def test_global_evict_scan_deduplicates_completed_source_until_repopulated(self):
+        binding = self._evict_ready_binding(
+            object_key="prefix-a", backend_object_id="block-a", spec_id="spec-terminal",
+        )
+        bridge = OnlineBackendBridge(
+            run_id="run",
+            bindings=[binding],
+            hook_client=object(),
+            hook_url="http://127.0.0.1:7900/actions",
+            gate=gate(),
+        )
+        controller = OnlinePolicyController(
+            run_id="run",
+            workload_id="w",
+            bridge=bridge,
+            config=OnlinePolicyControllerConfig(
+                evict_cpu_capacity_bytes=1,
+                global_evict_scan_min_interval_s=0.0,
+            ),
+        )
+        controller.execution_enabled = True
+        self._ingest_cpu_object(
+            controller,
+            object_key="prefix-a",
+            backend_object_id="block-a",
+            prefetch_waste=True,
+            size=1,
+        )
+        state = controller.profile_store.object_state("block-a")
+        assert state is not None
+        generation = int(state.get("binding_generation") or 0)
+        bridge.dispatch = lambda decision: RuntimeActionResult(
+            "executed",
+            "evicted",
+            receipt=BackendActionReceipt(
+                "run", "command-1", "receipt-1", "bind", "block-a",
+                HookAction.EVICT, "completed", 10,
+                tier_before="cpu", tier_after="ssd",
+                binding_generation=generation,
+                decision_id=decision.decision_id,
+                request_id="req",
+            ),
+        )
+        decision = OfflineEvictionDecision(
+            run_id="run",
+            decision_id="terminal-evict",
+            request_id="req",
+            object_key="prefix-a",
+            object_level=ObjectLevel.PREFIX,
+            predicted_action="evict",
+            target_tier="cpu",
+            metadata={
+                "binding_id": "bind",
+                "binding_generation": generation,
+                "backend_object_id": "block-a",
+            },
+        )
+        self.assertEqual(controller.dispatch(decision).status, "executed")
+        self.assertIn(
+            ("block-a", generation, "cpu"),
+            controller._completed_evict_sources,
+        )
+
+        # A late release callback can carry the old CPU tier.  It must not
+        # make the completed source eligible for another not_found retry.
+        self.assertTrue(controller.ingest(BackendHookEvent(
+            "run", "late-release", "req", "prefix-a", ObjectLevel.PREFIX,
+            "block-a", HookAction.RELEASE, "completed", 11,
+            tier_before="cpu", tier_after="cpu", binding_generation=generation,
+        )))
+        self.assertEqual(controller.global_evict_scan(now_ns=12), [])
+
+        # A genuine later placement into CPU reopens that source tier.
+        self.assertTrue(controller.ingest(BackendHookEvent(
+            "run", "new-prefetch", "req", "prefix-a", ObjectLevel.PREFIX,
+            "block-a", HookAction.PREFETCH, "completed", 13,
+            tier_before="ssd", tier_after="cpu", bytes=1, binding_generation=generation,
+        )))
+        self.assertEqual(len(controller.global_evict_scan(now_ns=14)), 1)
+
     def test_global_evict_scan_is_deterministic(self):
         binding_a = self._evict_ready_binding(
             object_key="prefix-a", backend_object_id="block-a", spec_id="spec-scan-det-a",

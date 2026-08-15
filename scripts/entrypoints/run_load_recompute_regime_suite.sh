@@ -26,6 +26,7 @@ PORT="18200"
 CONTEXT_PORT="18190"
 TIMEOUT="900"
 GPU_MEMORY_UTILIZATION="0.72"
+OUTPUT_TOKENS="${ASTRAKV_REGIME_OUTPUT_TOKENS:-8}"
 
 usage() {
   cat <<'EOF'
@@ -35,6 +36,8 @@ Usage: bash scripts/entrypoints/run_load_recompute_regime_suite.sh \
 DIR must contain the canonical repeated_long_prefix.jsonl and
 constrained_kv_churn.jsonl (phase 1) or queued_concurrency.jsonl and
 random_no_reuse.jsonl (phase 2).
+--output-tokens N defaults to 8 for this TTFT/UMA regime matrix; every cell
+uses the same fixed value.
 EOF
 }
 
@@ -53,12 +56,14 @@ while [[ $# -gt 0 ]]; do
     --context-port) CONTEXT_PORT="$2"; shift 2 ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
     --gpu-memory-utilization) GPU_MEMORY_UTILIZATION="$2"; shift 2 ;;
+    --output-tokens) OUTPUT_TOKENS="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
 [[ -n "$WORKLOAD_DIR" && -d "$WORKLOAD_DIR" ]] || { echo "--workload-dir is required" >&2; exit 2; }
+[[ "$OUTPUT_TOKENS" =~ ^[1-9][0-9]*$ ]] || { echo "--output-tokens must be positive" >&2; exit 2; }
 [[ -f "$PATCH_MANIFEST" && -f "$CALLBACK_SMOKE" ]] || { echo "--patch-manifest and --callback-smoke are required" >&2; exit 2; }
 [[ "$PHASE" == "1" || "$PHASE" == "2" ]] || { echo "--phase must be 1 or 2" >&2; exit 2; }
 [[ "$HOST" == "127.0.0.1" || "$HOST" == "localhost" ]] || { echo "only loopback host is supported" >&2; exit 2; }
@@ -111,16 +116,20 @@ run_cell() {
   fi
   local extra_args=""
   [[ "$SMOKE" == true ]] && extra_args="--allow-ineligible"
+  # This report compares the variant members across cells (full/partial/
+  # recompute-only/off).  A same-cell baseline is never consumed, so omit it
+  # and halve model starts without weakening the cross-cell comparison.
   bash scripts/entrypoints/run_kv_core_controlled_suite.sh \
     --workload-dir "$cell_workload_dir" --workloads "$workload" --phases "$phase" \
     --output-dir "$cell_run_dir" --patch-manifest "$PATCH_MANIFEST" \
     --callback-smoke "$CALLBACK_SMOKE" --model "$MODEL" --host "$HOST" \
     --port "$PORT" --context-port "$CONTEXT_PORT" --timeout "$TIMEOUT" \
-    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" $extra_args
+    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
+    --output-tokens "$OUTPUT_TOKENS" --variant-only $extra_args
   local baseline_dir="$cell_run_dir/$phase/$workload/cold/baseline"
   local variant_dir="$cell_run_dir/$phase/$workload/cold/variant"
-  [[ -d "$baseline_dir" && -d "$variant_dir" ]] || { echo "missing cell runs: $label" >&2; return 1; }
-  echo "{\"workload\": \"$workload\", \"arm\": \"$arm\", \"phase\": \"$phase\", \"baseline_dir\": \"$baseline_dir\", \"variant_dir\": \"$variant_dir\", \"smoke\": $SMOKE}" >> "$CELLS_FILE"
+  [[ -d "$variant_dir" ]] || { echo "missing variant cell run: $label" >&2; return 1; }
+  echo "{\"workload\": \"$workload\", \"arm\": \"$arm\", \"phase\": \"$phase\", \"baseline_dir\": \"\", \"variant_dir\": \"$variant_dir\", \"variant_only\": true, \"output_tokens\": $OUTPUT_TOKENS, \"smoke\": $SMOKE}" >> "$CELLS_FILE"
 }
 
 if [[ "$PHASE" == "1" ]]; then

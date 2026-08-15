@@ -42,6 +42,7 @@ EXTERNAL_SIDECAR=""
 DATASETS="qasper,multifieldqa_en"
 WARMUP_PASSES="${ASTRAKV_ABLATION_WARMUP_PASSES:-0}"
 WARMUP_LIMIT="${ASTRAKV_ABLATION_WARMUP_LIMIT:-8}"
+WARMUP_SAME_SERVER="${ASTRAKV_ABLATION_WARMUP_SAME_SERVER:-false}"
 EVICTION_FILL_GROUPS="${ASTRAKV_ABLATION_EVICTION_FILL_GROUPS:-0}"
 MEASURE_PHASES="${ASTRAKV_ABLATION_MEASURE_PHASES:-}"
 PREDICTION_PHASES="${ASTRAKV_ABLATION_PREDICTION_PHASES:-}"
@@ -49,6 +50,9 @@ INTERLEAVE="false"
 INTERLEAVE_PATTERN="${ASTRAKV_INTERLEAVE_PATTERN:-round-robin}"
 ROLES="${ASTRAKV_ABLATION_ROLES:-baseline,variant}"
 PREFETCH_LEAD_S="${ASTRAKV_ABLATION_PREFETCH_LEAD_S:-0.0}"
+OUTPUT_TOKENS="${ASTRAKV_ABLATION_OUTPUT_TOKENS:-128}"
+WARMUP_OUTPUT_TOKENS="${ASTRAKV_ABLATION_WARMUP_OUTPUT_TOKENS:-$OUTPUT_TOKENS}"
+CACHE_ROOT=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -74,11 +78,17 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+CACHE_ROOT="${ASTRAKV_ABLATION_CACHE_ROOT:-$OUTPUT_DIR}"
+
 [[ -x "$PYTHON" ]] || { echo "Python is not executable: $PYTHON" >&2; exit 2; }
 [[ -d "$MODEL" ]] || { echo "Model path is missing: $MODEL" >&2; exit 2; }
 [[ "$HOST" == "127.0.0.1" || "$HOST" == "localhost" ]] || { echo "Only loopback hosts are allowed" >&2; exit 2; }
 [[ "$LIMIT" =~ ^[0-9]+$ ]] || { echo "--limit must be a non-negative integer" >&2; exit 2; }
 [[ "$EVICTION_FILL_GROUPS" =~ ^[0-9]+$ ]] || { echo "--eviction-fill-groups must be a non-negative integer" >&2; exit 2; }
+[[ "$OUTPUT_TOKENS" =~ ^[1-9][0-9]*$ ]] || { echo "ASTRAKV_ABLATION_OUTPUT_TOKENS must be positive" >&2; exit 2; }
+[[ "$WARMUP_OUTPUT_TOKENS" =~ ^[1-9][0-9]*$ ]] || { echo "ASTRAKV_ABLATION_WARMUP_OUTPUT_TOKENS must be positive" >&2; exit 2; }
+[[ "$WARMUP_SAME_SERVER" == "true" || "$WARMUP_SAME_SERVER" == "false" ]] || {
+  echo "ASTRAKV_ABLATION_WARMUP_SAME_SERVER must be true or false" >&2; exit 2; }
 [[ -n "$GROUPED_ROOT" ]] || { echo "--grouped-root is required" >&2; exit 2; }
 IFS=',' read -r -a SELECTED_DATASETS <<< "$DATASETS"
 [[ "${#SELECTED_DATASETS[@]}" -gt 0 ]] || { echo "--datasets must not be empty" >&2; exit 2; }
@@ -143,7 +153,7 @@ start_server() {
   local hooks_enabled="${6:-true}"
   local launch_run_id="$run_id"
   local online_policy="true"
-  local prefetch_dispatch="${ASTRAKV_ENABLE_ONLINE_PREFETCH_DISPATCH:-true}"
+  local prefetch_dispatch=""
   local kv_core_mode="${ASTRAKV_KV_CORE_MODE:-off}"
   local vendor_patch="${ASTRAKV_KV_CORE_VENDOR_PATCH:-true}"
   if [[ "$hooks_enabled" != "true" ]]; then
@@ -181,9 +191,17 @@ start_server() {
     # shellcheck disable=SC1090
     source "$runtime_env"
     set +a
+    # The preceding role deliberately exports its runtime.env for the
+    # benchmark client.  Resolve dispatch only *after* sourcing the current
+    # role so a baseline=false value cannot leak into the following variant.
+    prefetch_dispatch="${ASTRAKV_ENABLE_ONLINE_PREFETCH_DISPATCH:-true}"
   fi
+  # LMCache 0.4.7 defaults to builtin key hashing. Warmup and formal
+  # servers are separate processes, so both must use the same Python seed.
   ASTRAKV_MODEL="$MODEL" \
   ASTRAKV_PYTHON="$PYTHON" \
+  PYTHONHASHSEED="${PYTHONHASHSEED:-0}" \
+  ASTRAKV_VLLM_SEED="${ASTRAKV_VLLM_SEED:-0}" \
   ASTRAKV_HOST="$HOST" \
   ASTRAKV_PORT="$PORT" \
   ASTRAKV_MAX_MODEL_LEN="$MAX_MODEL_LEN" \
@@ -268,6 +286,7 @@ materialize_dataset() {
     --dataset "$dataset" \
     --task "$dataset" \
     --limit "$LIMIT" \
+    --output-tokens "$OUTPUT_TOKENS" \
     --prefetch-lead-s "$PREFETCH_LEAD_S" \
     "${extra_args[@]}"
 
@@ -345,10 +364,14 @@ run_condition() {
   local run_id="grouped-exact-next-${dataset}-${role}-$(date -u +%Y%m%dT%H%M%SZ)"
   local run_dir="$OUTPUT_DIR/$dataset/$role"
   local state_dir="$OUTPUT_DIR/$dataset/${role}-state"
-  local cache_dir="$OUTPUT_DIR/$dataset/${role}-lmcache-store"
+  # A functional calibration may point this at a previously completed,
+  # process-cold SSD seed to avoid repeating an expensive warmup. Formal
+  # comparisons leave ASTRAKV_ABLATION_CACHE_ROOT unset and remain isolated.
+  local cache_dir="$CACHE_ROOT/$dataset/${role}-lmcache-store"
   local runtime_env="$state_dir/runtime.env"
   local server_log="$OUTPUT_DIR/$dataset/${role}-server.log"
   local sidecar_dir="$state_dir/sidecar"
+  local formal_server_started="false"
   mkdir -p "$run_dir" "$state_dir" "$sidecar_dir"
   local secret
   secret="$($PYTHON -c 'import secrets; print(secrets.token_hex(32))')"
@@ -396,29 +419,58 @@ PY
   fi
   write_runtime_env "$run_id" "$state_dir" "$runtime_env" "$secret" "$role" "$sidecar_path"
   if [[ "$WARMUP_PASSES" =~ ^[0-9]+$ && "$WARMUP_PASSES" -gt 0 ]]; then
-    local warmup_file="$OUTPUT_DIR/$dataset/materialized/${dataset}_grouped_exact_next_warmup.jsonl"
-    if [[ ! -f "$warmup_file" ]]; then
-      "$PYTHON" - "$canonical" "$warmup_file" "$WARMUP_LIMIT" <<'PY'
+    local warmup_source="$OUTPUT_DIR/$dataset/materialized/${dataset}_grouped_exact_next_warmup.jsonl"
+    local warmup_file="$OUTPUT_DIR/$dataset/materialized/${dataset}_grouped_exact_next_selected_warmup.jsonl"
+    # B needs the predicted prompt's exact native keys on SSD before ingress.
+    # Seed only the labeled prediction phases (normally two/few ``far`` rows)
+    # instead of decoding dozens of unrelated filler requests. Other suites
+    # retain their historical source-file + limit behavior.
+    "$PYTHON" - "$canonical" "$warmup_source" "$warmup_file" "$PREDICTION_PHASES" "$WARMUP_LIMIT" <<'PY'
 import json, sys
-source, target, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
-rows = []
-with open(source, encoding="utf-8") as handle:
-    for line in handle:
-        rows.append(json.loads(line))
-        if len(rows) >= limit:
-            break
+canonical, warmup_source, target, phase_text, limit_text = sys.argv[1:]
+phases = {item.strip() for item in phase_text.split(",") if item.strip()}
+limit = int(limit_text)
+source = canonical if phases else warmup_source
+try:
+    with open(source, encoding="utf-8") as handle:
+        rows = [json.loads(line) for line in handle if line.strip()]
+except FileNotFoundError:
+    with open(canonical, encoding="utf-8") as handle:
+        rows = [json.loads(line) for line in handle if line.strip()]
+if phases:
+    rows = [
+        row for row in rows
+        if str((row.get("metadata") or {}).get("prefetch_phase") or "") in phases
+    ]
+elif limit > 0:
+    rows = rows[:limit]
+if not rows:
+    raise SystemExit(
+        f"warmup selection is empty: source={source} phases={sorted(phases)}"
+    )
 with open(target, "w", encoding="utf-8") as handle:
     for row in rows:
         handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-print(f"warmup workload written to {target} ({len(rows)} rows)")
+print(
+    f"warmup workload written to {target} "
+    f"({len(rows)} rows, phases={sorted(phases)})"
+)
 PY
-    fi
     local warmup_state_dir="$state_dir/warmup-state"
     local warmup_server_log="$OUTPUT_DIR/$dataset/${role}-warmup-server.log"
-    # Warmup writes the same LMCache SSD directory, then the process is
-    # stopped before the formal run.  This makes CPU/GPU residency cold while
-    # preserving the disk objects needed by the measured far requests.
-    start_server "" "$warmup_state_dir" "" "$cache_dir" "$warmup_server_log" false
+    if [[ "$WARMUP_SAME_SERVER" == "true" ]]; then
+      # LMCache 0.4.7 does not rebuild LocalDiskBackend's in-memory metadata
+      # index from existing files. Keep the formal server alive so warmup SSD
+      # keys remain discoverable; measured ingress symmetrically invalidates
+      # their CPU copies before the B-only promotion decision.
+      warmup_state_dir="$state_dir"
+      warmup_server_log="$server_log"
+      start_server "$run_id" "$state_dir" "$runtime_env" "$cache_dir" "$server_log" true
+      formal_server_started="true"
+    else
+      # Historical path for suites that require a fully separate process.
+      start_server "" "$warmup_state_dir" "" "$cache_dir" "$warmup_server_log" false
+    fi
     for pass_index in $(seq 1 "$WARMUP_PASSES"); do
       echo "[$dataset/$role] warmup pass $pass_index/$WARMUP_PASSES (independent LMCache-only server)"
       "$PYTHON" scripts/benchmark/run_real_benchmark.py \
@@ -441,11 +493,15 @@ PY
         --claim-scope online_control_warmup \
         --metrics-interval 1.0 \
         --timeout "$TIMEOUT" \
-        --output-tokens 128
+        --output-tokens "$WARMUP_OUTPUT_TOKENS"
     done
-    cleanup
+    if [[ "$WARMUP_SAME_SERVER" != "true" ]]; then
+      cleanup
+    fi
   fi
-  start_server "$run_id" "$state_dir" "$runtime_env" "$cache_dir" "$server_log"
+  if [[ "$formal_server_started" != "true" ]]; then
+    start_server "$run_id" "$state_dir" "$runtime_env" "$cache_dir" "$server_log"
+  fi
   set -a
   # shellcheck disable=SC1090
   source "$runtime_env"
@@ -477,7 +533,7 @@ PY
     --enable-samples \
     --metrics-interval 1.0 \
     --timeout "$TIMEOUT" \
-    --output-tokens 128
+    --output-tokens "$OUTPUT_TOKENS"
   cleanup
 }
 

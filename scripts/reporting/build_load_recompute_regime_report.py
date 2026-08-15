@@ -61,7 +61,10 @@ def _read_cells(path: Path) -> list[dict[str, Any]]:
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(row, dict) and row.get("variant_dir") and row.get("baseline_dir"):
+        # The regime report is a cross-cell comparison and consumes only the
+        # variant artifact.  New runners omit the redundant same-cell baseline
+        # to halve engine starts; retain compatibility with older cell files.
+        if isinstance(row, dict) and row.get("variant_dir"):
             cells.append(row)
     return cells
 
@@ -83,6 +86,7 @@ def build(cells: list[dict[str, Any]]) -> dict[str, Any]:
                 "workload": cell.get("workload"),
                 "arm": cell.get("arm"),
                 "phase": cell.get("phase"),
+                "output_tokens": cell.get("output_tokens"),
                 "stats": stats[(str(cell.get("workload") or ""), str(cell.get("arm") or ""))],
             }
             for cell in cells

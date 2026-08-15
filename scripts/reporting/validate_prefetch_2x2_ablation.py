@@ -9,9 +9,9 @@ The grouped exact-next ablation produces, per dataset and per role
   and ``kv_core_prefetch_tickets.jsonl`` (Prefetch-A decisions/tickets).
 
 This validator folds the two wrapper runs (A off / A on) into the reported
-cells, counts B receipts, A decisions and tickets.  Per the current scope the
-A+B combined cell (A1B1) is intentionally not run; only pure baseline (A0B0),
-B-only (A0B1) and A-only (A1B0) are reported.
+cells, counts B receipts, A decisions and tickets.  The historical three-cell
+isolation run remains supported; ``--require-combined`` turns the A1B1 cell
+into a strict coexistence requirement for final mainline validation.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "astrakv-prefetch-2x2-validation-v1"
+SCHEMA = "astrakv-prefetch-2x2-validation-v2"
 ROLES = ("baseline", "variant")
 
 
@@ -81,11 +81,18 @@ def _benchmark_ttft(run_dir: Path, state_dir: Path) -> dict[str, Any]:
         state_dir / "benchmark_results.csv",
     )
     if path is None:
-        return {"success_count": 0, "ttft_p50_ms": None, "ttft_p95_ms": None}
+        return {
+            "row_count": 0, "success_count": 0, "failure_count": 0,
+            "ttft_p50_ms": None, "ttft_p95_ms": None,
+        }
     values: list[float] = []
+    row_count = 0
+    failure_count = 0
     with path.open(encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
+            row_count += 1
             if str(row.get("status") or "") != "ok":
+                failure_count += 1
                 continue
             raw = row.get("ttft_ms") or row.get("ttft_p50_ms")
             if raw in (None, ""):
@@ -96,9 +103,15 @@ def _benchmark_ttft(run_dir: Path, state_dir: Path) -> dict[str, Any]:
                 continue
     values.sort()
     if not values:
-        return {"success_count": 0, "ttft_p50_ms": None, "ttft_p95_ms": None}
+        return {
+            "row_count": row_count, "success_count": 0,
+            "failure_count": failure_count,
+            "ttft_p50_ms": None, "ttft_p95_ms": None,
+        }
     return {
+        "row_count": row_count,
         "success_count": len(values),
+        "failure_count": failure_count,
         "ttft_p50_ms": _percentile(values, 50),
         "ttft_p95_ms": _percentile(values, 95),
     }
@@ -190,6 +203,10 @@ def main() -> int:
         "--datasets", default="qasper,multifieldqa_en",
         help="Comma-separated datasets to aggregate (default qasper,multifieldqa_en).",
     )
+    parser.add_argument(
+        "--require-combined", action="store_true",
+        help="Require and validate the A1B1 coexistence cell.",
+    )
     args = parser.parse_args()
     datasets = tuple(item.strip() for item in args.datasets.split(",") if item.strip())
     if not datasets:
@@ -204,9 +221,6 @@ def main() -> int:
     for a_enabled, root in ((False, a_off), (True, a_on)):
         for dataset in datasets:
             for role in ROLES:
-                if a_enabled and role == "variant":
-                    # A+B combined cell is out of scope by decision.
-                    continue
                 cell = _aggregate_cell(root, dataset, role)
                 if not (root / dataset / role).is_dir() and not (root / dataset / f"{role}-state").is_dir():
                     continue
@@ -217,7 +231,24 @@ def main() -> int:
 
     b_only_cells = [cell for cell in cells if cell["cell"] == "A0B1"]
     a_only_cells = [cell for cell in cells if cell["cell"] == "A1B0"]
-    expected_cells = 3 * len(datasets)  # A0B0, A0B1, A1B0
+    combined_cells = [cell for cell in cells if cell["cell"] == "A1B1"]
+    expected_cells = (4 if args.require_combined else 3) * len(datasets)
+    combined_requests_ok = bool(combined_cells) and all(
+        cell["benchmark"]["success_count"] > 0
+        and cell["benchmark"]["failure_count"] == 0
+        for cell in combined_cells
+    )
+    combined_policy_activity = bool(combined_cells) and all(
+        cell["prefetch_a"]["submitted"] > 0
+        or cell["prefetch_a"]["tickets_consumed"] > 0
+        or cell["prefetch_b"]["completed_with_bytes"] > 0
+        or cell["prefetch_b"]["already_cpu_noop"] > 0
+        for cell in combined_cells
+    )
+    combined_b_receipts_safe = bool(combined_cells) and all(
+        not cell["prefetch_b"]["failure_reasons"]
+        for cell in combined_cells
+    )
 
     summary = {
         "schema": SCHEMA,
@@ -225,7 +256,7 @@ def main() -> int:
         "a_on_root": str(a_on),
         "cells": cells,
         "acceptance": {
-            "cells_present": len(cells) == expected_cells,
+            "cells_present": len(cells) >= expected_cells,
             "b_only_completed_receipt": any(
                 cell["prefetch_b"]["completed_with_bytes"] > 0
                 for cell in b_only_cells
@@ -234,11 +265,36 @@ def main() -> int:
                 cell["prefetch_a"]["tickets_consumed"] > 0
                 for cell in a_only_cells
             ),
+            "combined_required": args.require_combined,
+            "combined_present": len(combined_cells) == len(datasets),
+            "combined_requests_ok": combined_requests_ok,
+            "combined_policy_activity": combined_policy_activity,
+            "combined_b_receipts_safe": combined_b_receipts_safe,
+            "combined_coexistence_pass": (
+                combined_requests_ok
+                and combined_policy_activity
+                and combined_b_receipts_safe
+            ) if args.require_combined else None,
         },
-        "both_cell_conflict_totals": None,
+        "both_cell_conflict_totals": {
+            "cells": len(combined_cells),
+            "b_failures": sum(
+                sum(cell["prefetch_b"]["failure_reasons"].values())
+                for cell in combined_cells
+            ),
+            "b_already_cpu_noop": sum(
+                cell["prefetch_b"]["already_cpu_noop"]
+                for cell in combined_cells
+            ),
+            "a_tickets_wasted": sum(
+                cell["prefetch_a"]["tickets_wasted"]
+                for cell in combined_cells
+            ),
+        } if combined_cells else None,
         "note": (
-            "A+B combined (A1B1) is intentionally not verified; scope is pure "
-            "baseline, A-only and B-only performance."
+            "Isolation cells prove A and B independently. When required, A1B1 "
+            "proves that both paths are enabled in one mainline server, requests "
+            "remain successful, and B emits no failed dispatch receipts."
         ),
     }
     payload = json.dumps(summary, indent=2, sort_keys=True)

@@ -33,6 +33,22 @@ def _row(group: str, order: int, prompt: str = "shared context") -> dict:
 
 
 class InterleaveGroupsTests(unittest.TestCase):
+    def test_grouped_runner_resolves_role_dispatch_after_runtime_env(self) -> None:
+        """A baseline=false export must not disable the following variant."""
+        script = (
+            PROJECT_ROOT
+            / "scripts/entrypoints/run_grouped_exact_next_prefetch_ablation.sh"
+        ).read_text(encoding="utf-8")
+        start = script.index("start_server() {")
+        end = script.index("\nwrite_runtime_env() {", start)
+        function = script[start:end]
+        self.assertIn('local prefetch_dispatch=""', function)
+        source_index = function.index('source "$runtime_env"')
+        resolve_index = function.index(
+            'prefetch_dispatch="${ASTRAKV_ENABLE_ONLINE_PREFETCH_DISPATCH:-true}"'
+        )
+        self.assertLess(source_index, resolve_index)
+
     def test_fire_consume_groups_schedule_firsts_then_far_near(self) -> None:
         rows = []
         for g in ("g1", "g2", "g3"):
@@ -121,6 +137,7 @@ class InterleaveGroupsTests(unittest.TestCase):
                     "--limit", "6",
                     "--interleave",
                     "--prefetch-lead-s", "0.25",
+                    "--output-tokens", "8",
                 ],
                 capture_output=True,
                 text=True,
@@ -139,6 +156,7 @@ class InterleaveGroupsTests(unittest.TestCase):
             # prefetch_lead_s is stamped on every row for the A invalidate+fill
             # window.
             self.assertTrue(all(abs(r["prefetch_lead_s"] - 0.25) < 1e-9 for r in rows))
+            self.assertTrue(all(r["expected_output_tokens"] == 8 for r in rows))
 
     def test_cli_fire_consume_applies_limit_after_pair_construction(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:

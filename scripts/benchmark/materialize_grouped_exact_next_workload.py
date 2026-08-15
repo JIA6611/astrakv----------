@@ -21,6 +21,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task", default="")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument(
+        "--output-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Override expected_output_tokens for every materialized row. "
+            "Zero preserves each source row's max_tokens/default of 128."
+        ),
+    )
+    parser.add_argument(
         "--interleave",
         action="store_true",
         help=(
@@ -73,6 +82,8 @@ def main() -> int:
     args = parse_args()
     if args.eviction_fill_groups < 0:
         raise SystemExit("--eviction-fill-groups must be non-negative")
+    if args.output_tokens < 0:
+        raise SystemExit("--output-tokens must be non-negative")
     input_path = Path(args.grouped_prompts_jsonl)
     rows = load_jsonl(input_path)
     ordered = sorted(rows, key=lambda row: int(row.get("order") or 0))
@@ -141,7 +152,11 @@ def main() -> int:
                 reuse_ratio=reuse_ratio,
                 reuse_bucket=reuse_bucket,
                 context_length=estimate_prompt_tokens(str(row.get("prompt") or "")),
-                expected_output_tokens=int(row.get("max_tokens") or 128),
+                expected_output_tokens=(
+                    args.output_tokens
+                    if args.output_tokens > 0
+                    else int(row.get("max_tokens") or 128)
+                ),
                 batch_size=1,
                 case=f"{dataset}_grouped_exact_next",
                 prefetch_lead_s=max(0.0, args.prefetch_lead_s),

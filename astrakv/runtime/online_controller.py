@@ -112,6 +112,12 @@ class OnlinePolicyController:
             )
         )
         self._last_global_evict_scan_ns = 0
+        # A completed layered evict is terminal for that binding generation
+        # and source tier until a later placement event repopulates the tier.
+        # Runtime lifecycle callbacks can arrive after the action receipt and
+        # temporarily restore a stale profile tier; this ledger prevents the
+        # global scan from issuing an unbounded stream of not_found retries.
+        self._completed_evict_sources: dict[tuple[str, int, str], int] = {}
 
     def _offline_profile_for(
         self,
@@ -141,6 +147,24 @@ class OnlinePolicyController:
             return False
         if not self.profile_store.consume(event):
             return False
+        if (
+            event.action in {
+                HookAction.CACHE_STORE,
+                HookAction.CACHE_LOAD,
+                HookAction.OFFLOAD,
+                HookAction.PREFETCH,
+            }
+            and event.status in {"completed", "ok", "executed"}
+            and str(event.tier_after or "") in {"cpu", "ssd"}
+        ):
+            placement_key = (
+                event.backend_object_id,
+                int(event.binding_generation or 0),
+                str(event.tier_after),
+            )
+            terminal_ns = self._completed_evict_sources.get(placement_key)
+            if terminal_ns is not None and int(event.timestamp_ns) > terminal_ns:
+                self._completed_evict_sources.pop(placement_key, None)
         self.trace_events.append(TraceEvent(
             event_type=event.action.value,
             category="kv" if event.action.value.startswith("cache_") else "placement",
@@ -787,6 +811,20 @@ class OnlinePolicyController:
             execution_enabled=self.execution_enabled,
             breaker_state=_breaker_snapshot(breaker),
         )
+        receipt = result.receipt
+        if (
+            decision.predicted_action == "evict"
+            and receipt is not None
+            and receipt.status in {"completed", "ok", "executed"}
+            and str(receipt.tier_before or "") in {"cpu", "ssd"}
+        ):
+            self._completed_evict_sources[
+                (
+                    receipt.backend_object_id,
+                    int(receipt.binding_generation or 0),
+                    str(receipt.tier_before),
+                )
+            ] = int(receipt.timestamp_ns or time.time_ns())
         self.profile_store.checkpoint()
         return result
 
@@ -850,6 +888,13 @@ class OnlinePolicyController:
             if tier == "ssd" and not ssd_pressure_over:
                 continue
             if tier not in {"cpu", "ssd"}:
+                continue
+            terminal_key = (
+                backend_object_id,
+                _as_int(state.get("binding_generation")),
+                tier,
+            )
+            if terminal_key in self._completed_evict_sources:
                 continue
             if _as_int(state.get("active_reference_count")) > 0:
                 continue

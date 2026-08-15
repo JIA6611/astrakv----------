@@ -37,9 +37,11 @@ SSD_CAPACITY_BYTES=""
 PRESSURE_TRIGGER="0.8"
 COLD_SCORE_THRESHOLD="0.35"
 GLOBAL_SCAN_INTERVAL_S="5.0"
-GLOBAL_SCAN_MAX_VICTIMS="4"
+GLOBAL_SCAN_MAX_VICTIMS="1"
 WARMUP_PASSES="1"
 WARMUP_LIMIT="8"
+OUTPUT_TOKENS="${ASTRAKV_E11_OUTPUT_TOKENS:-8}"
+ROLES="baseline"
 PATCH_VERIFICATION="${ASTRAKV_KV_CORE_PATCH_VERIFICATION:-}"
 EXTERNAL_SIDECAR=""
 KV_CORE_MODE="on"
@@ -64,10 +66,14 @@ Options:
   --pressure-trigger N        Pressure trigger fraction (default 0.8)
   --cold-score-threshold N    evict coldness score threshold (default 0.35)
   --global-scan-interval-s N  Global evict scan min interval (default 5.0)
-  --global-scan-max-victims N Max victims per scan (default 4)
+  --global-scan-max-victims N Max victims per scan (default 1; reduces stale duplicates)
   --warmup-passes N           Warmup passes before the measured run
                               (same server/cache, builds online profile; default 1)
   --warmup-limit N            Warmup request count per pass (default 8)
+  --output-tokens N           Fixed decode tokens per request (default 8;
+                              E11 evaluates TTFT/eviction, not long decode)
+  --roles ROLE                Run one identical role in both arms: baseline or
+                              variant (default baseline; isolates evict from B)
   --patch-verification PATH   KV-Core connector patch verification JSON
                               (required when --no-kv-core is not set; defaults
                               to $ASTRAKV_KV_CORE_PATCH_VERIFICATION)
@@ -97,6 +103,8 @@ while [[ $# -gt 0 ]]; do
     --global-scan-max-victims) GLOBAL_SCAN_MAX_VICTIMS="$2"; shift 2 ;;
     --warmup-passes) WARMUP_PASSES="$2"; shift 2 ;;
     --warmup-limit) WARMUP_LIMIT="$2"; shift 2 ;;
+    --output-tokens) OUTPUT_TOKENS="$2"; shift 2 ;;
+    --roles) ROLES="$2"; shift 2 ;;
     --patch-verification) PATCH_VERIFICATION="$2"; shift 2 ;;
     --sidecar-path) EXTERNAL_SIDECAR="$2"; shift 2 ;;
     --no-kv-core) KV_CORE_MODE="off"; shift ;;
@@ -110,6 +118,9 @@ done
 [[ -d "$MODEL" ]] || { echo "model directory is missing: $MODEL" >&2; exit 2; }
 [[ "$LIMIT" =~ ^[0-9]+$ ]] || { echo "--limit must be a non-negative integer" >&2; exit 2; }
 [[ "$REPEATS" =~ ^[1-9][0-9]*$ ]] || { echo "--repeats must be a positive integer" >&2; exit 2; }
+[[ "$OUTPUT_TOKENS" =~ ^[1-9][0-9]*$ ]] || { echo "--output-tokens must be positive" >&2; exit 2; }
+[[ "$ROLES" == "baseline" || "$ROLES" == "variant" ]] || {
+  echo "--roles must be baseline or variant" >&2; exit 2; }
 IFS=',' read -r -a SELECTED_DATASETS <<< "$DATASETS"
 [[ "${#SELECTED_DATASETS[@]}" -gt 0 ]] || { echo "--datasets must not be empty" >&2; exit 2; }
 for dataset in "${SELECTED_DATASETS[@]}"; do
@@ -196,8 +207,8 @@ run_arm() {
     # evict-B mirrors LMCache's native watermark loop: periodic pressure scan.
     periodic_env+=(
       "ASTRAKV_EVICT_PERIODIC_SCAN_ENABLED=true"
-      "ASTRAKV_EVICT_PERIODIC_SCAN_INTERVAL_S=1.0"
-      "ASTRAKV_EVICT_GLOBAL_SCAN_MIN_INTERVAL_S=1.0"
+      "ASTRAKV_EVICT_PERIODIC_SCAN_INTERVAL_S=$GLOBAL_SCAN_INTERVAL_S"
+      "ASTRAKV_EVICT_GLOBAL_SCAN_MIN_INTERVAL_S=$GLOBAL_SCAN_INTERVAL_S"
     )
   fi
   env \
@@ -216,6 +227,8 @@ run_arm() {
     "${scope_env[@]}" \
     "ASTRAKV_ABLATION_WARMUP_PASSES=$WARMUP_PASSES" \
     "ASTRAKV_ABLATION_WARMUP_LIMIT=$WARMUP_LIMIT" \
+    "ASTRAKV_ABLATION_OUTPUT_TOKENS=$OUTPUT_TOKENS" \
+    "ASTRAKV_ABLATION_WARMUP_OUTPUT_TOKENS=$OUTPUT_TOKENS" \
     "ASTRAKV_LOCAL_CPU_SIZE_GB=$cpu_gb" \
     "ASTRAKV_LOCAL_DISK_SIZE_GB=$ssd_gb" \
     "LMCACHE_CACHE_POLICY=LRU" \
@@ -225,6 +238,7 @@ run_arm() {
       --model "$MODEL" \
       --limit "$LIMIT" \
       --datasets "$dataset" \
+      --roles "$ROLES" \
       --output-dir "$arm_out" \
       "${SIDECAR_ARGS[@]}"
 }
@@ -262,7 +276,7 @@ for arm in arm-evict-b arm-lru; do
   for rep in $(seq 1 "$REPEATS"); do
     # Artifacts (receipts/commands/tickets) live in the run dir (baseline|variant),
     # not the *-state dir; the ablation copies them over during run_condition.
-    for run_dir in "$OUTPUT_ROOT/$arm/rep-$rep"/*/{baseline,variant}; do
+    for run_dir in "$OUTPUT_ROOT/$arm/rep-$rep"/*/"$ROLES"; do
       [[ -d "$run_dir" ]] || continue
       "$PYTHON" scripts/reporting/build_evict_mainline_report.py --state-dir "$run_dir" >/dev/null || true
     done
@@ -271,6 +285,11 @@ for arm in arm-evict-b arm-lru; do
     --arm-root "$OUTPUT_ROOT/$arm" \
     --output "$OUTPUT_ROOT/$arm/arm_metrics.json" 2>/dev/null || true
 done
+
+"$PYTHON" scripts/reporting/evaluate_e11_target.py \
+  --root "$OUTPUT_ROOT" --role "$ROLES" \
+  --output "$OUTPUT_ROOT/e11_target_report.md" \
+  --paired-manifest-output "$OUTPUT_ROOT/e11_paired_run_manifest.json"
 
 echo ""
 echo "evict-B vs LRU suite completed: $OUTPUT_ROOT"

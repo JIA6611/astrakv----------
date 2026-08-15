@@ -251,6 +251,103 @@ class RuntimeControlHost:
             raise RuntimeError("runtime control host is not started")
         return f"http://127.0.0.1:{self._http_server.server_port}/actions"
 
+    def _authorize_predictive_prefetch_context(
+        self, context: RuntimeRequestContext,
+    ) -> RuntimeRequestContext:
+        """Attach a scoped B-policy authorization to an ingress context.
+
+        A predictive prefetch must run in the request's authenticated lead
+        window, before the HTTP request performs its native LMCache lookup.
+        Release-time dispatch cannot do this for a disk object that was
+        populated by a different warmup process because the live binding does
+        not exist yet.  The exact token ids already carried by this context are
+        the version-locked execution identity; the sidecar/profile only grants
+        permission for this one request/object pair.
+        """
+        controller = self.online_controller
+        if (
+            controller is None
+            or not self.config.online_policy_enabled
+            or not self.config.online_prefetch_dispatch_enabled
+            or self.config.online_prefetch_mode == "disabled"
+        ):
+            return context
+        metadata = dict(context.metadata)
+        try:
+            lead_s = float(metadata.get("prefetch_lead_s") or 0.0)
+        except (TypeError, ValueError):
+            lead_s = 0.0
+        if lead_s <= 0.0:
+            return context
+        object_key = str(
+            metadata.get("object_key")
+            or metadata.get("cache_key")
+            or metadata.get("prefix_id")
+            or context.request_id
+        )
+        prefix_id = str(metadata.get("prefix_id") or object_key)
+        prefix_hash = str(metadata.get("prefix_hash") or prefix_id)
+        origin = ""
+        evidence: dict[str, Any] = {}
+        if (
+            self.config.online_prefetch_mode != "prefix_only"
+            and controller.prediction_source is not None
+        ):
+            for prediction in controller.prediction_source.predictions_for_request(
+                context.request_id,
+            ):
+                if (
+                    prediction.candidate_object_id == object_key
+                    and prediction.object_level is ObjectLevel.PREFIX
+                ):
+                    origin = "sidecar_b"
+                    evidence = {
+                        "prediction_score": prediction.score,
+                        "prediction_confidence": prediction.confidence,
+                        "prediction_reason": prediction.reason,
+                        "prediction_evidence_source": prediction.evidence_source,
+                        "prediction_expires_at_ns": prediction.expires_at_ns,
+                    }
+                    break
+        if not origin and self.config.online_prefetch_mode in {
+            "prefix_only", "combined", "hybrid",
+        } and controller.scheduler_hints is not None:
+            hint = controller.scheduler_hints.best_hint_for_object(
+                request_id=context.request_id,
+                backend_object_id="",
+                object_key=object_key,
+                prefix_id=prefix_id,
+                prefix_hash=prefix_hash,
+            )
+            if hint is not None and str(hint.action or "") == "prefetch":
+                origin = "profile_b"
+                evidence = {
+                    "scheduler_hint_reason": hint.reason,
+                    "scheduler_hint_priority": hint.priority,
+                }
+        if not origin:
+            return context
+        authorization = {
+            "schema": "astrakv-predictive-prefetch-authorization-v1",
+            "request_id": context.request_id,
+            "object_key": object_key,
+            "prefetch_origin": origin,
+            "prefetch_lead_s": lead_s,
+            "authorized_at_ns": time.time_ns(),
+            **evidence,
+        }
+        with self._event_lock:
+            self._append_artifact(
+                "predictive_prefetch_authorizations.jsonl", authorization,
+            )
+        metadata.update({
+            "predictive_prefetch_authorized": True,
+            "prefetch_origin": origin,
+            "predictive_prefetch_object_key": object_key,
+        })
+        metadata.update(evidence)
+        return replace(context, metadata=metadata)
+
     def start(self) -> None:
         if self._http_server is not None:
             return
@@ -278,7 +375,9 @@ class RuntimeControlHost:
                         )
                         bridge = host._kv_runtime_bridge
                         if bridge is not None:
-                            bridge.ingress_request(context)
+                            bridge.ingress_request(
+                                host._authorize_predictive_prefetch_context(context)
+                            )
                     else:
                         service = host.action_service
                         if service is None:

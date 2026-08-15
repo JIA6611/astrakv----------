@@ -14,9 +14,51 @@ from astrakv.runtime.backend_hook import BackendActionCommand, BackendActionRece
 from astrakv.runtime.eviction import ObjectLevel
 from astrakv.runtime.lmcache047_action_service import command_integrity_digest
 from astrakv.runtime.kv_runtime_core import RuntimeMode
+from astrakv.runtime.prediction_sidecar import PredictionSidecarIndex, SidecarPrediction
 
 
 class RuntimeControlHostTests(unittest.TestCase):
+    def test_sidecar_authorizes_only_matching_ingress_lead_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host = RuntimeControlHost(RuntimeControlHostConfig(
+                run_id="run-a", state_dir=Path(directory), secret=b"a" * 32,
+                engine_instance_id="engine", worker_id="worker",
+                online_policy_enabled=True,
+                online_prefetch_dispatch_enabled=True,
+                online_prefetch_mode="hybrid",
+            ))
+            prediction = SidecarPrediction(
+                run_id="run-a", request_id="request-far",
+                candidate_object_id="prefix-a", object_level=ObjectLevel.PREFIX,
+                score=0.99, recommended_lead_time_ms=250.0,
+                confidence=0.98, reason="exact_next_locality",
+                evidence_source="test", predicted_class="exact-next",
+                expires_at_ns=9_999_999_999_999_999_999,
+            )
+            host.online_controller = SimpleNamespace(
+                prediction_source=PredictionSidecarIndex([prediction], run_id="run-a"),
+                scheduler_hints=None,
+            )
+            context = RuntimeRequestContext(
+                run_id="run-a", request_id="request-far", case="case",
+                request_nonce="nonce", request_started_s=time.time(),
+                metadata={"cache_key": "prefix-a", "prefix_id": "prefix-a",
+                          "prefetch_lead_s": 5.0, "exact_token_ids": [1, 2, 3]},
+            )
+
+            authorized = host._authorize_predictive_prefetch_context(context)
+
+            self.assertIsNot(authorized, context)
+            self.assertTrue(authorized.metadata["predictive_prefetch_authorized"])
+            self.assertEqual(authorized.metadata["prefetch_origin"], "sidecar_b")
+            rows = [
+                json.loads(line) for line in
+                (Path(directory) / "predictive_prefetch_authorizations.jsonl")
+                .read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(rows[0]["request_id"], "request-far")
+            self.assertEqual(rows[0]["object_key"], "prefix-a")
+
     def test_duplicate_single_process_bridge_registration_is_idempotent(self):
         with tempfile.TemporaryDirectory() as directory:
             host = RuntimeControlHost(RuntimeControlHostConfig(

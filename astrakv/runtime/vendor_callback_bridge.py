@@ -100,6 +100,7 @@ class VendorCallbackBridge:
         self._prefetch_by_request: dict[str, str] = {}
         self._ingress_started_ns: dict[str, int] = {}
         self._ingress_object_key: dict[str, str] = {}
+        self._ingress_prefetch_origin: dict[str, str] = {}
         # Test-only per-request decision overrides (memory pressure, deadline,
         # IO bandwidth, forced recompute) published through the authenticated
         # request context.  Populated only when the equivalence test gate is
@@ -171,7 +172,14 @@ class VendorCallbackBridge:
             return None
         bridge = cls(connector)
         host = installed_runtime_control_host()
-        if host is not None and scheduler_role:
+        # ``connector=None`` may have created the process-local control host
+        # before LMCache constructs the real connector.  In that startup
+        # order the connector's role metadata is not a reliable ownership
+        # signal (vLLM 0.23 can expose WORKER with no worker_count yet), but a
+        # process-local host is authoritative proof that this bridge must be
+        # attached to it.  A bridge in another process observes ``host is
+        # None`` and therefore still cannot register across process bounds.
+        if host is not None:
             host.register_kv_runtime_bridge(bridge)
         return bridge
 
@@ -185,6 +193,18 @@ class VendorCallbackBridge:
             or request_id
         )
         self._ingress_object_key[request_id] = object_key
+        predictive_prefetch_authorized = (
+            metadata.get("predictive_prefetch_authorized") is True
+            and str(metadata.get("prefetch_origin") or "") in {
+                "sidecar_b", "profile_b",
+            }
+        )
+        prefetch_origin = (
+            str(metadata.get("prefetch_origin") or "")
+            if predictive_prefetch_authorized
+            else "prefetch_a"
+        )
+        self._ingress_prefetch_origin[request_id] = prefetch_origin
         try:
             tokens = tuple(int(token) for token in metadata.get("exact_token_ids", ()))
         except (TypeError, ValueError):
@@ -221,7 +241,10 @@ class VendorCallbackBridge:
             _env_flag("ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD")
             and prefetch_lead_s > 0.0
         )
-        promote = active and _env_flag("ASTRAKV_KV_CORE_CPU_PREFETCH_ENABLED")
+        promote = active and (
+            _env_flag("ASTRAKV_KV_CORE_CPU_PREFETCH_ENABLED")
+            or predictive_prefetch_authorized
+        )
         if self._storage_manager() is None:
             # The EngineCore scheduler owns authenticated ingress, while the
             # worker owns LocalDiskBackend/LocalCPUBackend.  Publish the exact
@@ -234,6 +257,7 @@ class VendorCallbackBridge:
                     normalized_configs,
                     promote=promote,
                     invalidate_disk_backed_cpu=invalidate_disk_backed_cpu,
+                    prefetch_origin=prefetch_origin,
                 )
             return
         if invalidate_disk_backed_cpu:
@@ -1183,6 +1207,9 @@ class VendorCallbackBridge:
             "memory_pressure": capability.memory_pressure,
             "status": "rejected" if reason is not None else "submitted",
             "reason": reason or "",
+            "prefetch_origin": self._ingress_prefetch_origin.get(
+                request_id, "prefetch_a",
+            ),
             "timestamp_ns": time.time_ns(),
         })
         if reason is not None:
@@ -1279,6 +1306,7 @@ class VendorCallbackBridge:
             request_configs = payload.get("request_configs")
             promote = payload.get("promote") is True
             invalidate_disk_backed_cpu = payload.get("invalidate_disk_backed_cpu") is True
+            prefetch_origin = str(payload.get("prefetch_origin") or "prefetch_a")
             if not isinstance(request_configs, dict):
                 request_configs = None
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
@@ -1288,6 +1316,7 @@ class VendorCallbackBridge:
         if expires_at_ns <= time.time_ns():
             return
         callbacks = self._callbacks()
+        self._ingress_prefetch_origin[request_id] = prefetch_origin
         if invalidate_disk_backed_cpu:
             self._invalidate_disk_backed_cpu_prefix(
                 request_id=request_id,
@@ -1744,6 +1773,7 @@ class VendorCallbackBridge:
         *,
         promote: bool,
         invalidate_disk_backed_cpu: bool = False,
+        prefetch_origin: str = "prefetch_a",
     ) -> None:
         if self._state_dir is None:
             return
@@ -1759,6 +1789,7 @@ class VendorCallbackBridge:
             "request_configs": request_configs,
             "promote": bool(promote),
             "invalidate_disk_backed_cpu": bool(invalidate_disk_backed_cpu),
+            "prefetch_origin": str(prefetch_origin or "prefetch_a"),
             "created_at_ns": now,
             "expires_at_ns": now + _env_int(
                 "ASTRAKV_KV_CORE_PREFETCH_TTL_NS", 30_000_000_000,

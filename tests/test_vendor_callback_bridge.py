@@ -168,6 +168,36 @@ def _scheduler_connector() -> SimpleNamespace:
 
 
 class VendorCallbackBridgeTests(unittest.TestCase):
+    def test_predictive_authorization_promotes_with_a_flag_disabled(self):
+        with patch.dict(
+            os.environ,
+            {"ASTRAKV_KV_CORE_CPU_PREFETCH_ENABLED": "false"},
+            clear=False,
+        ):
+            bridge = VendorCallbackBridge(SimpleNamespace())
+            active_callbacks = SimpleNamespace(mode=RuntimeMode.ACTIVE)
+            with (
+                patch.object(bridge, "_callbacks", return_value=active_callbacks),
+                patch.object(bridge, "_storage_manager", return_value=object()),
+                patch.object(bridge, "_publish_tier_observation"),
+                patch.object(bridge, "_schedule_cpu_promotion") as promote,
+            ):
+                bridge.ingress_request(SimpleNamespace(
+                    request_id="request-far",
+                    metadata={
+                        "cache_key": "prefix-a",
+                        "exact_token_ids": [1, 2, 3, 4],
+                        "prefetch_lead_s": 5.0,
+                        "predictive_prefetch_authorized": True,
+                        "prefetch_origin": "sidecar_b",
+                    },
+                ))
+
+            promote.assert_called_once()
+            self.assertEqual(
+                bridge._ingress_prefetch_origin["request-far"], "sidecar_b",
+            )
+
     def test_connector_metadata_associates_real_native_request_through_host(self) -> None:
         callbacks = KVCoreConnectorCallbacks(
             mode=RuntimeMode.SHADOW,
@@ -217,6 +247,42 @@ class VendorCallbackBridgeTests(unittest.TestCase):
         connector.kv_role = "kv_producer"
         connector.worker_count = 8
         self.assertTrue(_owns_runtime_control_host(connector))
+
+    def test_existing_process_local_host_receives_late_connector_bridge(self) -> None:
+        connector = _connector()
+        connector.worker_count = 2
+        registered = []
+        host = SimpleNamespace(register_kv_runtime_bridge=registered.append)
+        callbacks = SimpleNamespace(mode=RuntimeMode.ACTIVE)
+        with (
+            patch.dict(os.environ, {
+                "ASTRAKV_KV_CORE_VENDOR_PATCH": "true",
+                "ASTRAKV_TENSOR_PARALLEL_SIZE": "2",
+            }, clear=False),
+            patch(
+                "astrakv.runtime.vendor_callback_bridge.patch_local_disk_remove_race_class",
+            ),
+            patch(
+                "astrakv.runtime.vendor_callback_bridge.install_from_environment",
+            ) as install,
+            patch(
+                "astrakv.runtime.vendor_callback_bridge.installed_kv_core_callbacks",
+                return_value=callbacks,
+            ),
+            patch(
+                "astrakv.runtime.vendor_callback_bridge.installed_runtime_control_host",
+                return_value=host,
+            ),
+            patch.object(VendorCallbackBridge, "_start_prefetch_watcher_if_worker"),
+        ):
+            bridge = VendorCallbackBridge.from_environment(connector)
+
+        self.assertIsNotNone(bridge)
+        self.assertEqual(registered, [bridge])
+        install.assert_called_once_with(
+            vendor_engine_child=True,
+            start_runtime_host=False,
+        )
 
     def test_scheduler_lookup_publishes_intent_before_using_it(self) -> None:
         callbacks = KVCoreConnectorCallbacks(
@@ -670,13 +736,18 @@ class VendorCallbackBridgeTests(unittest.TestCase):
                 self.assertEqual(len(tickets), 1)
                 ticket = tickets[0]
                 self.assertIs(ticket.status, PrefetchStatus.SUBMITTED)
-                future = bridge._prefetch_futures[ticket.prefetch_id]
-                self.assertEqual(future.result(timeout=5), 2048)
+                # The promotion can finish before this thread observes the
+                # future; the done callback intentionally removes completed
+                # futures.  Absence therefore means "already settled", not
+                # "never scheduled".
+                future = bridge._prefetch_futures.get(ticket.prefetch_id)
+                if future is not None:
+                    self.assertEqual(future.result(timeout=5), 2048)
+                self._wait_for_ticket_record(raw_tmp, ticket.prefetch_id, "completed")
                 self.assertIs(
                     callbacks.tickets.get(ticket.prefetch_id).status,
                     PrefetchStatus.COMPLETED,
                 )
-                self._wait_for_ticket_record(raw_tmp, ticket.prefetch_id, "completed")
                 decisions = [
                     json.loads(line)
                     for line in (Path(raw_tmp) / "kv_core_policy_decisions.jsonl").read_text(
@@ -727,13 +798,14 @@ class VendorCallbackBridgeTests(unittest.TestCase):
                 tickets = callbacks.tickets.snapshot()
                 self.assertEqual(len(tickets), 1)
                 ticket = tickets[0]
-                future = bridge._prefetch_futures[ticket.prefetch_id]
-                self.assertEqual(future.result(timeout=5), 2048)
+                future = bridge._prefetch_futures.get(ticket.prefetch_id)
+                if future is not None:
+                    self.assertEqual(future.result(timeout=5), 2048)
+                self._wait_for_ticket_record(raw_tmp, ticket.prefetch_id, "completed")
                 self.assertIs(
                     callbacks.tickets.get(ticket.prefetch_id).status,
                     PrefetchStatus.COMPLETED,
                 )
-                self._wait_for_ticket_record(raw_tmp, ticket.prefetch_id, "completed")
                 decisions = [
                     json.loads(line)
                     for line in (Path(raw_tmp) / "kv_core_policy_decisions.jsonl").read_text(

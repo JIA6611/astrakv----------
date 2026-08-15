@@ -22,12 +22,14 @@ PORT="18000"
 CONTEXT_PORT="17900"
 TIMEOUT="900"
 GPU_MEMORY_UTILIZATION="0.72"
+OUTPUT_TOKENS="${ASTRAKV_CONTROL_OUTPUT_TOKENS:-128}"
 # E1 is a lifecycle gate, not a performance sweep. Its default is deliberately
 # one cold repeated-prefix workload that exercises all seven native callbacks.
 WORKLOADS="repeated_long_prefix"
 CACHE_STATES="cold"
 ALLOW_INELIGIBLE=false
 OFFLINE_PROFILE=""
+VARIANT_ONLY=false
 
 usage() {
   cat <<'EOF'
@@ -40,6 +42,11 @@ or warm cache-state cases.  Active phases additionally require verified
 connector evidence and real runtime accounting.
 --page-cache-evidence additionally samples mincore residency of the LMCache
 disk store alongside every run (OS virtual-memory evidence for the report).
+--variant-only skips the within-phase control member.  It is intended only
+for cross-cell regime matrices whose report compares the variant runs to a
+separate recompute-only cell; the default paired acceptance path is unchanged.
+--output-tokens N fixes generation length for every paired request (default
+128, or ASTRAKV_CONTROL_OUTPUT_TOKENS).
 EOF
 }
 
@@ -57,9 +64,11 @@ while [[ $# -gt 0 ]]; do
     --context-port) CONTEXT_PORT="$2"; shift 2 ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
     --gpu-memory-utilization) GPU_MEMORY_UTILIZATION="$2"; shift 2 ;;
+    --output-tokens) OUTPUT_TOKENS="$2"; shift 2 ;;
     --workloads) WORKLOADS="$2"; shift 2 ;;
     --cache-states) CACHE_STATES="$2"; shift 2 ;;
     --allow-ineligible) ALLOW_INELIGIBLE=true; shift ;;
+    --variant-only) VARIANT_ONLY=true; shift ;;
     --offline-profile) OFFLINE_PROFILE="$2"; shift 2 ;;
     --page-cache-evidence) PAGE_CACHE_EVIDENCE=true; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -68,6 +77,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$WORKLOAD_DIR" && -d "$WORKLOAD_DIR" ]] || { echo "--workload-dir is required" >&2; exit 2; }
+[[ "$OUTPUT_TOKENS" =~ ^[1-9][0-9]*$ ]] || { echo "--output-tokens must be positive" >&2; exit 2; }
 [[ -z "$OFFLINE_PROFILE" || -f "$OFFLINE_PROFILE" ]] || { echo "invalid --offline-profile" >&2; exit 2; }
 [[ "$HOST" == "127.0.0.1" || "$HOST" == "localhost" ]] || { echo "only a loopback server is supported" >&2; exit 2; }
 IFS=',' read -r -a SELECTED_PHASES <<< "$PHASES"
@@ -246,7 +256,7 @@ run_one() {
     --pair-id "${label}-${workload}-${cache_state}" --pair-role "$role" --claim-scope kv_core \
     --runtime-state-dir "$state_dir" --request-context-url "http://${HOST}:${CONTEXT_PORT}/request-context" \
     --request-context-session-id "$run_id-session" --request-context-secret-hex "$runtime_secret_hex" \
-    --timeout "$TIMEOUT" --output-tokens 128; then
+    --timeout "$TIMEOUT" --output-tokens "$OUTPUT_TOKENS"; then
     assert_lmcache_runtime_healthy "$log_path" || true
     return 1
   fi
@@ -307,13 +317,18 @@ max_local_cpu_size: $local_cpu_size
 local_disk: $variant_cache_dir
 max_local_disk_size: 80.0
 EOF
-  ASTRAKV_CONTROL_TOPOLOGY="$control_topology" \
-    LMCACHE_CONFIG_FILE="$baseline_cache_config" run_one "$label" "$baseline_phase" baseline "$workload" "$cache_state" "$label"
+  if [[ "$VARIANT_ONLY" != true ]]; then
+    ASTRAKV_CONTROL_TOPOLOGY="$control_topology" \
+      LMCACHE_CONFIG_FILE="$baseline_cache_config" run_one "$label" "$baseline_phase" baseline "$workload" "$cache_state" "$label"
+  fi
   # Both arms learn their admission cost from their own native scheduler
   # callbacks. Do not derive variant policy inputs from baseline HTTP TTFT:
   # TTFT includes queueing and I/O and would violate the paired control.
   ASTRAKV_CONTROL_TOPOLOGY="$control_topology" \
     LMCACHE_CONFIG_FILE="$variant_cache_config" run_one "$label" "$variant_phase" variant "$workload" "$cache_state" "$label"
+  if [[ "$VARIANT_ONLY" == true ]]; then
+    return 0
+  fi
   if [[ "$variant_phase" == E0 ]]; then
     # E0 is a raw off-mode baseline cell for the regime matrix (TTFT/UMA
     # reference only); it carries no phase-level eligibility claim.

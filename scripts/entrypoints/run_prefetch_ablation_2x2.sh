@@ -7,13 +7,15 @@ set -Eeuo pipefail
 # (ASTRAKV_ENABLE_ONLINE_PREFETCH_DISPATCH) per arm and leaves A off by
 # default.  This wrapper runs that script twice -- once with the KV-Core mode
 # active but A's CPU prefetch flag off, once with A's flag exported --
-# producing the three cells we report on (the A+B combined cell is
-# intentionally NOT run):
+# producing the three isolation cells by default.  Pass --include-combined
+# for the final mainline coexistence check, which adds the A+B cell without
+# rerunning a second baseline:
 #
 #   run 1: (A off, B off)  -> pure baseline   (mode stays off; prefetch uses
 #                            its independent dispatch channel)
 #          (A off, B on)   -> B-only
-#   run 2: (A on,  B off)  -> A-only   (variant/both skipped)
+#   run 2: (A on,  B off)  -> A-only
+#          (A on,  B on)   -> A+B combined (only with --include-combined)
 #
 # It then aggregates receipts/tickets/decisions per cell with
 # scripts/reporting/validate_prefetch_2x2_ablation.py.
@@ -28,6 +30,7 @@ MODEL="${ASTRAKV_MODEL:-$ROOT/models/Qwen3-8B}"
 OUTPUT_ROOT="${ASTRAKV_ROOT:-$ROOT}/results/prefetch-ablation-2x2-$TIMESTAMP"
 LIMIT="50"
 SKIP_VALIDATE="false"
+INCLUDE_COMBINED="false"
 DATASETS="qasper,multifieldqa_en"
 PATCH_VERIFICATION="${ASTRAKV_KV_CORE_PATCH_VERIFICATION:-}"
 INTERLEAVE="false"
@@ -52,6 +55,8 @@ Options:
                              (objects become SSD-resident-but-CPU-evicted between
                              visits).  Without it every object's visits are
                              consecutive and neither prefetch fires.
+  --include-combined         Also run and require the A1B1 coexistence cell.
+                             This adds only the A-on/variant arm.
   --skip-validate      Skip the final 4-cell aggregation step.
 EOF
 }
@@ -65,6 +70,7 @@ while [[ $# -gt 0 ]]; do
     --datasets) DATASETS="$2"; shift 2 ;;
     --patch-verification) PATCH_VERIFICATION="$2"; shift 2 ;;
     --interleave) INTERLEAVE="true"; shift ;;
+    --include-combined) INCLUDE_COMBINED="true"; shift ;;
     --skip-validate) SKIP_VALIDATE="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -104,7 +110,13 @@ bash scripts/entrypoints/run_grouped_exact_next_prefetch_ablation.sh \
   --prefetch-lead-s "$PREFETCH_LEAD_S" \
   --output-dir "$AOFF_DIR"
 
-echo "=== [2x2] Run 2/2: A on (cells: A1B0, A1B1) ==="
+if [[ "$INCLUDE_COMBINED" == "true" ]]; then
+  AON_ROLES="baseline,variant"
+  echo "=== [2x2] Run 2/2: A on (cells: A1B0, A1B1) ==="
+else
+  AON_ROLES="baseline"
+  echo "=== [2x2] Run 2/2: A on (cell: A1B0) ==="
+fi
 ASTRAKV_KV_CORE_MODE=active ASTRAKV_KV_CORE_TOPOLOGY=gpu_cpu_ssd \
 ASTRAKV_KV_CORE_LOCAL_CPU=true ASTRAKV_KV_CORE_CPU_PREFETCH_ENABLED=true \
 ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD=true \
@@ -115,7 +127,7 @@ ASTRAKV_KV_CORE_INVALIDATE_DISK_BACKED_CPU_ON_PREFETCH_LEAD=true \
   --datasets "$DATASETS" \
   $([ "$INTERLEAVE" == "true" ] && echo --interleave) \
   --prefetch-lead-s "$PREFETCH_LEAD_S" \
-  --roles baseline \
+  --roles "$AON_ROLES" \
   --output-dir "$AON_DIR"
 
 if [[ "$SKIP_VALIDATE" == "true" ]]; then
@@ -125,10 +137,15 @@ fi
 
 PYTHON="${ASTRAKV_PYTHON:-python3}"
 export ASTRAKV_PYTHON="$PYTHON"
-"$PYTHON" scripts/reporting/validate_prefetch_2x2_ablation.py \
-  --a-off "$AOFF_DIR" --a-on "$AON_DIR" \
-  --datasets "$DATASETS" \
+VALIDATE_ARGS=(
+  --a-off "$AOFF_DIR" --a-on "$AON_DIR"
+  --datasets "$DATASETS"
   --output "$OUTPUT_ROOT/prefetch_2x2_validation.json"
+)
+if [[ "$INCLUDE_COMBINED" == "true" ]]; then
+  VALIDATE_ARGS+=(--require-combined)
+fi
+"$PYTHON" scripts/reporting/validate_prefetch_2x2_ablation.py "${VALIDATE_ARGS[@]}"
 
 echo "2x2 ablation completed: $OUTPUT_ROOT"
 echo "Validation summary: $OUTPUT_ROOT/prefetch_2x2_validation.json"

@@ -56,6 +56,8 @@ class Prefetch2x2ValidatorTests(unittest.TestCase):
         self.assertEqual(cell["conflict_signals"]["invalidate_removed_chunk_count"], 3)
         self.assertTrue(cell["conflict_signals"]["dual_accounting_ticket_consumed_and_b_completed"])
         self.assertEqual(cell["benchmark"]["success_count"], 2)
+        self.assertEqual(cell["benchmark"]["row_count"], 3)
+        self.assertEqual(cell["benchmark"]["failure_count"], 1)
         self.assertEqual(cell["benchmark"]["ttft_p50_ms"], 100.0)
         self.assertEqual(cell["benchmark"]["ttft_p95_ms"], 200.0)
 

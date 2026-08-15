@@ -12,6 +12,7 @@ from astrakv.runtime.lmcache047_runtime_patch import (
     _ConnectorLifecycle,
     _owner_action_batched_get,
     patch_local_disk_remove_race,
+    patch_local_disk_remove_race_class,
     _prefetch_ready,
     install_lmcache047_hooks,
     probe_lmcache047_storage_contract,
@@ -61,6 +62,42 @@ class LMCache047RuntimePatchTests(unittest.TestCase):
         self.assertFalse(backend.disk_lock._is_owned())
         # Second remove on the same key returns False without crashing.
         self.assertFalse(backend.remove("key"))
+
+    def test_local_disk_remove_race_class_patch_covers_future_instances(self):
+        class Meta:
+            def __init__(self, path: str, size: int) -> None:
+                self.path = path
+                self.size = size
+
+        class FakeBackend:
+            def __init__(self) -> None:
+                self.disk_lock = threading.RLock()
+                self.dict = {}
+                self.usage = 0
+                self.stats_monitor = types.SimpleNamespace(update_local_storage_usage=lambda usage: None)
+                self.cache_policy = types.SimpleNamespace(update_on_force_evict=lambda key: None)
+                self.batched_msg_sender = None
+
+            def update_local_storage_usage(self, usage: int) -> None:
+                self.usage = usage
+
+            def remove(self, key, force=True):
+                raise AssertionError("original remove should be replaced by the class race patch")
+
+        OpType = type("OpType", (), {"EVICT": "evict"})
+        self.assertEqual(patch_local_disk_remove_race_class(FakeBackend, OpType), 1)
+        # Instances created after the class patch inherit the tolerant remove.
+        backend = FakeBackend()
+        missing_path = tempfile.mktemp(suffix=".pt")
+        backend.dict["key"] = Meta(missing_path, 10)
+        backend.usage = 10
+        self.assertTrue(backend.remove("key"))
+        self.assertEqual(backend.usage, 0)
+        self.assertFalse(backend.disk_lock._is_owned())
+        # Second remove on the same key returns False without crashing.
+        self.assertFalse(backend.remove("key"))
+        # Patching the class again is idempotent.
+        self.assertEqual(patch_local_disk_remove_race_class(FakeBackend, OpType), 0)
 
     def test_owner_action_read_bypasses_only_its_own_reservation_guard(self):
         records = []

@@ -2352,42 +2352,92 @@ def patch_local_disk_remove_race(manager: Any) -> int:
             backend_self: Any,
             key: Any,
             force: bool = True,
-            *,
-            _original: Callable[..., Any] = original_remove,
         ) -> bool:
-            acquired = False
-            if force:
-                backend_self.disk_lock.acquire()
-                acquired = True
-            try:
-                meta = backend_self.dict.pop(key, None)
-                if meta is None:
-                    return False
-                path = meta.path
-                size = meta.size
-                backend_self.usage -= size
-                backend_self.stats_monitor.update_local_storage_usage(backend_self.usage)
-                try:
-                    os.remove(path)
-                except FileNotFoundError:
-                    # Already deleted by a concurrent eviction path.
-                    pass
-                if force:
-                    backend_self.cache_policy.update_on_force_evict(key)
-                if backend_self.batched_msg_sender is not None and OpType is not None:
-                    backend_self.batched_msg_sender.add_kv_op(
-                        OpType.EVICT,
-                        key=key.chunk_hash,
-                    )
-                return True
-            finally:
-                if acquired:
-                    backend_self.disk_lock.release()
+            return _tolerant_remove(backend_self, key, force=force, op_type=OpType)
 
         remove_wrapper.__astrakv_lmcache047_remove_race_patch__ = True
         backend.remove = types.MethodType(remove_wrapper, backend)
         patched += 1
     return patched
+
+
+def _tolerant_remove(backend_self: Any, key: Any, *, force: bool, op_type: Any) -> bool:
+    """Shared FileNotFoundError-tolerant remove used by both the instance-
+    and class-level LocalDiskBackend patches.  ``op_type`` is the LMCache
+    ``OpType`` enum (``None`` in environments without LMCache installed)."""
+    acquired = False
+    if force:
+        backend_self.disk_lock.acquire()
+        acquired = True
+    try:
+        meta = backend_self.dict.pop(key, None)
+        if meta is None:
+            return False
+        path = meta.path
+        size = meta.size
+        backend_self.usage -= size
+        backend_self.stats_monitor.update_local_storage_usage(backend_self.usage)
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            # Already deleted by a concurrent eviction path.
+            pass
+        if force:
+            backend_self.cache_policy.update_on_force_evict(key)
+        if backend_self.batched_msg_sender is not None and op_type is not None:
+            backend_self.batched_msg_sender.add_kv_op(
+                op_type.EVICT,
+                key=key.chunk_hash,
+            )
+        return True
+    finally:
+        if acquired:
+            backend_self.disk_lock.release()
+
+
+def patch_local_disk_remove_race_class(
+    backend_cls: type[Any] | None = None,
+    op_type_cls: type[Any] | None = None,
+) -> int:
+    """Patch LocalDiskBackend.remove at the class level.
+
+    The instance-level ``patch_local_disk_remove_race`` only covers the
+    manager handed to ``install_lmcache047_hooks``.  Independent LMCache
+    engines (for example the E11 warmup server, which deliberately launches
+    with AstraKV hooks disabled) create their own LocalDiskBackend instances
+    that the instance-level patch never reaches.  Patching the class means
+    every current and future instance inherits the same FileNotFoundError
+    tolerance (and the same guarantee that the disk lock is always released).
+    """
+    if backend_cls is None:
+        try:
+            from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend  # noqa: PLC0415
+            backend_cls = LocalDiskBackend
+        except ImportError:
+            return 0
+    if op_type_cls is None:
+        try:
+            from lmcache.v1.cache_controller.message import OpType  # noqa: PLC0415
+            op_type_cls = OpType
+        except ImportError:
+            op_type_cls = None
+    original_remove = getattr(backend_cls, "remove", None)
+    if original_remove is None or getattr(
+        original_remove, "__astrakv_lmcache047_remove_race_class_patch__", False
+    ):
+        return 0
+
+    def remove_wrapper(backend_self: Any, key: Any, force: bool = True) -> bool:
+        return _tolerant_remove(backend_self, key, force=force, op_type=op_type_cls)
+
+    # Both markers are set so the instance-level patch (which only checks
+    # ``__astrakv_lmcache047_remove_race_patch__``) skips already-patched
+    # backends after the class-level patch has run.
+    remove_wrapper.__astrakv_lmcache047_remove_race_patch__ = True
+    remove_wrapper.__astrakv_lmcache047_remove_race_class_patch__ = True
+    remove_wrapper.__name__ = "remove"
+    backend_cls.remove = remove_wrapper
+    return 1
 
 
 def install_lmcache047_hooks(
@@ -2611,6 +2661,7 @@ def _patch_storage_manager(
         return patched
 
     endpoint._require_verified_local_disk_completion = patch_local_disk_completion_backends()
+    patch_local_disk_remove_race_class()
     patch_local_disk_remove_race(manager)
 
     def put_wrapper(self: Any, keys: Any, memory_objs: Any, *args: Any, **kwargs: Any) -> Any:

@@ -38,6 +38,7 @@ from astrakv.runtime.lmcache047_bootstrap import (
     installed_kv_core_callbacks,
     installed_runtime_control_host,
 )
+from astrakv.runtime.lmcache047_runtime_patch import patch_local_disk_remove_race_class
 from astrakv.runtime.offline_kv_profile import OfflineKVProfileIndex, PrefixRuntimeHint
 from astrakv.runtime.third_party_patch import PATCH_ID, REQUIRED_CALLBACKS
 from astrakv.runtime.uma_metrics import current_cgroup_memory_evidence
@@ -147,6 +148,12 @@ class VendorCallbackBridge:
 
     @classmethod
     def from_environment(cls, connector: Any = None) -> "VendorCallbackBridge | None":
+        # Crash-safety guard: LocalDiskBackend.remove races a concurrent
+        # eviction (missing backing file) and would otherwise kill EngineCore.
+        # Applied on the class so every LMCache engine instance in this
+        # process is covered, including LMCache-only servers launched with
+        # AstraKV hooks disabled (e.g. the E11 warmup server).  Idempotent.
+        patch_local_disk_remove_race_class()
         if os.environ.get("ASTRAKV_KV_CORE_VENDOR_PATCH", "false") != "true":
             return None
         # ``connector is None`` is the legacy/bootstrap call made before the

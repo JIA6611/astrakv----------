@@ -10,7 +10,7 @@ param(
 
     [int]$Port = 10000,
 
-    [string]$RemoteRoot = "/home/zyx/astrakv2",
+    [string]$RemoteRoot = "/home/zyx/astrakv-W",
 
     [switch]$DryRun
 )

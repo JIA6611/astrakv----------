@@ -17,6 +17,51 @@ def event(event_id: str, *, action: HookAction = HookAction.CACHE_HIT, timestamp
 
 
 class OnlineProfileStoreTests(unittest.TestCase):
+
+    def test_non_authoritative_events_do_not_change_resident_tier(self) -> None:
+        store = OnlineProfileStore(run_id="run-a")
+        self.assertTrue(store.consume(BackendHookEvent(
+            run_id="run-a",
+            event_id="event-store",
+            request_id="request-a",
+            object_key="prefix-a",
+            object_level=ObjectLevel.PREFIX,
+            backend_object_id="object-a",
+            action=HookAction.CACHE_STORE,
+            status="completed",
+            timestamp_ns=1,
+            tier_after="cpu",
+            bytes=64,
+        )))
+        self.assertTrue(store.consume(BackendHookEvent(
+            run_id="run-a",
+            event_id="event-available",
+            request_id="request-a",
+            object_key="prefix-a",
+            object_level=ObjectLevel.PREFIX,
+            backend_object_id="object-a",
+            action=HookAction.CACHE_LOAD,
+            status="available",
+            timestamp_ns=2,
+            tier_after="ssd",
+        )))
+        self.assertTrue(store.consume(BackendHookEvent(
+            run_id="run-a",
+            event_id="event-rejected",
+            request_id="request-a",
+            object_key="prefix-a",
+            object_level=ObjectLevel.PREFIX,
+            backend_object_id="object-a",
+            action=HookAction.DROP,
+            status="rejected",
+            timestamp_ns=3,
+            tier_after="ssd",
+        )))
+
+        state = store.object_state("object-a")
+        assert state is not None
+        self.assertEqual(state["current_tier"], "cpu")
+
     def test_replay_is_idempotent_and_checkpoint_restores_event_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "online-state.json"

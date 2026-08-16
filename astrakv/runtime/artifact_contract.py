@@ -12,11 +12,25 @@ FINAL_RUNTIME_ARTIFACT_NAMES = {
     "astrakv_runtime_commands": "astrakv_runtime_commands.jsonl",
     "runtime_command_receipts": "runtime_command_receipts.jsonl",
     "runtime_structured_events": "runtime_structured_events.jsonl",
+    "native_policy_installation": "native_policy_installation.jsonl",
+    "native_cache_policy_evictions": "native_cache_policy_evictions.jsonl",
+    "kv_core_native_callbacks": "kv_core_native_callbacks.jsonl",
+    "kv_core_native_receipts": "kv_core_native_receipts.jsonl",
     "online_profile_checkpoint": "online_profile_checkpoint.json",
 }
 
 AUXILIARY_RUNTIME_ARTIFACT_NAMES = {
     "trace": "trace_events.jsonl",
+}
+
+# Produced by the benchmark-side request-ahead MoE client.  These are formal
+# evidence artifacts, but they do not originate in RuntimeControlHost state and
+# therefore must not be included in FINAL_RUNTIME_ARTIFACT_NAMES exports.
+MOE_RUNTIME_ARTIFACT_NAMES = {
+    "moe_prepare_receipts": "moe_prepare_receipts.jsonl",
+    "moe_route_events": "moe_route_events.jsonl",
+    "moe_route_summary": "moe_route_summary.json",
+    "moe_routed_experts_manifest": "moe_routed_experts_manifest.json",
 }
 
 LEGACY_RUNTIME_ARTIFACT_NAMES = {
@@ -26,6 +40,10 @@ LEGACY_RUNTIME_ARTIFACT_NAMES = {
     "astrakv_runtime_commands": ("commands.jsonl", "online_commands.jsonl"),
     "runtime_command_receipts": ("receipts.jsonl", "online_receipts.jsonl"),
     "runtime_structured_events": (),
+    "native_policy_installation": (),
+    "native_cache_policy_evictions": (),
+    "kv_core_native_callbacks": (),
+    "kv_core_native_receipts": (),
     "online_profile_checkpoint": (),
 }
 

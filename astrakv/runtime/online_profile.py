@@ -84,7 +84,8 @@ class OnlineProfileStore:
             state["binding_generation"] = event.binding_generation
             state["event_count"] += 1
             state["bytes"] += max(0, event.bytes or 0)
-            state["current_tier"] = _prefer_known_tier(event.tier_after, state["current_tier"])
+            if _status_updates_resident_tier(event.status):
+                state["current_tier"] = _prefer_known_tier(event.tier_after, state["current_tier"])
             if event.bytes and event.bytes > 0:
                 tier_after = str(event.tier_after or "")
                 if event.action is HookAction.CACHE_STORE and event.status == "submitted":
@@ -360,7 +361,8 @@ class OnlineProfileStore:
                         )
                 elif event is not None:
                     state["binding_generation"] = event.metadata.get("binding_generation", state["binding_generation"])
-                    state["current_tier"] = _prefer_known_tier(event.tier_after, state["current_tier"])
+                    if _status_updates_resident_tier(event.status):
+                        state["current_tier"] = _prefer_known_tier(event.tier_after, state["current_tier"])
                     state["bytes"] = max(state["bytes"], max(0, event.bytes or 0))
                 elif decision.metadata.get("binding_generation") is not None:
                     state["binding_generation"] = decision.metadata.get("binding_generation")
@@ -449,6 +451,18 @@ def _prefer_known_tier(candidate: Any, current: Any) -> str:
     if normalized and normalized != "unknown":
         return normalized
     return str(current or "unknown")
+
+
+def _status_updates_resident_tier(status: Any) -> bool:
+    """Return whether an event status proves that its tier_after became resident."""
+    normalized = str(status or "").strip().lower()
+    return normalized not in {
+        "available",
+        "blocked",
+        "failed",
+        "not_found",
+        "rejected",
+    }
 
 
 def _new_object_state(backend_object_id: str, *, binding_generation: Any) -> dict[str, Any]:

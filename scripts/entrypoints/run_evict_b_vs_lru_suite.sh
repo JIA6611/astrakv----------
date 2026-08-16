@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# evict-B vs LMCache built-in LRU: real-machine two-arm ablation on DGX.
+# AstraKV-W vs LMCache built-in LRU at the native CPU capacity-reclaim point.
 #
 # Each repeat runs the grouped exact-next prefetch ablation per dataset:
-#   arm-evict-b: online policy + evict-B dispatch enabled (pressure-gated)
-#   arm-lru:     online policy + evict dispatch disabled, LMCACHE_CACHE_POLICY=LRU
+#   arm-evict-b: CPU AstraKV victim selection; SSD remains native LRU
+#   arm-lru:     CPU native LRU; SSD remains native LRU
 #
 # Capacities are auto-scaled to each dataset's footprint (CPU 15% / SSD 45%)
-# so that the evict pressure gate (default 0.8) actually fires and LMCache's
-# built-in eviction is exercised in the LRU arm.  All other controls
-# (workload, prefetch/sidecar settings, warmup) are identical between arms;
-# only the evict decision source differs.
+# so that LMCache's physical capacity path is exercised in both arms.  All
+# other controls (workload, prefetch/sidecar settings, warmup) are identical.
+# The old release/periodic/global evict dispatch paths are disabled in both
+# arms; only the CPU policy selector differs.
 #
-# After the runs, per-arm metrics are aggregated and the per-request mainline
-# evidence report (ingress prefetch-A -> lookup -> release evict -> prefetch-B)
-# is built for every state directory.
+# After the runs, per-arm metrics and workload-regime boundaries are
+# aggregated.  This baseline-only suite intentionally disables Prefetch-B and
+# therefore does not produce or validate E12's complete control chain.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
@@ -26,19 +26,20 @@ TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUTPUT_ROOT="${ASTRAKV_ROOT:-$ROOT}/results/evict-b-vs-lru-$TIMESTAMP"
 GROUPED_ROOT=""
 MODEL="${ASTRAKV_MODEL:-$ROOT/models/Qwen3-8B}"
-LIMIT="50"
+LIMIT="9"
 DATASETS="qasper,multifieldqa_en"
+REGIMES="recency_aligned,scan_pollution_past_observed,profile_shift_or_stale"
 REPEATS="3"
-KV_BYTES_PER_TOKEN="1600"
+KV_BYTES_PER_TOKEN="147456"
 CPU_FRACTION="0.15"
 SSD_FRACTION="0.45"
-CPU_CAPACITY_BYTES=""
-SSD_CAPACITY_BYTES=""
+CPU_CAPACITY_BYTES="${ASTRAKV_E11_CPU_CAPACITY_BYTES:-805306368}"
+SSD_CAPACITY_BYTES="${ASTRAKV_E11_SSD_CAPACITY_BYTES:-4294967296}"
 PRESSURE_TRIGGER="0.8"
 COLD_SCORE_THRESHOLD="0.35"
 GLOBAL_SCAN_INTERVAL_S="5.0"
 GLOBAL_SCAN_MAX_VICTIMS="1"
-WARMUP_PASSES="1"
+WARMUP_PASSES="0"
 WARMUP_LIMIT="8"
 OUTPUT_TOKENS="${ASTRAKV_E11_OUTPUT_TOKENS:-8}"
 ROLES="baseline"
@@ -55,25 +56,29 @@ Options:
   --grouped-root DIR          Directory containing <dataset>/grouped_prompts.jsonl
   --output-root PATH          Result root (default results/evict-b-vs-lru-<ts>)
   --model PATH                Local model path
-  --limit N                   Per-dataset request limit (default 50)
+  --limit N                   E11 selected request limit (default 9)
   --datasets LIST             Comma-separated datasets (default qasper,multifieldqa_en)
+  --regimes LIST              Comma-separated workload regimes (default
+                              recency_aligned,scan_pollution_past_observed,
+                              profile_shift_or_stale)
   --repeats N                 Paired repeats per arm (default 3)
-  --kv-bytes-per-token N      KV bytes per token for footprint estimate (default 1600)
+  --kv-bytes-per-token N      KV bytes per token (Qwen3-8B bf16 default 147456)
   --cpu-fraction N            CPU tier as footprint fraction (default 0.15)
   --ssd-fraction N            SSD tier as footprint fraction (default 0.45)
-  --cpu-capacity-bytes N      Explicit CPU tier bytes (overrides fraction/floor)
-  --ssd-capacity-bytes N      Explicit SSD tier bytes (overrides fraction/floor)
-  --pressure-trigger N        Pressure trigger fraction (default 0.8)
-  --cold-score-threshold N    evict coldness score threshold (default 0.35)
-  --global-scan-interval-s N  Global evict scan min interval (default 5.0)
-  --global-scan-max-victims N Max victims per scan (default 1; reduces stale duplicates)
+  --cpu-capacity-bytes N      CPU tier bytes (default 805306368 = 0.75 GiB,
+                              enough for one ~5k-token Qwen3-8B prefix)
+  --ssd-capacity-bytes N      SSD tier bytes (default 4294967296 = 4 GiB)
+  --pressure-trigger N        Retained compatibility option; external evict is disabled
+  --cold-score-threshold N    Retained compatibility option; native selector scores directly
+  --global-scan-interval-s N  Retained compatibility option; external scans are disabled
+  --global-scan-max-victims N Retained compatibility option; external scans are disabled
   --warmup-passes N           Warmup passes before the measured run
-                              (same server/cache, builds online profile; default 1)
+                              (default 0; measured profile semantics stay cold)
   --warmup-limit N            Warmup request count per pass (default 8)
   --output-tokens N           Fixed decode tokens per request (default 8;
                               E11 evaluates TTFT/eviction, not long decode)
-  --roles ROLE                Run one identical role in both arms: baseline or
-                              variant (default baseline; isolates evict from B)
+  --roles ROLE                Must be baseline (default); prevents Prefetch-B
+                              from contaminating the CPU eviction comparison
   --patch-verification PATH   KV-Core connector patch verification JSON
                               (required when --no-kv-core is not set; defaults
                               to $ASTRAKV_KV_CORE_PATCH_VERIFICATION)
@@ -91,6 +96,7 @@ while [[ $# -gt 0 ]]; do
     --model) MODEL="$2"; shift 2 ;;
     --limit) LIMIT="$2"; shift 2 ;;
     --datasets) DATASETS="$2"; shift 2 ;;
+    --regimes) REGIMES="$2"; shift 2 ;;
     --repeats) REPEATS="$2"; shift 2 ;;
     --kv-bytes-per-token) KV_BYTES_PER_TOKEN="$2"; shift 2 ;;
     --cpu-fraction) CPU_FRACTION="$2"; shift 2 ;;
@@ -119,14 +125,41 @@ done
 [[ "$LIMIT" =~ ^[0-9]+$ ]] || { echo "--limit must be a non-negative integer" >&2; exit 2; }
 [[ "$REPEATS" =~ ^[1-9][0-9]*$ ]] || { echo "--repeats must be a positive integer" >&2; exit 2; }
 [[ "$OUTPUT_TOKENS" =~ ^[1-9][0-9]*$ ]] || { echo "--output-tokens must be positive" >&2; exit 2; }
-[[ "$ROLES" == "baseline" || "$ROLES" == "variant" ]] || {
-  echo "--roles must be baseline or variant" >&2; exit 2; }
+[[ "$ROLES" == "baseline" ]] || {
+  echo "E11 native CPU policy A/B requires --roles baseline" >&2; exit 2; }
 IFS=',' read -r -a SELECTED_DATASETS <<< "$DATASETS"
 [[ "${#SELECTED_DATASETS[@]}" -gt 0 ]] || { echo "--datasets must not be empty" >&2; exit 2; }
+IFS=',' read -r -a SELECTED_REGIMES <<< "$REGIMES"
+[[ "${#SELECTED_REGIMES[@]}" -gt 0 ]] || { echo "--regimes must not be empty" >&2; exit 2; }
+for regime in "${SELECTED_REGIMES[@]}"; do
+  case "$regime" in
+    recency_aligned|scan_pollution_past_observed|profile_shift_or_stale) ;;
+    *) echo "invalid --regimes entry: $regime" >&2; exit 2 ;;
+  esac
+done
 for dataset in "${SELECTED_DATASETS[@]}"; do
   [[ -f "$GROUPED_ROOT/$dataset/grouped_prompts.jsonl" ]] || {
     echo "missing $GROUPED_ROOT/$dataset/grouped_prompts.jsonl" >&2; exit 2; }
 done
+
+# Build one deterministic, policy-sensitive source per dataset.  Both arms
+# consume these exact files; the original grouped corpus remains untouched.
+SOURCE_GROUPED_ROOT="$GROUPED_ROOT"
+MVP_GROUPED_ROOT="$OUTPUT_ROOT/e11-regime-grouped-source"
+SELECTED_CELLS=()
+for dataset in "${SELECTED_DATASETS[@]}"; do
+  for regime in "${SELECTED_REGIMES[@]}"; do
+    cell="${dataset}__${regime}"
+    SELECTED_CELLS+=("$cell")
+    mkdir -p "$MVP_GROUPED_ROOT/$cell"
+    "$PYTHON" scripts/benchmark/materialize_e11_native_cpu_mvp_source.py \
+      --input "$SOURCE_GROUPED_ROOT/$dataset/grouped_prompts.jsonl" \
+      --output "$MVP_GROUPED_ROOT/$cell/grouped_prompts.jsonl" \
+      --hot-groups 2 --cold-groups 2 --regime "$regime" \
+      > "$MVP_GROUPED_ROOT/$cell/schedule.json"
+  done
+done
+GROUPED_ROOT="$MVP_GROUPED_ROOT"
 
 SIDECAR_ARGS=()
 if [[ -n "$EXTERNAL_SIDECAR" ]]; then
@@ -179,13 +212,13 @@ PY
 }
 
 run_arm() {
-  local arm_name="$1" evict_dispatch="$2" dataset="$3" rep="$4" \
+  local arm_name="$1" cpu_policy="$2" dataset="$3" rep="$4" \
         cpu_bytes="$5" ssd_bytes="$6"
   local arm_out="$OUTPUT_ROOT/$arm_name/rep-$rep"
   local cpu_gb ssd_gb
   cpu_gb="$("$PYTHON" -c "print(round($cpu_bytes / 2**30, 3))")"
   ssd_gb="$("$PYTHON" -c "print(round($ssd_bytes / 2**30, 3))")"
-  echo "=== [$arm_name] rep $rep dataset=$dataset evict_dispatch=$evict_dispatch cpu=${cpu_gb}GB ssd=${ssd_gb}GB ==="
+  echo "=== [$arm_name] rep $rep dataset=$dataset cpu_policy=$cpu_policy cpu=${cpu_gb}GB ssd=${ssd_gb}GB ==="
   # launch_vllm_server.sh defaults VENDOR_PATCH to true; legacy-hooks mode
   # (evict-B online policy) must explicitly disable it so hook events flow.
   local vendor_patch_env="ASTRAKV_KV_CORE_VENDOR_PATCH=false"
@@ -199,30 +232,23 @@ run_arm() {
     scope_env+=(
       "ASTRAKV_RUNTIME_CONTROL_PROCESS_SCOPE=engine_child"
       "PYTHONPATH=$ROOT/scripts/runtime${PYTHONPATH:+:$PYTHONPATH}"
-      "ASTRAKV_EVICT_DISPATCH_INDEPENDENT_OF_MODE=true"
-    )
-  fi
-  local -a periodic_env=()
-  if [[ "$evict_dispatch" == "true" ]]; then
-    # evict-B mirrors LMCache's native watermark loop: periodic pressure scan.
-    periodic_env+=(
-      "ASTRAKV_EVICT_PERIODIC_SCAN_ENABLED=true"
-      "ASTRAKV_EVICT_PERIODIC_SCAN_INTERVAL_S=$GLOBAL_SCAN_INTERVAL_S"
-      "ASTRAKV_EVICT_GLOBAL_SCAN_MIN_INTERVAL_S=$GLOBAL_SCAN_INTERVAL_S"
+      "ASTRAKV_EVICT_DISPATCH_INDEPENDENT_OF_MODE=false"
     )
   fi
   env \
     "ASTRAKV_ENABLE_ONLINE_POLICY=true" \
-    "ASTRAKV_ONLINE_EVICT_DISPATCH_ENABLED=$evict_dispatch" \
+    "ASTRAKV_E11_CPU_EVICTION_POLICY=$cpu_policy" \
+    "ASTRAKV_ONLINE_EVICT_DISPATCH_ENABLED=false" \
+    "ASTRAKV_EVICT_DISPATCH_INDEPENDENT_OF_MODE=false" \
+    "ASTRAKV_EVICT_PERIODIC_SCAN_ENABLED=false" \
     "ASTRAKV_EVICT_PRESSURE_GATE_ENABLED=true" \
     "ASTRAKV_EVICT_PRESSURE_TRIGGER=$PRESSURE_TRIGGER" \
     "ASTRAKV_EVICT_CPU_CAPACITY_BYTES=$cpu_bytes" \
     "ASTRAKV_EVICT_SSD_CAPACITY_BYTES=$ssd_bytes" \
     "ASTRAKV_EVICT_COLD_SCORE_THRESHOLD=$COLD_SCORE_THRESHOLD" \
-    "ASTRAKV_EVICT_GLOBAL_SCAN_ENABLED=true" \
+    "ASTRAKV_EVICT_GLOBAL_SCAN_ENABLED=false" \
     "ASTRAKV_EVICT_GLOBAL_SCAN_MIN_INTERVAL_S=$GLOBAL_SCAN_INTERVAL_S" \
     "ASTRAKV_EVICT_GLOBAL_SCAN_MAX_VICTIMS=$GLOBAL_SCAN_MAX_VICTIMS" \
-    "${periodic_env[@]}" \
     "$vendor_patch_env" \
     "${scope_env[@]}" \
     "ASTRAKV_ABLATION_WARMUP_PASSES=$WARMUP_PASSES" \
@@ -245,7 +271,7 @@ run_arm() {
 
 mkdir -p "$OUTPUT_ROOT"
 
-for dataset in "${SELECTED_DATASETS[@]}"; do
+for dataset in "${SELECTED_CELLS[@]}"; do
   canonical="$(materialize_dataset "$dataset")"
   footprint="$(footprint_bytes "$canonical")"
   if [[ -n "$CPU_CAPACITY_BYTES" ]]; then
@@ -262,8 +288,14 @@ for dataset in "${SELECTED_DATASETS[@]}"; do
   fi
   echo "[$dataset] footprint=$footprint cpu_bytes=$cpu_bytes ssd_bytes=$ssd_bytes"
   for rep in $(seq 1 "$REPEATS"); do
-    run_arm "arm-evict-b" "true" "$dataset" "$rep" "$cpu_bytes" "$ssd_bytes"
-    run_arm "arm-lru" "false" "$dataset" "$rep" "$cpu_bytes" "$ssd_bytes"
+    # Alternate launch order across paired repeats to reduce temporal bias.
+    if (( rep % 2 == 1 )); then
+      run_arm "arm-lru" "lru" "$dataset" "$rep" "$cpu_bytes" "$ssd_bytes"
+      run_arm "arm-evict-b" "astrakv" "$dataset" "$rep" "$cpu_bytes" "$ssd_bytes"
+    else
+      run_arm "arm-evict-b" "astrakv" "$dataset" "$rep" "$cpu_bytes" "$ssd_bytes"
+      run_arm "arm-lru" "lru" "$dataset" "$rep" "$cpu_bytes" "$ssd_bytes"
+    fi
   done
 done
 
@@ -273,23 +305,26 @@ if [[ "$SKIP_AGGREGATE" == "true" ]]; then
 fi
 
 for arm in arm-evict-b arm-lru; do
-  for rep in $(seq 1 "$REPEATS"); do
-    # Artifacts (receipts/commands/tickets) live in the run dir (baseline|variant),
-    # not the *-state dir; the ablation copies them over during run_condition.
-    for run_dir in "$OUTPUT_ROOT/$arm/rep-$rep"/*/"$ROLES"; do
-      [[ -d "$run_dir" ]] || continue
-      "$PYTHON" scripts/reporting/build_evict_mainline_report.py --state-dir "$run_dir" >/dev/null || true
-    done
-  done
   "$PYTHON" scripts/reporting/aggregate_evict_ablation.py \
     --arm-root "$OUTPUT_ROOT/$arm" \
-    --output "$OUTPUT_ROOT/$arm/arm_metrics.json" 2>/dev/null || true
+    --output "$OUTPUT_ROOT/$arm/arm_metrics.json"
 done
 
-"$PYTHON" scripts/reporting/evaluate_e11_target.py \
+"$PYTHON" scripts/reporting/evaluate_e11_native_cpu_mvp.py \
   --root "$OUTPUT_ROOT" --role "$ROLES" \
   --output "$OUTPUT_ROOT/e11_target_report.md" \
+  --json-output "$OUTPUT_ROOT/e11_native_cpu_result.json" \
   --paired-manifest-output "$OUTPUT_ROOT/e11_paired_run_manifest.json"
+
+"$PYTHON" scripts/reporting/analyze_e11_request_attribution.py \
+  --root "$OUTPUT_ROOT" --role "$ROLES" \
+  --output "$OUTPUT_ROOT/e11_request_attribution.md" \
+  --json-output "$OUTPUT_ROOT/e11_request_attribution.json"
+
+"$PYTHON" scripts/reporting/evaluate_e11_regime_matrix.py \
+  --root "$OUTPUT_ROOT" --role "$ROLES" \
+  --output "$OUTPUT_ROOT/e11_regime_report.md" \
+  --json-output "$OUTPUT_ROOT/e11_regime_result.json"
 
 echo ""
 echo "evict-B vs LRU suite completed: $OUTPUT_ROOT"

@@ -555,7 +555,7 @@ class PredictorScriptTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         content = (root / "scripts" / "dev" / "sync_to_dgx.ps1").read_text(encoding="utf-8")
         self.assertIn('[int]$Port = 10000', content)
-        self.assertIn('[string]$RemoteRoot = "/home/zyx/astrakv2"', content)
+        self.assertIn('[string]$RemoteRoot = "/home/zyx/astrakv-W"', content)
 
 
 if __name__ == "__main__":

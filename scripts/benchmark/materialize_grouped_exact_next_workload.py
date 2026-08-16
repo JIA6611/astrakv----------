@@ -116,8 +116,15 @@ def main() -> int:
         # In interleave mode the row's original ``order`` no longer reflects
         # the execution sequence; the new enumeration index is authoritative.
         arrival_index = index if args.interleave else int(row.get("order") or index)
-        reuse_ratio = 0.0 if group_size <= 1 else (group_size - 1) / group_size
+        default_reuse_ratio = 0.0 if group_size <= 1 else (group_size - 1) / group_size
+        policy_reuse_ratio = row.get("_e11_policy_reuse_ratio")
+        reuse_ratio = default_reuse_ratio
+        if policy_reuse_ratio is not None and not 0.0 <= float(policy_reuse_ratio) <= 1.0:
+            raise ValueError(
+                f"E11 policy reuse ratio override must be within [0, 1]: {policy_reuse_ratio}"
+            )
         reuse_bucket = "none" if group_size == 1 else ("medium" if group_size == 2 else "high")
+        source_metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
         metadata = {
             "dataset": str(row.get("dataset") or dataset),
             "task": str(row.get("task") or task),
@@ -131,6 +138,14 @@ def main() -> int:
             "messages": row.get("messages") if isinstance(row.get("messages"), list) else None,
             "source_prompt_path": str(input_path),
         }
+        for key in (
+            "e11_regime", "e11_profile_quality", "e11_temperature", "e11_phase",
+        ):
+            if source_metadata.get(key) not in (None, ""):
+                metadata[key] = source_metadata[key]
+        if policy_reuse_ratio is not None:
+            metadata["e11_policy_reuse_ratio_overridden"] = True
+            metadata["e11_policy_reuse_ratio"] = float(policy_reuse_ratio)
         # fire-consume annotates the only requests that can prove B's value:
         # the far request is the trigger and the immediately following near
         # request is the consumer.  Keep these labels in the canonical

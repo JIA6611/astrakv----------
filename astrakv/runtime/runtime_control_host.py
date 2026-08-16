@@ -695,11 +695,14 @@ class RuntimeControlHost:
                 if field not in record and field in metadata:
                     record[field] = metadata[field]
         record_type = str(record.get("record_type") or "observation")
-        filename = (
-            canonical_artifact_path(self.state_dir, "backend_binding_events").name
-            if record_type == "binding"
-            else canonical_artifact_path(self.state_dir, "runtime_events_raw").name
-        )
+        if record_type == "binding":
+            filename = canonical_artifact_path(self.state_dir, "backend_binding_events").name
+        elif record_type == "native_policy_installation":
+            filename = canonical_artifact_path(self.state_dir, "native_policy_installation").name
+        elif record_type == "native_cache_policy_eviction":
+            filename = canonical_artifact_path(self.state_dir, "native_cache_policy_evictions").name
+        else:
+            filename = canonical_artifact_path(self.state_dir, "runtime_events_raw").name
         encoded = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
         with self._event_lock:
             with (self.state_dir / filename).open("a", encoding="utf-8") as handle:

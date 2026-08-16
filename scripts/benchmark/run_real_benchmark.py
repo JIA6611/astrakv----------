@@ -54,6 +54,12 @@ from astrakv.benchmarks.experiment_manifest import (
     write_experiment_manifest,
 )
 from astrakv.benchmarks.runtime_artifacts import export_online_control_artifacts
+from astrakv.runtime.artifact_contract import MOE_RUNTIME_ARTIFACT_NAMES
+from astrakv.runtime.moe_prepare import (
+    MoePrepareClient,
+    MoePrepareConfig,
+    MoePrepareResult,
+)
 from astrakv.runtime.request_context import (
     AuthenticatedJsonHttpRequestContextClient,
     JsonHttpRequestContextClient,
@@ -145,6 +151,11 @@ class RequestResult:
     finish_reason: str = ""
     deterministic_logprob: float | None = None
     generation_seed: int | None = None
+    moe_prepare_status: str = "disabled"
+    moe_prepare_latency_ms: float = 0.0
+    moe_route_event_count: int = 0
+    moe_unique_experts: int = 0
+    moe_model_type: str = ""
 
 
 def main() -> int:
@@ -170,6 +181,16 @@ def main() -> int:
         args.request_context_url, run_id=args.run_id,
         session_id=args.request_context_session_id, secret_hex=args.request_context_secret_hex,
     )
+    moe_prepare_client = (
+        MoePrepareClient(
+            base_url=args.base_url,
+            api_key=args.api_key,
+            output_dir=output_dir,
+            config=args.moe_prepare_config,
+        )
+        if args.moe_prepare_config.enabled
+        else None
+    )
 
     workload_rows = load_workload_rows(args.workload_jsonl)
     if workload_rows:
@@ -180,6 +201,7 @@ def main() -> int:
             request_context_client=request_context_client,
             request_context_artifact=request_context_artifact,
             request_context_association_path=request_context_association_path,
+            moe_prepare_client=moe_prepare_client,
         )
         failures.extend(item.error for item in request_results if item.status != "ok")
     else:
@@ -209,11 +231,19 @@ def main() -> int:
                     request_context_client=request_context_client,
                     request_context_artifact=request_context_artifact,
                     request_context_association_path=request_context_association_path,
+                    moe_prepare_client=moe_prepare_client,
                 )
                     request_results.extend(batch_results)
                     failures.extend(item.error for item in batch_results if item.status != "ok")
                 if collector is not None:
                     metric_summaries[case] = collector.stop()
+
+    if args.moe_prepare_config.enabled:
+        failures.extend(
+            f"MoE prepare {item.moe_prepare_status} for request {item.request_id}"
+            for item in request_results
+            if item.moe_prepare_status != "prepared"
+        )
 
     write_jsonl(output_dir / "request_results.jsonl", request_results)
     rows = summarize_results(request_results, metric_summaries)
@@ -322,6 +352,7 @@ def resolve_args(raw: argparse.Namespace, config: dict[str, Any]) -> argparse.Na
     workload_cfg = _dict(config.get("workload"))
     metrics_cfg = _dict(config.get("metrics"))
     runtime_cfg = _dict(config.get("runtime"))
+    moe_prepare_config = MoePrepareConfig.from_mapping(_dict(config.get("moe_prepare")))
 
     run_name = str(config.get("run_name") or "real_vllm_endpoint")
     if config:
@@ -416,6 +447,7 @@ def resolve_args(raw: argparse.Namespace, config: dict[str, Any]) -> argparse.Na
         request_context_session_id=str(raw.request_context_session_id or runtime_cfg.get("request_context_session_id") or os.environ.get("ASTRAKV_RUNTIME_CONTROL_SESSION_ID", "")),
         request_context_secret_hex=str(raw.request_context_secret_hex or runtime_cfg.get("request_context_secret_hex") or os.environ.get("ASTRAKV_RUNTIME_CONTROL_SECRET_HEX", "")),
         require_canonical_workload=bool(config.get("require_canonical_workload", False)),
+        moe_prepare_config=moe_prepare_config,
     )
 
 
@@ -459,6 +491,7 @@ def run_batch(
     request_context_client: RequestContextClient | None = None,
     request_context_artifact: RequestContextArtifact | None = None,
     request_context_association_path: Path | None = None,
+    moe_prepare_client: MoePrepareClient | None = None,
     batch_nonce: str | None = None,
 ) -> list[RequestResult]:
     invocation_nonce = _reserve_batch_nonce(batch_nonce)
@@ -504,6 +537,7 @@ def run_batch(
                     request_context_client=request_context_client,
                     request_context_artifact=request_context_artifact,
                     request_context_association_path=request_context_association_path,
+                    moe_prepare_client=moe_prepare_client,
                     request_context_reserved=True,
                 )
                 for request_index, request_id in enumerate(request_ids)
@@ -541,6 +575,7 @@ def run_one_request(
     tokenizer_path: str = "",
     tokenizer_revision: str = "",
     chat_template_revision: str = "qwen3-default",
+    moe_prepare_client: MoePrepareClient | None = None,
 ) -> RequestResult:
     request_metadata = request_metadata or {}
     cpu_before = cpu_rss_mb()
@@ -566,6 +601,7 @@ def run_one_request(
     runtime_request_id = ""
     runtime_event_id = ""
     request_context_error = ""
+    moe_prepare_result = MoePrepareResult()
     published_context: RuntimeRequestContext | None = None
     prefetch_lead_s = max(0.0, as_float_or_none(request_metadata.get("prefetch_lead_s")) or 0.0)
     run_id = str(request_metadata.get("run_id") or "")
@@ -655,6 +691,19 @@ def run_one_request(
                     runtime_event_id = receipt.runtime_event_id
         except Exception as exc:  # Context linkage must not suppress endpoint diagnostics.
             request_context_error = f"{type(exc).__name__}: {exc}"
+
+    if moe_prepare_client is not None:
+        moe_prepare_result = moe_prepare_client.prepare(
+            messages=messages,
+            model=model,
+            request_id=str(request_id),
+            exact_token_ids=tuple(exact_ids),
+            context_published=published_context is not None,
+            runtime_association_status=runtime_association_status,
+            prefix_id=str(request_metadata.get("prefix_id") or ""),
+            prefix_hash=str(request_metadata.get("prefix_hash") or ""),
+            cache_key=str(request_metadata.get("cache_key") or ""),
+        )
 
     if prefetch_lead_s > 0.0:
         time.sleep(prefetch_lead_s)
@@ -834,6 +883,11 @@ def run_one_request(
         finish_reason=finish_reason,
         deterministic_logprob=deterministic_logprob if logprob_observed else None,
         generation_seed=generation_seed,
+        moe_prepare_status=moe_prepare_result.status,
+        moe_prepare_latency_ms=moe_prepare_result.latency_ms,
+        moe_route_event_count=moe_prepare_result.route_event_count,
+        moe_unique_experts=moe_prepare_result.unique_experts,
+        moe_model_type=moe_prepare_result.model_type,
     )
 
 
@@ -997,6 +1051,7 @@ def run_workload_rows(
     request_context_client: RequestContextClient | None = None,
     request_context_artifact: RequestContextArtifact | None = None,
     request_context_association_path: Path | None = None,
+    moe_prepare_client: MoePrepareClient | None = None,
 ) -> tuple[list[RequestResult], dict[str, DgxSummary]]:
     results: list[RequestResult] = []
     summaries: dict[str, DgxSummary] = {}
@@ -1051,6 +1106,7 @@ def run_workload_rows(
             tokenizer_path=args.tokenizer_path,
             tokenizer_revision=args.tokenizer_revision,
             chat_template_revision=args.chat_template_revision,
+            moe_prepare_client=moe_prepare_client,
         )
         results.append(result)
         if collector is not None:
@@ -1268,6 +1324,10 @@ def finalize_experiment_manifest(output_dir: Path, args: argparse.Namespace, con
         "control_environment": control_environment.name,
         "benchmark": "benchmark_results.csv", "requests": "request_results.jsonl", "quality": quality.name,
     }
+    for role, filename in MOE_RUNTIME_ARTIFACT_NAMES.items():
+        candidate = output_dir / filename
+        if candidate.is_file():
+            artifact_paths[role] = candidate.name
     runtime_state_dir = str(getattr(args, "runtime_state_dir", "") or "")
     online_artifacts = tuple(getattr(args, "online_artifact", ()) or ())
     if runtime_state_dir and online_artifacts:
@@ -1316,6 +1376,8 @@ def _parse_online_artifacts(values: tuple[str, ...]) -> dict[str, Path]:
         "astrakv_runtime_commands",
         "runtime_command_receipts",
         "runtime_structured_events",
+        "native_policy_installation",
+        "native_cache_policy_evictions",
         "online_profile_checkpoint",
         "trace",
         *aliases,
@@ -1341,6 +1403,8 @@ def _canonical_online_filename(role: str, source: Path) -> str:
         "astrakv_runtime_commands": "astrakv_runtime_commands.jsonl",
         "runtime_command_receipts": "runtime_command_receipts.jsonl",
         "runtime_structured_events": "runtime_structured_events.jsonl",
+        "native_policy_installation": "native_policy_installation.jsonl",
+        "native_cache_policy_evictions": "native_cache_policy_evictions.jsonl",
         "online_profile_checkpoint": "online_profile_checkpoint.json",
         "trace": "trace_events.jsonl",
     }
@@ -1712,6 +1776,7 @@ def write_effective_config(path: Path, args: argparse.Namespace, config: dict[st
         "request_context_url": args.request_context_url,
         "request_context_artifact": "request_context.jsonl",
         "request_context_association_artifact": "request_context_associations.jsonl",
+        "moe_prepare": args.moe_prepare_config.to_record(),
         "samples_dir": "samples" if args.enable_samples else "",
         "samples_file_pattern": "samples/<case>_samples.csv" if args.enable_samples else "",
         "raw_config": redact_config({key: value for key, value in config.items() if key != "_config_path"}),

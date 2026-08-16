@@ -112,12 +112,15 @@ class OnlinePolicyController:
             )
         )
         self._last_global_evict_scan_ns = 0
-        # A completed layered evict is terminal for that binding generation
-        # and source tier until a later placement event repopulates the tier.
+        # A receipt-backed completed or not_found layered evict is terminal
+        # for that binding generation and source tier until a later placement
+        # event repopulates the tier. A not_found receipt is authoritative
+        # evidence that the controller's placement snapshot is stale; retrying
+        # the same generation/source only creates not_found churn.
         # Runtime lifecycle callbacks can arrive after the action receipt and
         # temporarily restore a stale profile tier; this ledger prevents the
         # global scan from issuing an unbounded stream of not_found retries.
-        self._completed_evict_sources: dict[tuple[str, int, str], int] = {}
+        self._terminal_evict_sources: dict[tuple[str, int, str], int] = {}
 
     def _offline_profile_for(
         self,
@@ -162,9 +165,9 @@ class OnlinePolicyController:
                 int(event.binding_generation or 0),
                 str(event.tier_after),
             )
-            terminal_ns = self._completed_evict_sources.get(placement_key)
+            terminal_ns = self._terminal_evict_sources.get(placement_key)
             if terminal_ns is not None and int(event.timestamp_ns) > terminal_ns:
-                self._completed_evict_sources.pop(placement_key, None)
+                self._terminal_evict_sources.pop(placement_key, None)
         self.trace_events.append(TraceEvent(
             event_type=event.action.value,
             category="kv" if event.action.value.startswith("cache_") else "placement",
@@ -812,17 +815,22 @@ class OnlinePolicyController:
             breaker_state=_breaker_snapshot(breaker),
         )
         receipt = result.receipt
+        receipt_source_tier = "" if receipt is None else str(receipt.tier_before or "")
+        if receipt_source_tier not in {"cpu", "ssd"}:
+            receipt_source_tier = str(
+                decision.metadata.get("current_tier") or decision.target_tier or ""
+            )
         if (
             decision.predicted_action == "evict"
             and receipt is not None
-            and receipt.status in {"completed", "ok", "executed"}
-            and str(receipt.tier_before or "") in {"cpu", "ssd"}
+            and receipt.status in {"completed", "ok", "executed", "not_found"}
+            and receipt_source_tier in {"cpu", "ssd"}
         ):
-            self._completed_evict_sources[
+            self._terminal_evict_sources[
                 (
                     receipt.backend_object_id,
                     int(receipt.binding_generation or 0),
-                    str(receipt.tier_before),
+                    receipt_source_tier,
                 )
             ] = int(receipt.timestamp_ns or time.time_ns())
         self.profile_store.checkpoint()
@@ -894,7 +902,7 @@ class OnlinePolicyController:
                 _as_int(state.get("binding_generation")),
                 tier,
             )
-            if terminal_key in self._completed_evict_sources:
+            if terminal_key in self._terminal_evict_sources:
                 continue
             if _as_int(state.get("active_reference_count")) > 0:
                 continue
@@ -907,7 +915,13 @@ class OnlinePolicyController:
                 object_level = ObjectLevel(level_raw)
             except ValueError:
                 continue
-            binding = self.bridge.binding_for(object_level, object_key, request_id=request_id)
+            binding = self.bridge.binding_for_backend_object(
+                backend_object_id,
+                _as_int(state.get("binding_generation")),
+                object_level=object_level,
+                object_key=object_key,
+                request_id=request_id,
+            )
             if binding is None:
                 continue
             if self.bridge.has_active_prefetch(binding.object_key):
@@ -1320,6 +1334,7 @@ def _build_runtime_action_plan(
             "prediction_present": bool(decision.metadata.get("prediction_present")),
             "load_target_id": str(decision.metadata.get("load_target_id") or ""),
             "dispatch_origin": str(decision.metadata.get("dispatch_origin") or ""),
+            "prefetch_kind": str(decision.metadata.get("prefetch_kind") or ""),
             "prefetch_skip_reason": str(decision.metadata.get("prefetch_skip_reason") or ""),
             "prefetch_window": dict(decision.metadata.get("prefetch_window") or {}),
         },

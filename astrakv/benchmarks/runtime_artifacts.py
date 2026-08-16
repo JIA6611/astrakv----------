@@ -42,6 +42,10 @@ def export_online_control_artifacts(state_dir: str | Path, output_dir: str | Pat
     _copy_or_empty(sources["astrakv_runtime_commands"], targets["astrakv_runtime_commands"])
     _copy_or_empty(sources["runtime_command_receipts"], targets["runtime_command_receipts"])
     _copy_or_empty(sources["runtime_structured_events"], targets["runtime_structured_events"])
+    _copy_or_empty(sources["native_policy_installation"], targets["native_policy_installation"])
+    _copy_or_empty(sources["native_cache_policy_evictions"], targets["native_cache_policy_evictions"])
+    _copy_or_empty(sources["kv_core_native_callbacks"], targets["kv_core_native_callbacks"])
+    _copy_or_empty(sources["kv_core_native_receipts"], targets["kv_core_native_receipts"])
 
     source_capabilities = sources["backend_capabilities"]
     if source_capabilities is None:

@@ -202,6 +202,44 @@ class InterleaveGroupsTests(unittest.TestCase):
                 ["first", "first", "first", "far", "near", "far"],
             )
 
+    def test_cli_preserves_explicit_e11_policy_hint_override(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            source = tmp / "grouped_prompts.jsonl"
+            source.write_text(
+                json.dumps({
+                    **_row("stale", 0),
+                    "_e11_policy_reuse_ratio": 0.0,
+                    "metadata": {
+                        "e11_regime": "profile_shift_or_stale",
+                        "e11_profile_quality": "past_observed_phase_shift",
+                    },
+                }) + "\n",
+                encoding="utf-8",
+            )
+            out_dir = tmp / "out"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(PROJECT_ROOT / "scripts/benchmark/materialize_grouped_exact_next_workload.py"),
+                    "--grouped-prompts-jsonl", str(source),
+                    "--output-dir", str(out_dir),
+                    "--dataset", "qasper__profile_shift_or_stale",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                env={**os.environ, "PYTHONPATH": str(PROJECT_ROOT)},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            canonical = out_dir / "qasper__profile_shift_or_stale_grouped_exact_next_canonical_workload.jsonl"
+            record = json.loads(canonical.read_text(encoding="utf-8").strip())
+            self.assertEqual(record["reuse_ratio"], 0.0)
+            self.assertEqual(record["reuse_bucket"], "none")
+            self.assertTrue(record["metadata"]["e11_policy_reuse_ratio_overridden"])
+            self.assertEqual(record["metadata"]["e11_policy_reuse_ratio"], 0.0)
+            self.assertEqual(record["metadata"]["e11_regime"], "profile_shift_or_stale")
+
 
 if __name__ == "__main__":
     unittest.main()

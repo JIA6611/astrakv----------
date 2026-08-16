@@ -151,6 +151,47 @@ class BackendBridgeTests(unittest.TestCase):
             )
         )
 
+    def test_bridge_resolves_exact_backend_object_before_latest_request_binding(self) -> None:
+        first = BackendObjectBinding(
+            "run-1", "request-1", "prefix-1", ObjectLevel.PREFIX,
+            "backend-1", "binding-1", binding_generation=3,
+        )
+        second = BackendObjectBinding(
+            "run-1", "request-1", "prefix-1", ObjectLevel.PREFIX,
+            "backend-2", "binding-2", binding_generation=4,
+        )
+        bridge = OnlineBackendBridge(
+            run_id="run-1",
+            bindings=[first, second],
+            hook_client=object(),
+            hook_url="http://127.0.0.1:7900/actions",
+            gate=accepted_gate(),
+        )
+
+        self.assertEqual(
+            bridge.binding_for(ObjectLevel.PREFIX, "prefix-1", request_id="request-1"),
+            second,
+        )
+        self.assertEqual(
+            bridge.binding_for_backend_object(
+                "backend-1",
+                3,
+                object_level=ObjectLevel.PREFIX,
+                object_key="prefix-1",
+                request_id="request-1",
+            ),
+            first,
+        )
+        self.assertIsNone(
+            bridge.binding_for_backend_object(
+                "backend-1",
+                4,
+                object_level=ObjectLevel.PREFIX,
+                object_key="prefix-1",
+                request_id="request-1",
+            )
+        )
+
     def test_runtime_execution_gate_blocks_before_hook_submit(self) -> None:
         registry, runtime_binding = released_runtime_binding()
         def responder(command):

@@ -210,6 +210,7 @@ class OnlineBackendBridge:
         self._bindings_by_object: dict[tuple[Any, str], BackendObjectBinding] = {}
         self._bindings_by_request_object: dict[tuple[str, Any, str], BackendObjectBinding] = {}
         self._bindings_by_id: dict[str, BackendObjectBinding] = {}
+        self._bindings_by_backend_generation: dict[tuple[str, int], BackendObjectBinding] = {}
         for item in bindings:
             if item.run_id == run_id and item.verified:
                 self.register_binding(item)
@@ -237,6 +238,31 @@ class OnlineBackendBridge:
                 return binding
         return self._bindings_by_object.get((object_level, object_key))
 
+    def binding_for_backend_object(
+        self,
+        backend_object_id: str,
+        binding_generation: int,
+        *,
+        object_level: Any | None = None,
+        object_key: str | None = None,
+        request_id: str | None = None,
+    ) -> BackendObjectBinding | None:
+        """Resolve one observed backend object without falling back to a newer binding."""
+        try:
+            generation = int(binding_generation)
+        except (TypeError, ValueError):
+            return None
+        binding = self._bindings_by_backend_generation.get((str(backend_object_id), generation))
+        if binding is None:
+            return None
+        if object_level is not None and binding.object_level != object_level:
+            return None
+        if object_key not in (None, "", binding.object_key):
+            return None
+        if request_id not in (None, "", binding.request_id):
+            return None
+        return binding
+
     def register_binding(self, binding: BackendObjectBinding) -> bool:
         """Accept only a current verified binding from the runtime owner."""
         if binding.run_id != self.run_id or not binding.verified:
@@ -244,6 +270,9 @@ class OnlineBackendBridge:
         self._bindings_by_object[(binding.object_level, binding.object_key)] = binding
         self._bindings_by_request_object[(binding.request_id, binding.object_level, binding.object_key)] = binding
         self._bindings_by_id[binding.binding_id] = binding
+        self._bindings_by_backend_generation[
+            (binding.backend_object_id, binding.binding_generation)
+        ] = binding
         return True
 
     def binding_snapshot(self, binding_id: str) -> dict[str, Any] | None:

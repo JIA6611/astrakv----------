@@ -20,6 +20,11 @@ from astrakv.runtime.backend_hook import BackendExecutionSpec, BackendHookEvent,
 from astrakv.runtime.backend_hook import HookAction
 from astrakv.runtime.eviction import ObjectLevel
 from astrakv.runtime.runtime_action_executor import RuntimeActionExecutor
+from astrakv.runtime.native_cpu_eviction_policy import (
+    NativeCPUCachePolicy,
+    install_native_cpu_eviction_policy,
+    normalize_native_cpu_policy,
+)
 from astrakv.runtime.request_context import (
     RequestContextReceipt,
     RuntimeRequestContextReceiver,
@@ -666,11 +671,35 @@ class LMCache047ActionEndpoint:
     _bindings_by_object: dict[tuple[str, str], BackendObjectBinding] = field(default_factory=dict)
     _load_targets: dict[str, _RuntimeLoadTarget] = field(default_factory=dict)
     _require_verified_local_disk_completion: bool = False
+    native_cpu_policy_mode: str = "disabled"
+    native_cpu_policy: NativeCPUCachePolicy | None = field(default=None, init=False, repr=False)
     _runtime_action_executor: RuntimeActionExecutor | None = field(default=None, init=False, repr=False)
 
     def remember(self, key: Any, manager: Any) -> str:
         """Legacy observation helper. It intentionally does not authorize actions."""
         return str(key)
+
+    def observe_native_policy_key(
+        self,
+        key: Any,
+        *,
+        context: RequestContext | None,
+        action: HookAction,
+        status: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if self.native_cpu_policy is None:
+            return
+        context_metadata = dict(context.metadata) if context is not None else {}
+        context_metadata.update(metadata or {})
+        self.native_cpu_policy.score_registry.observe(
+            key,
+            metadata=context_metadata,
+            action=action.value,
+            status=status,
+            logical_object_key="" if context is None else context.object_key,
+            request_id="" if context is None else context.request_id,
+        )
 
     def register_binding(self, binding: BackendObjectBinding, key: Any, manager: Any) -> BackendExecutionSpec | None:
         """Register only a registry-issued backend identity, never an arbitrary key."""
@@ -2451,6 +2480,7 @@ def install_lmcache047_hooks(
     request_context_provider: Callable[[], RequestContext | None] | None = None,
     request_context_consumer: LMCache047RequestContextConsumer | None = None,
     runtime_request_identity_provider: Callable[[str], RuntimeRequestIdentity | None] | None = None,
+    native_cpu_policy: str | None = None,
 ) -> LMCache047ActionEndpoint:
     observed_versions = versions or installed_versions()
     if observed_versions != SUPPORTED_VERSIONS:
@@ -2473,7 +2503,14 @@ def install_lmcache047_hooks(
         except ModuleNotFoundError as exc:
             if exc.name != "lmcache":
                 raise
-    endpoint = LMCache047ActionEndpoint(binding_registry=binding_registry, action_registration_enabled=False)
+    native_cpu_policy_mode = normalize_native_cpu_policy(
+        native_cpu_policy if native_cpu_policy is not None else os.environ.get("ASTRAKV_E11_CPU_EVICTION_POLICY")
+    )
+    endpoint = LMCache047ActionEndpoint(
+        binding_registry=binding_registry,
+        action_registration_enabled=False,
+        native_cpu_policy_mode=native_cpu_policy_mode,
+    )
     lifecycle = _ConnectorLifecycle(
         event_sink, binding_registry, request_context_consumer, runtime_request_identity_provider, endpoint,
     )
@@ -2551,6 +2588,12 @@ def _patch_storage_manager(
         action_manager=action_manager,
         lmcache_engine=getattr(action_manager, "lmcache_engine", None) if action_manager is not None else None,
     )
+    endpoint.native_cpu_policy = install_native_cpu_eviction_policy(
+        manager,
+        mode=endpoint.native_cpu_policy_mode,
+        run_id=str(getattr(binding_registry, "run_id", "") or os.environ.get("ASTRAKV_RUN_ID", "")),
+        event_sink=event_sink,
+    )
     original_put, original_get, original_remove = manager.batched_put, manager.get, manager.remove
     original_batched_get = getattr(manager, "batched_get", None)
     pending_store_callbacks: dict[str, list[tuple[Any, RequestContext, str]]] = {}
@@ -2572,6 +2615,13 @@ def _patch_storage_manager(
             metadata.setdefault("allow_reserved_io", True)
         observation = binding_registry.observe(
             key, action, status, context, bytes=bytes, metadata=metadata,
+        )
+        endpoint.observe_native_policy_key(
+            key,
+            context=context,
+            action=action,
+            status=status,
+            metadata=metadata,
         )
         if binding_observer is not None:
             binding_observer(key, observation, context, action_manager)

@@ -704,6 +704,10 @@ class OnlineControllerTests(unittest.TestCase):
         self.assertTrue(proposed.metadata["prefix_prefetch_candidate"])
         self.assertEqual(proposed.metadata["prefetch_kind"], "prefix")
         self.assertEqual(proposed.metadata["prefetch_source_tier"], "ssd")
+        self.assertEqual(
+            proposed.metadata["runtime_action_plan"]["metadata"]["prefetch_kind"],
+            "prefix",
+        )
 
     def test_scheduler_hint_offload_unifies_cpu_runtime_decision(self):
         execution_spec = BackendExecutionSpec(
@@ -1881,6 +1885,52 @@ class OnlineControllerTests(unittest.TestCase):
         )
         self.assertIn("evict_pressure_snapshot", results[0][0].metadata)
 
+    def test_global_evict_scan_uses_state_backend_identity_not_latest_request_binding(self):
+        first = self._evict_ready_binding(
+            object_key="prefix-shared",
+            backend_object_id="block-first",
+            spec_id="spec-first",
+            binding_id="bind-first",
+        )
+        second = self._evict_ready_binding(
+            object_key="prefix-shared",
+            backend_object_id="block-second",
+            spec_id="spec-second",
+            binding_id="bind-second",
+        )
+        bridge = OnlineBackendBridge(
+            run_id="run",
+            bindings=[first],
+            hook_client=object(),
+            hook_url="http://127.0.0.1:7900/actions",
+            gate=gate(),
+        )
+        controller = OnlinePolicyController(
+            run_id="run",
+            workload_id="w",
+            bridge=bridge,
+            config=OnlinePolicyControllerConfig(
+                evict_cpu_capacity_bytes=1,
+                global_evict_scan_min_interval_s=0.0,
+            ),
+        )
+        controller.execution_enabled = True
+        self._ingest_cpu_object(
+            controller,
+            object_key="prefix-shared",
+            backend_object_id="block-first",
+            prefetch_waste=False,
+            size=1,
+        )
+        self.assertTrue(bridge.register_binding(second))
+
+        results = controller.global_evict_scan(now_ns=1_000)
+
+        self.assertEqual(len(results), 1)
+        decision = results[0][0]
+        self.assertEqual(decision.metadata["backend_object_id"], "block-first")
+        self.assertEqual(decision.metadata["binding_id"], "bind-first")
+
     def test_global_evict_scan_falls_back_to_offline_profile_with_current_state(self):
         prefix_key = "sha256:offline-prefix"
         binding = self._evict_ready_binding(
@@ -2023,7 +2073,7 @@ class OnlineControllerTests(unittest.TestCase):
         self.assertEqual(controller.dispatch(decision).status, "executed")
         self.assertIn(
             ("block-a", generation, "cpu"),
-            controller._completed_evict_sources,
+            controller._terminal_evict_sources,
         )
 
         # A late release callback can carry the old CPU tier.  It must not
@@ -2042,6 +2092,74 @@ class OnlineControllerTests(unittest.TestCase):
             tier_before="ssd", tier_after="cpu", bytes=1, binding_generation=generation,
         )))
         self.assertEqual(len(controller.global_evict_scan(now_ns=14)), 1)
+
+    def test_global_evict_scan_deduplicates_not_found_source(self):
+        binding = self._evict_ready_binding(
+            object_key="prefix-stale",
+            backend_object_id="block-stale",
+            spec_id="spec-stale",
+        )
+        bridge = OnlineBackendBridge(
+            run_id="run",
+            bindings=[binding],
+            hook_client=object(),
+            hook_url="http://127.0.0.1:7900/actions",
+            gate=gate(),
+        )
+        controller = OnlinePolicyController(
+            run_id="run",
+            workload_id="w",
+            bridge=bridge,
+            config=OnlinePolicyControllerConfig(
+                evict_cpu_capacity_bytes=1,
+                global_evict_scan_min_interval_s=0.0,
+            ),
+        )
+        controller.execution_enabled = True
+        self._ingest_cpu_object(
+            controller,
+            object_key="prefix-stale",
+            backend_object_id="block-stale",
+            prefetch_waste=False,
+            size=1,
+        )
+        state = controller.profile_store.object_state("block-stale")
+        assert state is not None
+        generation = int(state.get("binding_generation") or 0)
+
+        def not_found(decision):
+            return RuntimeActionResult(
+                "not_found",
+                "source object is no longer resident",
+                receipt=BackendActionReceipt(
+                    "run",
+                    decision.decision_id,
+                    f"{decision.decision_id}:terminal",
+                    "bind",
+                    "block-stale",
+                    HookAction.EVICT,
+                    "not_found",
+                    10,
+                    tier_before="unknown",
+                    tier_after="unknown",
+                    binding_generation=generation,
+                    decision_id=decision.decision_id,
+                    request_id="req",
+                ),
+            )
+
+        bridge.dispatch = not_found
+        first = controller.global_evict_scan(now_ns=1_000)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0][1].status, "not_found")
+        self.assertIn(
+            ("block-stale", generation, "cpu"),
+            controller._terminal_evict_sources,
+        )
+
+        # The same stale generation/source is terminal after a receipt-backed
+        # not_found result, even though the placement snapshot still says CPU.
+        self.assertEqual(controller.global_evict_scan(now_ns=2_000), [])
 
     def test_global_evict_scan_is_deterministic(self):
         binding_a = self._evict_ready_binding(

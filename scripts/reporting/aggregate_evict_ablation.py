@@ -98,6 +98,14 @@ def aggregate_run(state_dir: Path, run_dir: Path | None, *, reaccess_window_ms: 
         run_dir / "kv_core_policy_decisions.jsonl" if run_dir is not None else state_dir,
         state_dir / "kv_core_policy_decisions.jsonl",
     )
+    native_evictions = load_first(
+        run_dir / "native_cache_policy_evictions.jsonl" if run_dir is not None else state_dir,
+        state_dir / "native_cache_policy_evictions.jsonl",
+    )
+    native_installations = load_first(
+        run_dir / "native_policy_installation.jsonl" if run_dir is not None else state_dir,
+        state_dir / "native_policy_installation.jsonl",
+    )
 
     receipt_counts: Counter[str] = Counter()
     evict_completed: list[dict[str, Any]] = []
@@ -105,6 +113,19 @@ def aggregate_run(state_dir: Path, run_dir: Path | None, *, reaccess_window_ms: 
         receipt_counts[f"{as_str(row.get('action'))}:{as_str(row.get('status'))}"] += 1
         if as_str(row.get("action")) == "evict" and as_str(row.get("status")) == "completed":
             evict_completed.append(row)
+
+    native_selected = {
+        as_str(row.get("selection_id")): row
+        for row in native_evictions
+        if as_str(row.get("status")) == "selected" and as_str(row.get("selection_id"))
+    }
+    native_completed = {
+        as_str(row.get("selection_id")): row
+        for row in native_evictions
+        if as_str(row.get("status")) == "completed" and as_str(row.get("selection_id"))
+    }
+    if native_evictions:
+        evict_completed = list(native_completed.values())
 
     ticket_counts: Counter[str] = Counter()
     for row in tickets:
@@ -119,6 +140,12 @@ def aggregate_run(state_dir: Path, run_dir: Path | None, *, reaccess_window_ms: 
         meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
         if as_str(row.get("action")) == "evict" and meta.get("evict_cold_score") is not None:
             cold_scores.append(as_float(meta.get("evict_cold_score")))
+    if native_evictions:
+        cold_scores = [
+            as_float(row.get("cold_score"))
+            for row in native_selected.values()
+            if row.get("cold_score") is not None
+        ]
 
     ttft: list[float] = []
     request_results = load_jsonl(run_dir / "request_results.jsonl") if run_dir is not None else []
@@ -130,7 +157,8 @@ def aggregate_run(state_dir: Path, run_dir: Path | None, *, reaccess_window_ms: 
     # Bad eviction: an evict-completed key later re-accessed within the window.
     evicted_at: dict[str, int] = {}
     for row in evict_completed:
-        key = event_key(row)
+        signals = row.get("signals") if isinstance(row.get("signals"), dict) else {}
+        key = as_str(signals.get("logical_object_key")) or event_key(row)
         ts = as_int(row.get("timestamp_ns"))
         if key:
             evicted_at[key] = max(evicted_at.get(key, 0), ts)
@@ -159,6 +187,15 @@ def aggregate_run(state_dir: Path, run_dir: Path | None, *, reaccess_window_ms: 
         "run_dir": str(run_dir) if run_dir is not None else "",
         "receipts": dict(receipt_counts),
         "evict_completed": len(evict_completed),
+        "native_eviction": {
+            "selected": len(native_selected),
+            "completed": len(native_completed),
+            "completion_rate": (
+                round(len(native_completed) / len(native_selected), 4)
+                if native_selected else None
+            ),
+        },
+        "native_policy_installation": native_installations[-1] if native_installations else None,
         "prefetch_a_tickets": dict(ticket_counts),
         "lookup_actions": dict(lookup_counts),
         "ttft_ms": {
@@ -191,11 +228,18 @@ def merge_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
     evicted_keys = 0
     reaccessed = 0
     evict_completed = 0
+    native_selected = 0
+    native_completed = 0
+    native_installations: list[dict[str, Any]] = []
     for run in runs:
         receipts.update(run["receipts"])
         tickets.update(run["prefetch_a_tickets"])
         lookup.update(run["lookup_actions"])
         evict_completed += run["evict_completed"]
+        native_selected += run.get("native_eviction", {}).get("selected", 0)
+        native_completed += run.get("native_eviction", {}).get("completed", 0)
+        if run.get("native_policy_installation"):
+            native_installations.append(run["native_policy_installation"])
         ttft_values = run["ttft_ms"]
         if ttft_values.get("count"):
             # Recompute percentiles from per-run aggregate is approximate; the
@@ -208,6 +252,12 @@ def merge_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
         "run_count": len(runs),
         "receipts": dict(receipts),
         "evict_completed": evict_completed,
+        "native_eviction": {
+            "selected": native_selected,
+            "completed": native_completed,
+            "completion_rate": round(native_completed / native_selected, 4) if native_selected else None,
+        },
+        "native_policy_installations": native_installations,
         "prefetch_a_tickets": dict(tickets),
         "lookup_actions": dict(lookup),
         "ttft_ms": {"count": len(ttft), "mean": None, "p50": None, "p95": None},
@@ -226,6 +276,21 @@ def merge_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def measured_state_dirs(arm_root: Path) -> list[Path]:
+    """Return only measured role state directories from the E11 arm layout.
+
+    A recursive search also enters ``*-lmcache-store`` and nested
+    ``warmup-state`` directories. Besides being very slow on real artifacts,
+    treating the nested warmup directory as a measured state makes
+    ``aggregate_run`` attempt to read the directory itself as JSONL.
+    """
+    return sorted(
+        path
+        for path in arm_root.glob("rep-*/*/*-state")
+        if path.is_dir()
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, help="Single run state directory")
@@ -240,10 +305,7 @@ def main() -> None:
         merged = runs[0]
     elif args.arm_root is not None:
         runs = []
-        for state_dir in sorted(
-            path for path in args.arm_root.rglob("*")
-            if path.is_dir() and path.name.endswith("-state")
-        ):
+        for state_dir in measured_state_dirs(args.arm_root):
             run_dir = state_dir.with_name(state_dir.name[: -len("-state")])
             # Warmup passes share the state dir; only the measured run_dir
             # should contribute request_results to TTFT aggregation.

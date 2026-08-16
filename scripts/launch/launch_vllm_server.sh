@@ -33,6 +33,7 @@ VLLM_DEV_MODE="${ASTRAKV_VLLM_DEV_MODE:-false}"
 LMCACHE047_HOOKS="${ASTRAKV_ENABLE_LMCACHE047_HOOKS:-false}"
 RUNTIME_CONTROL_RUN_ID="${ASTRAKV_RUNTIME_CONTROL_RUN_ID:-}"
 VLLM_SEED="${ASTRAKV_VLLM_SEED:-0}"
+MOE_MODE="${ASTRAKV_MOE_MODE:-false}"
 
 case "$PREFIX_CACHING" in
   true|false) ;;
@@ -45,6 +46,10 @@ esac
 case "$LMCACHE047_HOOKS" in
   true|false) ;;
   *) echo "ASTRAKV_ENABLE_LMCACHE047_HOOKS must be true or false, got: $LMCACHE047_HOOKS" >&2; exit 2 ;;
+esac
+case "$MOE_MODE" in
+  true|false) ;;
+  *) echo "ASTRAKV_MOE_MODE must be true or false, got: $MOE_MODE" >&2; exit 2 ;;
 esac
 if [[ "$LMCACHE047_HOOKS" == "true" ]]; then
   # The vendor-patched connector imports AstraKV directly.  Do not prepend
@@ -96,9 +101,11 @@ echo "HF_ENDPOINT=${HF_ENDPOINT}"
 echo "PrefixCaching=${PREFIX_CACHING} VllmDevMode=${VLLM_DEV_MODE}"
 echo "VllmSeed=${VLLM_SEED}"
 echo "LMCache047Hooks=${LMCACHE047_HOOKS}"
+echo "MoeMode=${MOE_MODE}"
 if [[ -n "$KV_CACHE_MEMORY_BYTES" ]]; then
   echo "KvCacheMemoryBytes=${KV_CACHE_MEMORY_BYTES}"
 fi
+
 if [[ -n "$RUNTIME_CONTROL_RUN_ID" ]]; then
   echo "RuntimeControlRunId=${RUNTIME_CONTROL_RUN_ID}"
 fi
@@ -115,6 +122,10 @@ CMD=(
   --tensor-parallel-size "$TENSOR_PARALLEL"
   --trust-remote-code
 )
+
+if [[ "$MOE_MODE" == "true" ]]; then
+  CMD+=(--language-model-only --enable-return-routed-experts)
+fi
 
 if [[ -n "$KV_CACHE_MEMORY_BYTES" ]]; then
   CMD+=(--kv-cache-memory-bytes "$KV_CACHE_MEMORY_BYTES")

@@ -39,6 +39,32 @@ removed.
 | `launch/launch_lmcache_vllm.sh` / `archive/launch_lmcache_vllm.ps1` | Starts vLLM + LMCache CPU or disk backend. PowerShell wrapper is archived because the current DGX Spark path is Linux/bash-first. |
 | `entrypoints/bootstrap_dgx_spark_env.sh` | Creates a local venv and installs Python, PyTorch, vLLM, and optional LMCache for DGX Spark. |
 
+### MoE Request-Ahead Prefill
+
+The DGX Spark MoE demo uses the already-installed
+`/opt/models/Qwen3.6-35B-A3B` checkpoint. It starts vLLM in language-model-only
+mode with routed-expert return enabled, runs a paired baseline/prepared workload,
+and writes routed-expert, prepare-receipt, raw-NumPy, LMCache, and TTFT evidence:
+
+```bash
+bash scripts/entrypoints/run_moe_prepare_demo.sh
+```
+
+The prepared arm is enabled through `ASTRAKV_MOE_PREPARE_ENABLED=true`; the
+baseline uses the same config and workload with that variable set to `false`.
+`ASTRAKV_MOE_MODE=true` is required for the server flags and is set by the
+entrypoint. The prepare request performs a real full-prefix MoE prefill with
+`max_tokens=1` before the measured streaming request. This demonstrates routed
+experts and KV reuse; it does not claim selective CPU/SSD expert-weight paging.
+
+vLLM `0.23.0` currently rejects `--enable-return-routed-experts` together with
+any `LMCacheConnectorV1` KV connector during startup. This is a configuration
+compatibility check, not a GB10 memory-pressure failure. On that exact build,
+the full acceptance run requires a vLLM build that supports both features; a
+route-only smoke can be run by clearing `ASTRAKV_KV_TRANSFER_CONFIG`, but it
+does not provide LMCache hit evidence. Do not treat a route-only result as the
+paired MoE+LMCache acceptance result.
+
 ## Analysis And Reporting
 
 | Script | Purpose |

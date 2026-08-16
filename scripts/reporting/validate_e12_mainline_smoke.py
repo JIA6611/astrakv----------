@@ -149,6 +149,43 @@ def _compact_lookup(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _compact_accounting_lookup(row: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the terminal native lookup ledger into lookup evidence.
+
+    The scheduler callback writes the authoritative load/recompute outcome to
+    request accounting.  It is intentionally separate from policy decisions:
+    a native lookup can allocate and complete an external load even when the
+    policy process did not emit a duplicate ``admit_external_prefix`` row.
+    Only terminal rows with positive load or confirmed recompute are admitted.
+    """
+    allocated = as_int(row.get("allocated_external_tokens"))
+    loaded = as_int(row.get("actual_loaded_tokens"))
+    recomputed = as_int(row.get("recomputed_tokens"))
+    confirmed = row.get("recompute_confirmed") is True
+    terminal = row.get("terminal") is True
+    action = ""
+    if terminal and allocated > 0 and loaded > 0:
+        action = "admit_external_prefix"
+    elif terminal and confirmed and recomputed > 0:
+        action = "recompute"
+    request_id = as_str(row.get("logical_request_id")) or as_str(row.get("request_id"))
+    return {
+        "request_id": request_id,
+        "physical_object_id": as_str(row.get("physical_object_id")),
+        "binding_generation": as_int(row.get("binding_generation")),
+        "action": action,
+        "reason": as_str(row.get("terminal_reason")) or "native_lookup_terminal",
+        "candidate_external_tokens": max(
+            allocated, recomputed, as_int(row.get("lookup_hit_tokens"))
+        ),
+        "candidate_evidence_present": bool(
+            as_int(row.get("lookup_hit_tokens")) > 0
+            and ((allocated > 0 and loaded > 0) or (confirmed and recomputed > 0))
+        ),
+        "timestamp_ns": as_int(row.get("timestamp_ns")),
+    }
+
+
 def _compact_release(row: dict[str, Any]) -> dict[str, Any]:
     meta = metadata(row)
     return {
@@ -280,6 +317,7 @@ def validate(run_dir: Path, state_dir: Path) -> dict[str, Any]:
     names = {
         "tickets": "kv_core_prefetch_tickets.jsonl",
         "decisions": "kv_core_policy_decisions.jsonl",
+        "lookup_accounting": "kv_core_request_accounting.jsonl",
         "runtime_events": "runtime_events_raw.jsonl",
         "commands": "astrakv_runtime_commands.jsonl",
         "receipts": "runtime_command_receipts.jsonl",
@@ -319,6 +357,15 @@ def validate(run_dir: Path, state_dir: Path) -> dict[str, Any]:
             chain["prefetch_a"].append(_compact_a(decision, ticket))
         elif action in LOOKUP_ACTIONS:
             chain["lookup"].append(_compact_lookup(decision))
+
+    # Native scheduler lookup accounting is the terminal source of truth for
+    # external bytes actually loaded or recompute explicitly confirmed.
+    for accounting in rows["lookup_accounting"]:
+        lookup = _compact_accounting_lookup(accounting)
+        if lookup["request_id"] and lookup["action"]:
+            chain = chains[lookup["request_id"]]
+            chain["request_id"] = lookup["request_id"]
+            chain["lookup"].append(lookup)
 
     for event in rows["runtime_events"]:
         if as_str(event.get("record_type")) != "event" or as_str(event.get("action")) != "release":

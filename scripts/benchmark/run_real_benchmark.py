@@ -352,7 +352,11 @@ def resolve_args(raw: argparse.Namespace, config: dict[str, Any]) -> argparse.Na
     workload_cfg = _dict(config.get("workload"))
     metrics_cfg = _dict(config.get("metrics"))
     runtime_cfg = _dict(config.get("runtime"))
-    moe_prepare_config = MoePrepareConfig.from_mapping(_dict(config.get("moe_prepare")))
+    moe_prepare_raw = _dict(config.get("moe_prepare"))
+    moe_prepare_override = os.environ.get("ASTRAKV_MOE_PREPARE_ENABLED")
+    if moe_prepare_override is not None:
+        moe_prepare_raw["enabled"] = moe_prepare_override
+    moe_prepare_config = MoePrepareConfig.from_mapping(moe_prepare_raw)
 
     run_name = str(config.get("run_name") or "real_vllm_endpoint")
     if config:
@@ -603,6 +607,7 @@ def run_one_request(
     request_context_error = ""
     moe_prepare_result = MoePrepareResult()
     published_context: RuntimeRequestContext | None = None
+    context_published = False
     prefetch_lead_s = max(0.0, as_float_or_none(request_metadata.get("prefetch_lead_s")) or 0.0)
     run_id = str(request_metadata.get("run_id") or "")
     task_metadata = request_metadata.get("metadata") if isinstance(request_metadata.get("metadata"), dict) else {}
@@ -683,9 +688,11 @@ def run_one_request(
             published_context = context
             if request_context_artifact is not None:
                 request_context_artifact.append(context)
+                context_published = request_context_client is None
             if request_context_client is not None:
                 receipt = request_context_client.publish(context)
                 if receipt.matches(context):
+                    context_published = True
                     runtime_association_status = "linked"
                     runtime_request_id = receipt.runtime_request_id
                     runtime_event_id = receipt.runtime_event_id
@@ -698,7 +705,7 @@ def run_one_request(
             model=model,
             request_id=str(request_id),
             exact_token_ids=tuple(exact_ids),
-            context_published=published_context is not None,
+            context_published=context_published,
             runtime_association_status=runtime_association_status,
             prefix_id=str(request_metadata.get("prefix_id") or ""),
             prefix_hash=str(request_metadata.get("prefix_hash") or ""),
@@ -1749,6 +1756,8 @@ def start_metrics_collector(
 
 
 def write_effective_config(path: Path, args: argparse.Namespace, config: dict[str, Any]) -> None:
+    # Keep direct callers and older tests compatible with pre-MoE namespaces.
+    moe_prepare_config = getattr(args, "moe_prepare_config", MoePrepareConfig())
     payload = {
         "source_config": config.get("_config_path", ""),
         "run_name": args.run_name,
@@ -1776,7 +1785,7 @@ def write_effective_config(path: Path, args: argparse.Namespace, config: dict[st
         "request_context_url": args.request_context_url,
         "request_context_artifact": "request_context.jsonl",
         "request_context_association_artifact": "request_context_associations.jsonl",
-        "moe_prepare": args.moe_prepare_config.to_record(),
+        "moe_prepare": moe_prepare_config.to_record(),
         "samples_dir": "samples" if args.enable_samples else "",
         "samples_file_pattern": "samples/<case>_samples.csv" if args.enable_samples else "",
         "raw_config": redact_config({key: value for key, value in config.items() if key != "_config_path"}),

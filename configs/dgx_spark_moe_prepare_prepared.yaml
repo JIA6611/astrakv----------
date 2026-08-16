@@ -1,0 +1,48 @@
+run_name: moe_qwen3_6_35b_a3b
+require_canonical_workload: true
+workload_jsonl: ""
+
+backend:
+  name: vllm-lmcache-kv-core
+  base_url: http://127.0.0.1:8000
+  api_key: EMPTY
+  model: /opt/models/Qwen3.6-35B-A3B
+  timeout_seconds: 600
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  dtype: bfloat16
+  gpu_memory_utilization: 0.70
+  max_model_len: 16384
+  tensor_parallel_size: 1
+  language_model_only: true
+  enable_return_routed_experts: true
+
+matrix:
+  batch_sizes: [1]
+  context_lengths: [2048, 8192]
+  output_tokens: 8
+  repeat: 4
+
+workload:
+  system_prompt: "You are a concise assistant for MoE request-ahead prefill validation."
+  temperature: 0.0
+  top_p: 1.0
+
+moe_prepare:
+  enabled: true
+  mode: full_prefix_prefill
+  max_tokens: 1
+  capture_window_tokens: 256
+  timeout_seconds: 600
+  require_exact_token_ids: true
+  fail_open: true
+  expected_layers: 40
+  expected_top_k: 8
+  max_expert_id: 255
+  model_type: qwen3_5_moe
+
+metrics:
+  sample_interval_seconds: 0.5
+  process_name_filters: [vllm, lmcache, python]

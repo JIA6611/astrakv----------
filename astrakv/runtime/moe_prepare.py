@@ -351,19 +351,12 @@ class MoePrepareClient:
         safe_id = _safe_filename(request_id)
         raw_path = self.raw_dir / f"{safe_id}.npy"
         raw_sha256 = hashlib.sha256(raw).hexdigest()
-        events = list(
-            routed_experts_to_events(
-                array,
-                request_id=request_id,
-                token_start=token_start,
-                model=model,
-            )
-        )
+        route_event_count = int(array.size)
         unique_experts = {int(value) for value in np.unique(array).tolist()}
         result = MoePrepareResult(
             status="prepared",
             latency_ms=latency_ms,
-            route_event_count=len(events),
+            route_event_count=route_event_count,
             unique_experts=len(unique_experts),
             model_type=self.config.model_type,
             started_s=started_s,
@@ -390,11 +383,22 @@ class MoePrepareClient:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             self.raw_dir.mkdir(parents=True, exist_ok=True)
             raw_path.write_bytes(raw)
-            self._append_jsonl(self._artifact("moe_route_events"), (event.to_record() for event in events))
+            self._append_jsonl(
+                self._artifact("moe_route_events"),
+                (
+                    event.to_record()
+                    for event in routed_experts_to_events(
+                        array,
+                        request_id=request_id,
+                        token_start=token_start,
+                        model=model,
+                    )
+                ),
+            )
             self._append_jsonl(self._artifact("moe_prepare_receipts"), (receipt,))
             self._request_count += 1
             self._success_count += 1
-            self._route_event_count += len(events)
+            self._route_event_count += route_event_count
             self._unique_experts.update(unique_experts)
             for token_layers in array:
                 for layer_id, experts in enumerate(token_layers):
@@ -467,6 +471,7 @@ class MoePrepareClient:
             prefix_id=prefix_id,
             prefix_hash=prefix_hash,
             cache_key=cache_key,
+            context_published=status != "skipped_context_unpublished",
         )
         with self._lock:
             self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -489,6 +494,7 @@ class MoePrepareClient:
         prefix_id: str,
         prefix_hash: str,
         cache_key: str,
+        context_published: bool = True,
     ) -> dict[str, Any]:
         return {
             "schema": MOE_PREPARE_RECEIPT_SCHEMA,
@@ -499,7 +505,7 @@ class MoePrepareClient:
             "mode": self.config.mode,
             "status": result.status,
             "error": result.error,
-            "context_published": True,
+            "context_published": context_published,
             "runtime_association_status": runtime_association_status,
             "prefix_id": prefix_id,
             "prefix_hash": prefix_hash,

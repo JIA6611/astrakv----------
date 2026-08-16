@@ -71,7 +71,10 @@ export ASTRAKV_KV_CORE_PREFETCH_DEADLINE_NS=15000000000
 export ASTRAKV_KV_CORE_PREFETCH_TTL_NS=60000000000
 export ASTRAKV_PREFIX_CACHING=false
 export ASTRAKV_PREFETCH_DISPATCH_INDEPENDENT_OF_MODE=true
-export ASTRAKV_LOCAL_CPU_SIZE_GB="${ASTRAKV_E12_CPU_SIZE_GB:-8.0}"
+# Keep prefetched A objects resident until their following native lookup.  The
+# smoke is a control-chain audit, so capacity pressure must not race the
+# consume proof; capacity eviction remains outside E12 acceptance.
+export ASTRAKV_LOCAL_CPU_SIZE_GB="${ASTRAKV_E12_CPU_SIZE_GB:-32.0}"
 export ASTRAKV_ABLATION_OUTPUT_TOKENS="${ASTRAKV_E12_OUTPUT_TOKENS:-8}"
 export ASTRAKV_ABLATION_WARMUP_OUTPUT_TOKENS="${ASTRAKV_E12_OUTPUT_TOKENS:-8}"
 export ASTRAKV_ABLATION_WARMUP_PASSES=1

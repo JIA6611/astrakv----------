@@ -18,6 +18,13 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# The active DGX checkout is astrakv-W.  Normalize the previous mistaken
+# checkout name so an old command line cannot silently sync to the wrong tree.
+if ($RemoteRoot.TrimEnd("/") -eq "/home/zyx/astrakv2") {
+    Write-Warning "RemoteRoot /home/zyx/astrakv2 is obsolete; using /home/zyx/astrakv-W."
+    $RemoteRoot = "/home/zyx/astrakv-W"
+}
+
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 
 function Normalize-RelativePath {

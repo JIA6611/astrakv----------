@@ -28,6 +28,7 @@ class ValidateE12MainlineSmokeTests(unittest.TestCase):
         self.assertIn("ASTRAKV_ABLATION_PREDICTION_PHASES=far", script)
         self.assertIn("--interleave-pattern fire-consume", script)
         self.assertIn("ASTRAKV_PREFIX_CACHING=false", script)
+        self.assertIn('ASTRAKV_LOCAL_CPU_SIZE_GB="${ASTRAKV_E12_CPU_SIZE_GB:-32.0}"', script)
 
     def _valid_bundle(self, root: Path) -> tuple[Path, Path]:
         run = root / "run"
@@ -124,6 +125,38 @@ class ValidateE12MainlineSmokeTests(unittest.TestCase):
         self.assertEqual(chain["request_id"], "req-1")
         self.assertEqual(chain["lookup"]["action"], "admit_external_prefix")
         self.assertEqual(chain["prefetch_b"]["moved_bytes"], 4096)
+
+    def test_accepts_terminal_native_lookup_accounting(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run, state = self._valid_bundle(Path(raw))
+            (state / "kv_core_policy_decisions.jsonl").write_text(
+                "\n".join(
+                    line for line in (state / "kv_core_policy_decisions.jsonl")
+                    .read_text(encoding="utf-8").splitlines()
+                    if "admit_external_prefix" not in line
+                ) + "\n",
+                encoding="utf-8",
+            )
+            write_jsonl(state / "kv_core_request_accounting.jsonl", [{
+                "logical_request_id": "req-1",
+                "request_id": "native-req-1",
+                "physical_object_id": "physical-1",
+                "binding_generation": 2,
+                "lookup_hit_tokens": 1024,
+                "allocated_external_tokens": 1024,
+                "actual_loaded_tokens": 1024,
+                "recomputed_tokens": 0,
+                "recompute_confirmed": False,
+                "terminal": True,
+                "terminal_reason": "native_partial_prefix_load_recompute",
+                "timestamp_ns": 20,
+            }])
+            result = validate(run, state)
+
+        self.assertTrue(result["eligible"])
+        self.assertEqual(result["validation_status"], "PASS")
+        self.assertEqual(result["complete_chain_count"], 1)
+        self.assertEqual(result["complete_chains"][0]["lookup"]["action"], "admit_external_prefix")
 
     def test_rejects_bundle_without_prefetch_b_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

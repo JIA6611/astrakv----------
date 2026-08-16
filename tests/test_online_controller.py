@@ -1881,6 +1881,72 @@ class OnlineControllerTests(unittest.TestCase):
         )
         self.assertIn("evict_pressure_snapshot", results[0][0].metadata)
 
+    def test_global_evict_scan_falls_back_to_offline_profile_with_current_state(self):
+        prefix_key = "sha256:offline-prefix"
+        binding = self._evict_ready_binding(
+            object_key=prefix_key,
+            backend_object_id="block-offline",
+            spec_id="spec-scan-offline",
+        )
+        bridge = OnlineBackendBridge(
+            run_id="run",
+            bindings=[binding],
+            hook_client=object(),
+            hook_url="http://127.0.0.1:7900/actions",
+            gate=gate(),
+        )
+        offline_db = ProfileDB()
+        offline_profile = ChunkProfile(
+            chunk_id=prefix_key,
+            workload_id="train-workload",
+            request_count=2,
+        )
+        offline_db.chunks[f"train-workload:{prefix_key}"] = offline_profile
+        controller = OnlinePolicyController(
+            run_id="run",
+            workload_id="live-workload",
+            bridge=bridge,
+            profile_db=offline_db,
+            config=OnlinePolicyControllerConfig(
+                offline_profile_workload_id="train-workload",
+                evict_cpu_capacity_bytes=1,
+                global_evict_scan_min_interval_s=0.0,
+            ),
+        )
+        controller.execution_enabled = True
+        self._ingest_cpu_object(
+            controller,
+            object_key=prefix_key,
+            backend_object_id="block-offline",
+            prefetch_waste=False,
+            size=1,
+        )
+        controller.observed_profile_db = ProfileDB()
+        self.assertIsNone(
+            controller.observed_profile_db.get_chunk(
+                binding.backend_object_id,
+                workload_id=controller.workload_id,
+            )
+        )
+
+        received_states = []
+        resolve_offline_profile = controller._offline_profile_for
+
+        def capture_offline_profile(candidate_binding, candidate_state):
+            received_states.append(candidate_state)
+            return resolve_offline_profile(candidate_binding, candidate_state)
+
+        controller._offline_profile_for = capture_offline_profile
+        expected_state = controller.profile_store.object_state("block-offline")
+        results = controller.global_evict_scan(now_ns=1_000)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(received_states, [expected_state])
+        self.assertIs(
+            resolve_offline_profile(binding, received_states[0]),
+            offline_profile,
+        )
+
     def test_global_evict_scan_skips_without_pressure(self):
         binding = self._evict_ready_binding(
             object_key="prefix", backend_object_id="block-7", spec_id="spec-scan-nopressure",

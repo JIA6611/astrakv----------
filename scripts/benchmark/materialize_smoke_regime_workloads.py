@@ -7,10 +7,11 @@ rows and short deterministic prompts so the full chain
 (materialize -> server -> benchmark -> accounting -> acceptance -> report)
 can be verified end to end before the real matrix runs.
 
-The default context length (3000 tokens) is deliberately above the 2048-token
-partial-prefix cap so the E4 arm really splits load vs recompute instead of
-degenerating into a full load; otherwise the partial-prefix evidence gate
-would fail for the wrong reason.
+The default context-length estimate (6000 tokens) is deliberately well above
+the 2048-token partial-prefix cap.  The earlier 3000 estimate produced only
+2297 Qwen3 request tokens on DGX, leaving a 2048-token native hit that could
+not be split.  The larger smoke prompt yields at least two native hit chunks
+beyond the cap, so E4 must prove a real load/recompute split.
 """
 
 from __future__ import annotations
@@ -57,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--context-tokens", type=int, default=3000)
+    parser.add_argument("--context-tokens", type=int, default=6000)
     parser.add_argument("--groups", type=int, default=2, help="Shared-context groups for repeated/queued/churn workloads.")
     parser.add_argument("--revisits", type=int, default=3)
     parser.add_argument("--churn-groups", type=int, default=4)
@@ -75,8 +76,8 @@ def main() -> int:
 
 
 def materialize(args: argparse.Namespace) -> dict:
-    if args.context_tokens < 2304:
-        raise SystemExit("--context-tokens must exceed the 2048 partial cap plus one chunk so the E4 split is real")
+    if args.context_tokens < 5120:
+        raise SystemExit("--context-tokens must provide a safe tokenizer margin above the 2048 partial cap")
     rng = random.Random(args.seed)
     rows = {
         "repeated_long_prefix": build_repeated_long_prefix(

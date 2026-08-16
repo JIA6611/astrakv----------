@@ -917,7 +917,7 @@ class OnlinePolicyController:
                 continue
             profile = (
                 self.observed_profile_db.get_chunk(binding.backend_object_id, workload_id=self.workload_id)
-                or self._offline_profile_for(binding, object_state)
+                or self._offline_profile_for(binding, state)
             )
             reuse = _reuse_frequency(profile, state)
             policy_reuse = _policy_reuse_frequency(profile, state, reuse)

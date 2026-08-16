@@ -91,6 +91,35 @@ for workload in $WORKLOADS; do
 done
 
 mkdir -p "$OUTPUT_DIR"
+export ASTRAKV_REGIME_OUTPUT_DIR="$OUTPUT_DIR"
+"$PYTHON" - <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+
+root = Path.cwd()
+paths = [
+    root / "astrakv/runtime/vendor_callback_bridge.py",
+    root / "astrakv/runtime/lmcache047_runtime_patch.py",
+    root / "scripts/benchmark/materialize_smoke_regime_workloads.py",
+    root / "scripts/benchmark/materialize_recompute_only_workload.py",
+    root / "scripts/reporting/validate_load_recompute_regime_cell.py",
+    root / "scripts/reporting/build_load_recompute_regime_report.py",
+    root / "scripts/entrypoints/run_kv_core_controlled_suite.sh",
+    root / "scripts/entrypoints/run_load_recompute_regime_suite.sh",
+]
+payload = {
+    "schema": "astrakv-load-recompute-regime-runtime-source-v1",
+    "files": [
+        {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        for path in paths
+    ],
+}
+(Path(os.environ["ASTRAKV_REGIME_OUTPUT_DIR"]) / "runtime_source_manifest.json").write_text(
+    json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
 if [[ "$SMOKE" == true ]]; then
   SMOKE_WORKLOAD_DIR="$OUTPUT_DIR/smoke-workloads"
   "$PYTHON" scripts/benchmark/materialize_smoke_regime_workloads.py \
@@ -129,6 +158,11 @@ run_cell() {
   local baseline_dir="$cell_run_dir/$phase/$workload/cold/baseline"
   local variant_dir="$cell_run_dir/$phase/$workload/cold/variant"
   [[ -d "$variant_dir" ]] || { echo "missing variant cell run: $label" >&2; return 1; }
+  if ! "$PYTHON" scripts/reporting/validate_load_recompute_regime_cell.py \
+      --run-dir "$variant_dir" --arm "$arm" --phase "$phase" --workload "$workload" \
+      --output "$variant_dir/acceptance.json"; then
+    [[ "$SMOKE" == true ]] || return 1
+  fi
   echo "{\"workload\": \"$workload\", \"arm\": \"$arm\", \"phase\": \"$phase\", \"baseline_dir\": \"\", \"variant_dir\": \"$variant_dir\", \"variant_only\": true, \"output_tokens\": $OUTPUT_TOKENS, \"smoke\": $SMOKE}" >> "$CELLS_FILE"
 }
 

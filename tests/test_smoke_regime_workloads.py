@@ -15,7 +15,7 @@ def _args(output_dir: str) -> argparse.Namespace:
     return argparse.Namespace(
         output_dir=output_dir,
         seed=0,
-        context_tokens=3000,
+        context_tokens=6000,
         groups=2,
         revisits=3,
         churn_groups=4,
@@ -53,7 +53,7 @@ class SmokeRegimeWorkloadsTests(unittest.TestCase):
                 self.assertEqual(row["case"], "repeated_long_prefix")
                 self.assertEqual(row["metadata"]["workload_type"], "repeated_long_prefix")
                 self.assertTrue(row["metadata"]["smoke"])
-                self.assertTrue(row["context_length"] >= 2304, "context must exceed the 2048 partial cap")
+                self.assertTrue(row["context_length"] >= 5120, "context must retain a tokenizer margin above the partial cap")
             for row in revisits:
                 self.assertGreater(row["prefetch_lead_s"], 0.0)
                 self.assertGreater(row["sleep_before_s"], 0.0)

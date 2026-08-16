@@ -216,6 +216,10 @@ class VendorCallbackBridge:
             probe = metadata.get("kv_core_decision_probe")
             if isinstance(probe, dict) and probe:
                 self._decision_probe_by_request[request_id] = dict(probe)
+                self._write_decision_probe_intent(
+                    logical_request_id=request_id,
+                    probe=probe,
+                )
         if (
             _env_flag("ASTRAKV_KV_CORE_EQUIVALENCE_TEST")
             and str(metadata.get("kv_core_equivalence_mode") or "") == "force_recompute"
@@ -667,6 +671,7 @@ class VendorCallbackBridge:
                 "allocated_external_tokens": max(0, int(allocated_external_tokens)),
             })
             return
+        declared_prefetch_identity: tuple[str, int, str, str] | None = None
         if intent_record is not None:
             expected = (
                 str(intent_record.get("physical_object_id") or ""),
@@ -674,6 +679,7 @@ class VendorCallbackBridge:
                 str(intent_record.get("native_key") or ""),
                 str(intent_record.get("compatibility_identity") or ""),
             )
+            declared_prefetch_identity = expected
             observed = (
                 physical.physical_object_id,
                 physical.binding_generation,
@@ -716,6 +722,7 @@ class VendorCallbackBridge:
             max(0, int(allocated_external_tokens)),
             token_prefix=tokens[:prefix_tokens],
             request_configs=request_configs,
+            declared_prefetch_identity=declared_prefetch_identity,
         )
         self._record("native_load_start", {
             "request_id": request_id,
@@ -856,9 +863,7 @@ class VendorCallbackBridge:
         available = max(0, int(available_external_tokens))
         if not self._active_admission() or available == 0:
             return available
-        probe = self._decision_probe_by_request.get(logical_request_id)
-        if probe is not None:
-            probe = dict(probe)
+        probe = self._decision_probe_for_request(logical_request_id)
         if probe is not None and probe.get("force_recompute") is True:
             self._append("kv_core_policy_decisions.jsonl", {
                 "request_id": logical_request_id,
@@ -1014,7 +1019,7 @@ class VendorCallbackBridge:
     def _probe_deadline_offset_ns(self, logical_request_id: str) -> int:
         """Test-only per-request load deadline; falls back to the env knob."""
 
-        probe = self._decision_probe_by_request.get(logical_request_id)
+        probe = self._decision_probe_for_request(logical_request_id)
         if probe is not None:
             value = probe.get("deadline_ns")
             if value not in (None, ""):
@@ -1023,6 +1028,78 @@ class VendorCallbackBridge:
                 except (TypeError, ValueError):
                     pass
         return _env_int("ASTRAKV_KV_CORE_LOAD_DEADLINE_NS", 60_000_000_000)
+
+    def _decision_probe_intent_path(self, logical_request_id: str) -> Path | None:
+        """Return the test-only shared record path for one logical request."""
+        if self._state_dir is None or not logical_request_id:
+            return None
+        directory = self._state_dir / "decision_probe_intents"
+        directory.mkdir(parents=True, exist_ok=True)
+        request_digest = hashlib.sha256(logical_request_id.encode("utf-8")).hexdigest()
+        return directory / f"{request_digest}.json"
+
+    def _write_decision_probe_intent(
+        self, *, logical_request_id: str, probe: dict[str, Any],
+    ) -> None:
+        """Publish an authenticated test probe for a separate scheduler bridge."""
+        if not _env_flag("ASTRAKV_KV_CORE_EQUIVALENCE_TEST"):
+            return
+        path = self._decision_probe_intent_path(logical_request_id)
+        if path is None:
+            return
+        now_ns = time.time_ns()
+        payload = {
+            "schema": "astrakv-kv-decision-probe-intent-v1",
+            "logical_request_id": logical_request_id,
+            "probe": dict(probe),
+            "created_at_ns": now_ns,
+            "expires_at_ns": now_ns + _env_int(
+                "ASTRAKV_KV_CORE_EQUIVALENCE_TEST_TTL_NS", 30_000_000_000,
+            ),
+        }
+        temporary = path.with_suffix(
+            f".{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            temporary.write_text(
+                json.dumps(payload, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, path)
+        except (OSError, TypeError, ValueError):
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _decision_probe_for_request(
+        self, logical_request_id: str,
+    ) -> dict[str, Any] | None:
+        """Load a validated test probe from memory or the shared state dir."""
+        if not _env_flag("ASTRAKV_KV_CORE_EQUIVALENCE_TEST"):
+            return None
+        probe = self._decision_probe_by_request.get(logical_request_id)
+        if probe is not None:
+            return dict(probe)
+        path = self._decision_probe_intent_path(logical_request_id)
+        if path is None:
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            loaded_probe = payload.get("probe")
+            if (
+                payload.get("schema") != "astrakv-kv-decision-probe-intent-v1"
+                or payload.get("logical_request_id") != logical_request_id
+                or not isinstance(loaded_probe, dict)
+                or not loaded_probe
+                or int(payload.get("expires_at_ns") or 0) <= time.time_ns()
+            ):
+                return None
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        probe = dict(loaded_probe)
+        self._decision_probe_by_request[logical_request_id] = probe
+        return dict(probe)
 
     def _consume_equivalence_force_recompute(
         self,
@@ -1996,6 +2073,7 @@ class VendorCallbackBridge:
         lookup_hit_tokens: int,
         token_prefix: tuple[int, ...] = (),
         request_configs: dict[str, Any] | None = None,
+        declared_prefetch_identity: tuple[str, int, str, str] | None = None,
     ) -> None:
         callbacks = self._callbacks()
         manager = self._storage_manager()
@@ -2004,14 +2082,41 @@ class VendorCallbackBridge:
         cpu = getattr(manager, "storage_backends", {}).get("LocalCPUBackend")
         if cpu is None or not native_keys or not all(cpu.contains(key, False) for key in native_keys):
             return
+        observed_identity = (
+            physical.physical_object_id,
+            physical.binding_generation,
+            physical.native_key,
+            physical.compatibility_key.identity,
+        )
         for ticket in callbacks.tickets.snapshot(statuses=(
             PrefetchStatus.SUBMITTED, PrefetchStatus.COMPLETED,
         )):
+            ticket_identity = (
+                ticket.physical_object_id,
+                ticket.binding_generation,
+                ticket.native_key,
+                ticket.compatibility_identity,
+            )
+            exact_match = (
+                ticket_identity == observed_identity
+                and ticket.prefix_hash == physical.compatibility_key.prefix_hash
+            )
+            # LMCache may expose a shorter block-aligned prefix at native load
+            # than the scheduler observed.  Attribute that partial load to the
+            # completed full-prefix ticket only when the ticket still matches
+            # the persisted scheduler intent exactly.  The ticket store itself
+            # remains exact-match-only; the prefix relation is proven here and
+            # consumption below uses the ticket's declared identity.
+            partial_prefix_match = (
+                ticket.status is PrefetchStatus.COMPLETED
+                and declared_prefetch_identity is not None
+                and ticket_identity == declared_prefetch_identity
+                and physical.binding_generation == ticket.binding_generation
+                and native_key_prefix_ok(ticket.native_key, physical.native_key)
+            )
             if (
                 ticket.target_request_id == logical_request_id
-                and ticket.generation_key == physical.generation_key
-                and ticket.prefix_hash == physical.compatibility_key.prefix_hash
-                and ticket.native_key == physical.native_key
+                and (exact_match or partial_prefix_match)
             ):
                 if ticket.status is PrefetchStatus.SUBMITTED:
                     ticket = callbacks.complete_cpu_prefetch(
@@ -2019,10 +2124,14 @@ class VendorCallbackBridge:
                         completed_bytes=ticket.requested_bytes,
                     )
                     self._append_ticket(ticket)
-                consumed = callbacks.consume_cpu_prefetch(
+                consumed = callbacks.tickets.consume(
                     ticket.prefetch_id,
                     request_id=logical_request_id,
-                    physical=physical,
+                    physical_object_id=ticket.physical_object_id,
+                    binding_generation=ticket.binding_generation,
+                    prefix_hash=ticket.prefix_hash,
+                    native_key=ticket.native_key,
+                    compatibility_identity=ticket.compatibility_identity,
                 )
                 self._prefetch_by_request[native_request_id] = ticket.prefetch_id
                 self._write_consumed_prefetch_marker(

@@ -72,6 +72,36 @@ wait_for_server() {
 }
 
 mkdir -p "$OUTPUT_DIR/workload" "$OUTPUT_DIR/state" "$OUTPUT_DIR/lmcache-store"
+export ASTRAKV_DECISION_PROBE_OUTPUT_DIR="$OUTPUT_DIR"
+"$PYTHON" - <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+
+root = Path.cwd()
+paths = [
+    root / "astrakv/runtime/vendor_callback_bridge.py",
+    root / "astrakv/runtime/lmcache047_runtime_patch.py",
+    root / "scripts/benchmark/run_real_benchmark.py",
+    root / "scripts/benchmark/materialize_decision_probe_workload.py",
+    root / "scripts/reporting/validate_decision_probe.py",
+    root / "scripts/entrypoints/run_decision_probe_suite.sh",
+]
+payload = {
+    "schema": "astrakv-decision-probe-runtime-source-v1",
+    "files": [
+        {
+            "path": str(path.resolve()),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for path in paths
+    ],
+}
+(Path(os.environ["ASTRAKV_DECISION_PROBE_OUTPUT_DIR"]) / "runtime_source_manifest.json").write_text(
+    json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
 "$PYTHON" scripts/runtime/verify_kv_core_connector_patch.py \
   --deployment-manifest "$PATCH_MANIFEST" --callback-smoke "$CALLBACK_SMOKE" \
   --output "$OUTPUT_DIR/connector_patch_verification.json"

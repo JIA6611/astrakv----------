@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+.codex/
 *.py[cod]
 *.pyo
 .pytest_cache/

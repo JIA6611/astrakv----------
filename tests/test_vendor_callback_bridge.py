@@ -649,6 +649,94 @@ class VendorCallbackBridgeTests(unittest.TestCase):
             self.assertEqual(len(partial), 1)
             self.assertEqual(rejected, [])
 
+    def test_native_load_start_consumes_completed_prefetch_for_declared_partial_prefix(self) -> None:
+        callbacks = KVCoreConnectorCallbacks(
+            mode=RuntimeMode.ACTIVE,
+            capability=TierCapabilitySnapshot(
+                topology=TierTopology.GPU_CPU_SSD,
+                local_cpu_enabled=True,
+                local_disk_enabled=True,
+                available_kv_blocks=1024,
+                external_token_cap=2,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as raw_tmp, patch.dict(os.environ, {
+            "ASTRAKV_RUNTIME_CONTROL_STATE_DIR": raw_tmp,
+            "ASTRAKV_KV_CORE_ADMISSION_ENABLED": "true",
+            "ASTRAKV_KV_CORE_EXTERNAL_TOKEN_CAP": "2",
+            "ASTRAKV_KV_CORE_BOOTSTRAP_LOADS": "1",
+        }, clear=False), patch(
+            "astrakv.runtime.vendor_callback_bridge.installed_kv_core_callbacks",
+            return_value=callbacks,
+        ), patch.object(VendorCallbackBridge, "_start_prefetch_watcher_if_worker"):
+            connector = _connector()
+            cpu = _CPU()
+            connector.lmcache_engine.storage_manager.storage_backends["LocalCPUBackend"] = cpu
+
+            scheduler_bridge = VendorCallbackBridge(connector)
+            scheduler_bridge.scheduler_exact_lookup(
+                connector,
+                request_id="native-request",
+                token_ids=(1, 2, 3, 4),
+                request_configs=None,
+                lookup_hit_tokens=4,
+                num_computed_tokens=0,
+            )
+            declared = scheduler_bridge._physical_by_request["native-request"]
+            declared_keys = scheduler_bridge._keys_by_request["native-request"]
+            now = time.time_ns()
+            ticket = PrefetchTicket(
+                prefetch_id="partial-prefix-ticket",
+                physical_object_id=declared.physical_object_id,
+                binding_generation=declared.binding_generation,
+                prefix_hash=declared.compatibility_key.prefix_hash,
+                source_tier="ssd",
+                target_tier="cpu",
+                requested_bytes=2048,
+                deadline_ns=now + 1_000_000_000,
+                expires_at_ns=now + 2_000_000_000,
+                target_request_id="native-request",
+                native_key=declared.native_key,
+                compatibility_identity=declared.compatibility_key.identity,
+            )
+            callbacks.tickets.submit(ticket)
+            callbacks.tickets.complete(ticket.prefetch_id, completed_bytes=2048)
+            for key in declared_keys:
+                cpu.hot_cache[key] = _MemoryObj()
+
+            # A separate worker-side bridge sees only the admitted one-chunk
+            # prefix, while the persisted intent and ticket describe both
+            # scheduler-visible chunks.
+            worker_bridge = VendorCallbackBridge(connector)
+            worker_bridge.native_load_start(
+                request_id="native-request",
+                connector=connector,
+                token_ids=(1, 2, 3, 4),
+                request_configs=None,
+                compatibility_prefix_tokens=2,
+                allocated_external_tokens=2,
+            )
+
+            consumed = callbacks.tickets.get(ticket.prefetch_id)
+            self.assertIsNotNone(consumed)
+            self.assertIs(consumed.status, PrefetchStatus.CONSUMED)
+            self.assertEqual(consumed.consumer_request_id, "native-request")
+            self.assertEqual(
+                worker_bridge._prefetch_by_request["native-request"], ticket.prefetch_id,
+            )
+            records = [
+                json.loads(line)
+                for line in (Path(raw_tmp) / "kv_core_native_callbacks.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            self.assertTrue(any(
+                row.get("callback") == "native_load_start"
+                and row.get("status") == "accepted_partial_prefix"
+                for row in records
+            ))
+            self.assertEqual(records[-1]["prefetch_id"], ticket.prefetch_id)
+
     @staticmethod
     def _roomy_capability() -> TierCapabilitySnapshot:
         return TierCapabilitySnapshot(

@@ -31,10 +31,12 @@ from scripts.benchmark.materialize_kv_equivalence_workload import select_prompt_
 WORKLOAD_NAME = "decision_probe_single_prefix"
 REPS_PER_SCENARIO = 3
 
-# Locked scenario matrix.  Values are chosen so the expected reason is robust
-# to object-size uncertainty: S1 reads at 20 GB/s, S4 at 0.1 GB/s, S2 uses a
-# 300 ms deadline while SSD reads take ~1 s at the default 3 GB/s, S3 forces
-# the memory-pressure gate, and S5 uses the test-only force-recompute path.
+# Locked scenario matrix.  S1 reads at 20 GB/s, S4 at 0.1 GB/s, and S2 uses
+# an explicit 3 GB/s read rate with a 100 ms deadline.  The locked Qasper
+# prefix materializes 603,979,776 candidate bytes, whose modeled read cost is
+# 201.326592 ms at 3 GB/s; the 100 ms deadline therefore has a clear margin.
+# S3 forces the memory-pressure gate, and S5 uses the test-only
+# force-recompute path.
 SCENARIOS: dict[str, dict[str, Any]] = {
     "S1": {
         "probe": {"ssd_gbps": 20.0, "memory_pressure": 0.0, "deadline_ns": 60_000_000_000},
@@ -42,7 +44,7 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         "expected_reason": "native_load_cheaper",
     },
     "S2": {
-        "probe": {"deadline_ns": 300_000_000, "memory_pressure": 0.0},
+        "probe": {"ssd_gbps": 3.0, "deadline_ns": 100_000_000, "memory_pressure": 0.0},
         "expected_decision": "recompute",
         "expected_reason": "load_deadline_miss",
     },

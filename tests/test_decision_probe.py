@@ -155,6 +155,40 @@ class DecisionProbeTests(unittest.TestCase):
             self.assertEqual(cap, 0)
             self.assertEqual(_last_decision(raw_tmp)["reason"], "uma_memory_pressure")
 
+    def test_probe_crosses_from_ingress_bridge_to_scheduler_bridge(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp, _probe_context(raw_tmp):
+            ingress_bridge = _bridge(raw_tmp)
+            scheduler_bridge = _bridge(raw_tmp)
+            ingress_bridge.ingress_request(SimpleNamespace(
+                request_id="probe-cross-bridge",
+                metadata={
+                    "exact_token_ids": TOKENS,
+                    "kv_core_decision_probe": {"memory_pressure": 0.95},
+                },
+            ))
+
+            self.assertNotIn(
+                "probe-cross-bridge",
+                scheduler_bridge._decision_probe_by_request,
+            )
+            cap = scheduler_bridge._external_token_cap(
+                physical=_physical(),
+                requested_tokens=len(TOKENS),
+                available_external_tokens=len(TOKENS),
+                priority=0,
+                logical_request_id="probe-cross-bridge",
+                token_sequence_hash=SEQUENCE_HASH,
+            )
+
+            self.assertEqual(cap, 0)
+            decision = _last_decision(raw_tmp)
+            self.assertEqual(decision["reason"], "uma_memory_pressure")
+            self.assertEqual(decision["decision_probe"], {"memory_pressure": 0.95})
+            self.assertEqual(
+                scheduler_bridge._decision_probe_by_request["probe-cross-bridge"],
+                {"memory_pressure": 0.95},
+            )
+
     def test_per_request_tight_deadline_forces_load_deadline_miss(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp, _probe_context(raw_tmp):
             bridge = _bridge(raw_tmp)

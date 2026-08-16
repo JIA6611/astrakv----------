@@ -53,6 +53,11 @@ def _manifest() -> dict:
 
 
 class DecisionProbeMaterializerTests(unittest.TestCase):
+    def test_deadline_probe_has_explicit_bandwidth_and_clear_margin(self) -> None:
+        probe = SCENARIOS["S2"]["probe"]
+        self.assertEqual(probe["ssd_gbps"], 3.0)
+        self.assertLessEqual(probe["deadline_ns"], 100_000_000)
+
     def test_materializes_seed_plus_all_scenarios_with_locked_labels(self) -> None:
         from astrakv.benchmarks.runtime_workload import load_runtime_workload_jsonl
 

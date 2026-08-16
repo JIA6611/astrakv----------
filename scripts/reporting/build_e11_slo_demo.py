@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import statistics
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from scripts.reporting.analyze_e11_request_attribution import analyze
+from scripts.reporting.evaluate_e11_target import percentile
 
 
 REGIME = "scan_pollution_past_observed"
@@ -29,7 +29,7 @@ def build_demo_result(
     ]
     if len(matching) != 1:
         return {
-            "schema": "astrakv-e11-slo-demo-v1",
+            "schema": "astrakv-e11-slo-demo-v2",
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "status": "inconclusive",
             "reason": f"expected_one_scan_pollution_cell_found_{len(matching)}",
@@ -42,8 +42,7 @@ def build_demo_result(
     rows = [
         row
         for row in cell.get("requests", [])
-        if row.get("phase") == "post_divergence"
-        and float(row.get("lru_ttft_ms") or 0) > 0
+        if float(row.get("lru_ttft_ms") or 0) > 0
         and float(row.get("astrakv_ttft_ms") or 0) > 0
     ]
     lru_values = [float(row["lru_ttft_ms"]) for row in rows]
@@ -52,10 +51,10 @@ def build_demo_result(
     eligible = diverged and len(rows) >= min_requests
 
     result: dict[str, Any] = {
-        "schema": "astrakv-e11-slo-demo-v1",
+        "schema": "astrakv-e11-slo-demo-v2",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "status": "inconclusive",
-        "reason": "insufficient_post_divergence_evidence",
+        "reason": "insufficient_paired_request_evidence",
         "regime": REGIME,
         "cell": cell_name,
         "slo_ms": _round(slo_ms),
@@ -63,7 +62,10 @@ def build_demo_result(
         "evidence": {
             "victim_sequence_diverged": diverged,
             "first_divergence_ordinal": cell.get("first_divergence_ordinal"),
-            "post_divergence_paired_requests": len(rows),
+            "paired_requests": len(rows),
+            "post_divergence_paired_requests": sum(
+                row.get("phase") == "post_divergence" for row in rows
+            ),
             "minimum_required_requests": min_requests,
             "source_evidence_gaps": attribution.get("evidence_gaps", []),
         },
@@ -71,32 +73,33 @@ def build_demo_result(
     if not eligible:
         return result
 
-    lru_p50 = statistics.median(lru_values)
-    astra_p50 = statistics.median(astra_values)
-    improvement_ms = lru_p50 - astra_p50
-    improvement_percent = improvement_ms / lru_p50 * 100.0
-    lru_pass = lru_p50 <= slo_ms
-    astra_pass = astra_p50 <= slo_ms
+    lru_p95 = percentile(lru_values, 0.95)
+    astra_p95 = percentile(astra_values, 0.95)
+    assert lru_p95 is not None and astra_p95 is not None
+    improvement_ms = lru_p95 - astra_p95
+    improvement_percent = improvement_ms / lru_p95 * 100.0
+    lru_pass = lru_p95 <= slo_ms
+    astra_pass = astra_p95 <= slo_ms
     improved = improvement_ms > 0
     result.update(
         {
             "status": "pass" if improved and astra_pass else "no_improvement",
             "reason": (
-                "astrakv_lower_p50_and_meets_slo"
+                "astrakv_lower_p95_and_meets_slo"
                 if improved and astra_pass
-                else "astrakv_did_not_both_improve_p50_and_meet_slo"
+                else "astrakv_did_not_both_improve_p95_and_meet_slo"
             ),
             "metrics": {
-                "lru_ttft_p50_ms": _round(lru_p50),
-                "astrakv_ttft_p50_ms": _round(astra_p50),
+                "lru_ttft_p95_ms": _round(lru_p95),
+                "astrakv_ttft_p95_ms": _round(astra_p95),
                 "improvement_ms": _round(improvement_ms),
                 "improvement_percent": _round(improvement_percent),
             },
             "slo": {
                 "lru_pass": lru_pass,
                 "astrakv_pass": astra_pass,
-                "lru_headroom_ms": _round(slo_ms - lru_p50),
-                "astrakv_headroom_ms": _round(slo_ms - astra_p50),
+                "lru_headroom_ms": _round(slo_ms - lru_p95),
+                "astrakv_headroom_ms": _round(slo_ms - astra_p95),
                 "headroom_gain_ms": _round(improvement_ms),
             },
         }
@@ -111,18 +114,18 @@ def render_terminal(result: dict[str, Any]) -> str:
         return "\n".join(
             [
                 border,
-                "E11 Scan-Pollution TTFT P50 Demo",
-                "Result: INCONCLUSIVE (insufficient post-divergence evidence)",
+                "E11 Scan-Pollution TTFT P95 Demo",
+                "Result: INCONCLUSIVE (insufficient paired-request evidence)",
                 border,
             ]
         )
     return "\n".join(
         [
             border,
-            "E11 Scan-Pollution TTFT P50 Demo",
-            f"LMCache LRU          {metrics['lru_ttft_p50_ms']:10.2f} ms",
-            f"AstraKV-W evict-B    {metrics['astrakv_ttft_p50_ms']:10.2f} ms",
-            f"P50 reduction        {metrics['improvement_percent']:10.2f} %",
+            "E11 Scan-Pollution TTFT P95 Demo",
+            f"LMCache LRU          {metrics['lru_ttft_p95_ms']:10.2f} ms",
+            f"AstraKV-W evict-B    {metrics['astrakv_ttft_p95_ms']:10.2f} ms",
+            f"P95 reduction        {metrics['improvement_percent']:10.2f} %",
             border,
         ]
     )
@@ -134,26 +137,26 @@ def render_markdown(result: dict[str, Any]) -> str:
         "",
         f"- 结果状态：`{result['status']}`",
         f"- 证据状态：`{'有效' if result.get('eligible') else '证据不足'}`",
-        f"- TTFT P50 运行目标：`<= {result['slo_ms']:.2f} ms`",
+        f"- TTFT P95 运行目标：`<= {result['slo_ms']:.2f} ms`",
     ]
     metrics = result.get("metrics")
     if metrics:
         slo = result["slo"]
         lines += [
             "",
-            "| 策略 | TTFT P50 | SLO | SLO 余量 |",
+            "| 策略 | TTFT P95 | SLO | SLO 余量 |",
             "| --- | ---: | --- | ---: |",
-            f"| LMCache LRU | {metrics['lru_ttft_p50_ms']:.2f} ms | "
+            f"| LMCache LRU | {metrics['lru_ttft_p95_ms']:.2f} ms | "
             f"{'通过' if slo['lru_pass'] else '未通过'} | {slo['lru_headroom_ms']:+.2f} ms |",
-            f"| AstraKV-W evict-B | {metrics['astrakv_ttft_p50_ms']:.2f} ms | "
+            f"| AstraKV-W evict-B | {metrics['astrakv_ttft_p95_ms']:.2f} ms | "
             f"{'通过' if slo['astrakv_pass'] else '未通过'} | {slo['astrakv_headroom_ms']:+.2f} ms |",
             "",
-            f"evict-B 的 TTFT P50 相对 LRU 下降 {metrics['improvement_percent']:.2f}% "
+            f"evict-B 的 TTFT P95 相对 LRU 下降 {metrics['improvement_percent']:.2f}% "
             f"（{metrics['improvement_ms']:.2f} ms），SLO 余量增加 "
             f"{slo['headroom_gain_ms']:.2f} ms。",
         ]
     else:
-        lines += ["", f"当前不能形成 P50 对比：`{result['reason']}`。"]
+        lines += ["", f"当前不能形成 P95 对比：`{result['reason']}`。"]
     lines += [
         "",
         "说明：该结果来自单次现场配对 Demo，用于展示真机执行与方向性收益；正式结论仍以多轮实验为准。",

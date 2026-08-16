@@ -18,29 +18,29 @@ def _attribution(rows: list[dict], *, divergence: int | None = 4) -> dict:
 
 
 class E11SloDemoTest(unittest.TestCase):
-    def test_builds_positive_p50_and_slo_result(self) -> None:
+    def test_builds_positive_p95_and_slo_result(self) -> None:
         rows = [
             {"phase": "post_divergence", "lru_ttft_ms": 1700, "astrakv_ttft_ms": 1500},
             {"phase": "post_divergence", "lru_ttft_ms": 1600, "astrakv_ttft_ms": 1400},
             {"phase": "post_divergence", "lru_ttft_ms": 1800, "astrakv_ttft_ms": 1550},
-            {"phase": "pre_divergence", "lru_ttft_ms": 1000, "astrakv_ttft_ms": 2000},
+            {"phase": "pre_divergence", "lru_ttft_ms": 1000, "astrakv_ttft_ms": 1300},
         ]
 
         result = build_demo_result(_attribution(rows), slo_ms=1600)
 
         self.assertEqual(result["status"], "pass")
-        self.assertEqual(result["metrics"]["lru_ttft_p50_ms"], 1700.0)
-        self.assertEqual(result["metrics"]["astrakv_ttft_p50_ms"], 1500.0)
-        self.assertAlmostEqual(result["metrics"]["improvement_percent"], 11.76)
+        self.assertEqual(result["metrics"]["lru_ttft_p95_ms"], 1800.0)
+        self.assertEqual(result["metrics"]["astrakv_ttft_p95_ms"], 1550.0)
+        self.assertAlmostEqual(result["metrics"]["improvement_percent"], 13.89)
         self.assertFalse(result["slo"]["lru_pass"])
         self.assertTrue(result["slo"]["astrakv_pass"])
         terminal = render_terminal(result)
-        self.assertIn("LMCache LRU             1700.00 ms", terminal)
-        self.assertIn("AstraKV-W evict-B       1500.00 ms", terminal)
-        self.assertIn("P50 reduction             11.76 %", terminal)
+        self.assertIn("LMCache LRU             1800.00 ms", terminal)
+        self.assertIn("AstraKV-W evict-B       1550.00 ms", terminal)
+        self.assertIn("P95 reduction             13.89 %", terminal)
         self.assertNotIn("SLO", terminal)
 
-    def test_refuses_to_claim_result_without_enough_post_divergence_pairs(self) -> None:
+    def test_refuses_to_claim_result_without_enough_paired_requests(self) -> None:
         rows = [
             {"phase": "post_divergence", "lru_ttft_ms": 1800, "astrakv_ttft_ms": 1200},
             {"phase": "pre_divergence", "lru_ttft_ms": 1800, "astrakv_ttft_ms": 1200},
